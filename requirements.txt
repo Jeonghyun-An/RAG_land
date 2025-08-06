@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+transformers
+accelerate
+sentence-transformers
+torch
+faiss-cpu
+python-multipart
+pdfminer.six
