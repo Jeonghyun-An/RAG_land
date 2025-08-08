@@ -8,14 +8,13 @@ services:
       - ETCD_SNAPSHOT_COUNT=50000
       - ETCD_ENABLE_V2=true
       - ETCD_LOG_LEVEL=info
-      # 🔴 외부 컨테이너가 붙을 수 있게 0.0.0.0로 리슨 + etcd:2379로 광고
       - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
       - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
       - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
       - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd:2380
-      - ETCD_INITIAL_CLUSTER=default=http://etcd:2380    # 🔴 요거 추가!
-      - ETCD_NAME=default 
-      - ETCDCTL_API=3 
+      - ETCD_INITIAL_CLUSTER=default=http://etcd:2380
+      - ETCD_NAME=default
+      - ETCDCTL_API=3
     ports:
       - "2379:2379"
       - "2380:2380"
@@ -24,21 +23,21 @@ services:
     networks:
       - ragnet
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:2379/health"]
+      # wget 대신 etcdctl로 헬스체크
+      test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://127.0.0.1:2379"]
       interval: 5s
       timeout: 3s
       retries: 10
     restart: unless-stopped
 
   minio:
-    # (가능하면 최신으로 올리고 MINIO_ROOT_* 사용 권장)
     image: minio/minio:RELEASE.2023-01-20T02-05-44Z
     container_name: minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
-      # 최신 버전 쓸 땐:
+      # 최신 이미지로 바꾸면:
       # MINIO_ROOT_USER: minioadmin
       # MINIO_ROOT_PASSWORD: minioadmin
     ports:
@@ -49,7 +48,8 @@ services:
     networks:
       - ragnet
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      # 이 이미지에 curl 있음(이미 Healthy 떴던 걸로 확인)
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -60,9 +60,15 @@ services:
     container_name: milvus
     command: ["milvus", "run", "standalone"]
     environment:
-      ETCD_ENDPOINTS: etcd:2379
-      # 필요 시 외부 MinIO를 Milvus 내부 스토리지로 쓰려면 별도 설정이 필요하지만,
-      # 지금은 별개 MinIO(문서 저장용)라면 이대로 OK
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_USE_SSL=false
+      # 버킷 이름(없으면 Milvus가 만들어줍니다)
+      - MINIO_BUCKET_NAME=milvus-bucket
+      # 일부 버전에서는 이 키를 씁니다(겸사겸사 넣어도 무해)
+      - MINIO_BUCKET=milvus-bucket
     ports:
       - "19530:19530"
       - "9091:9091"
@@ -76,7 +82,7 @@ services:
       minio:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9091/healthz"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -93,14 +99,17 @@ services:
       - ../app:/app
       - ../models:/models
     environment:
-      # 🔵 도커 환경 플래그 (MinIO/Milvus를 서비스명으로 붙게)
       IS_DOCKER: "true"
-      # 선택: 명시적으로 지정하고 싶으면 아래도 추가
-      # MINIO_ENDPOINT: "minio:9000"
-      # MINIO_ACCESS_KEY: "minioadmin"
-      # MINIO_SECRET_KEY: "minioadmin"
-      # MINIO_BUCKET: "rag-docs"
-      # HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"
+      # MinIO/Milvus 접속 명시 (컨테이너 네트워크 이름으로)
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MILVUS_HOST: "milvus"
+      MILVUS_PORT: "19530"
+      # 모델 기본값/토큰
+      MODEL_ID: "meta-llama/Llama-3.2-1B-Instruct"
+      HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"   # .env나 OS env에서 가져옴(없으면 빈 값)
+      PYTHONUNBUFFERED: "1"
     networks:
       - ragnet
     depends_on:
