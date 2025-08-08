@@ -1,12 +1,14 @@
 # app/services/chunker.py
-from typing import List
-
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+def chunk_text(text: str, max_length: int = 500) -> list[str]:
+    lines = text.split("\n")
     chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start += chunk_size - overlap
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) < max_length:
+            chunk += line + "\n"
+        else:
+            chunks.append(chunk.strip())
+            chunk = line + "\n"
+    if chunk:
+        chunks.append(chunk.strip())
     return chunks
