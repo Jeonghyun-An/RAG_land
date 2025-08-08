@@ -48,3 +48,11 @@ poetry.lock
 # 🐳 Docker
 *.pid
 *.sock
+
+# 📂 MinIO 관련
+minio/
+# 📄 문서
+*.pdf
+*.docx
+# 📂 Milvus 관련
+milvus/
