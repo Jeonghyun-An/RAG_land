@@ -21,5 +21,5 @@ MILVUS_HOST = "milvus" if IS_DOCKER else os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 
 # HF 모델
-MODEL_ID = os.getenv("MODEL_ID", "saltlux/Ko-Llama3-Luxia-8B")
+MODEL_ID = os.getenv("MODEL_ID", "meta-llama/Llama-2-7b-chat-hf")
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")  # 없으면 빈 문자열
