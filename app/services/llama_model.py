@@ -20,16 +20,14 @@ MODEL_REGISTRY: Dict[str, str] = {
     # "mistral": "mistralai/Mistral-7B-Instruct-v0.1",  # 예시로 추가
 }
 
-def _get_auth_kwargs() -> dict:
-    # HF 토큰이 없어도 공개 모델이면 다운로드는 가능하지만,
-    # 메타 모델은 보통 토큰 필요 → 있으면 넣어줌
+def _need_hf_token(model_id: str) -> bool:
+    # 메타 계열은 거의 토큰 필요
+    return model_id.startswith("meta-llama/")
+
+def _auth_kwargs() -> dict:
     return {"token": HUGGINGFACE_TOKEN} if HUGGINGFACE_TOKEN else {}
 
 def load_model(model_name: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-    """
-    지연 로딩 + 캐시. GPU 있으면 자동으로 CUDA, 없으면 CPU.
-    CPU일 땐 float32로 안전하게.
-    """
     if model_name not in MODEL_REGISTRY:
         raise ValueError(f"지원하지 않는 모델입니다: {model_name}")
 
@@ -37,20 +35,29 @@ def load_model(model_name: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
         return LOADED_MODELS[model_name]
 
     model_id = MODEL_REGISTRY[model_name]
-    auth = _get_auth_kwargs()
+    if _need_hf_token(model_id) and not HUGGINGFACE_TOKEN:
+        raise RuntimeError(
+            f"{model_id} 는 Hugging Face 토큰이 필요합니다. "
+            "환경변수 HUGGINGFACE_TOKEN을 설정하세요."
+        )
 
-    # dtype/device 선택: CPU 안전(f32), CUDA면 bf16/auto 가능
+    auth = _auth_kwargs()
+
+    # dtype/device
     if torch.cuda.is_available():
-        torch_dtype = torch.bfloat16  # 최근 메타 계열은 bf16 선호
+        torch_dtype = torch.bfloat16
         device_map: Optional[str | dict] = "auto"
     else:
         torch_dtype = torch.float32
         device_map = {"": "cpu"}
 
-    # 토크나이저/모델 로드
+    # 버전/네트워크 이슈 시 캐시 경로 고정하면 편함 (선택)
+    cache_dir = os.environ.get("HF_HOME")  # 있으면 사용
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_id,
         use_fast=True,
+        cache_dir=cache_dir,
         **auth,
     )
 
@@ -58,6 +65,7 @@ def load_model(model_name: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
         model_id,
         torch_dtype=torch_dtype,
         device_map=device_map,
+        cache_dir=cache_dir,
         **auth,
     )
 
@@ -74,36 +82,26 @@ def generate_answer(
     top_p: float = 0.9,
     top_k: int = 50,
 ) -> str:
-    """
-    chat_template이 있으면 그걸 쓰고, 없으면 단순 프롬프트로 생성.
-    pad/eos 설정을 명시해서 끊김 문제 방지.
-    """
-    # 메시지 포맷 (instruct 모델은 보통 chat_template 포함)
-    inputs = None
+    # 메시지 -> 텐서
     try:
         messages = [{"role": "user", "content": prompt}]
-        inputs = tokenizer.apply_chat_template(
+        input_ids = tokenizer.apply_chat_template(
             messages,
             return_tensors="pt",
             add_generation_prompt=True,
         )
     except Exception:
-        # chat_template이 없다면 fallback: 일반 토크나이즈
-        inputs = tokenizer(prompt, return_tensors="pt").input_ids
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
 
-    # 디바이스 맞추기
     device = next(model.parameters()).device
-    if isinstance(inputs, dict):
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-    else:
-        inputs = inputs.to(device)
+    input_ids = input_ids.to(device)
 
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
 
     with torch.no_grad():
         output_ids = model.generate(
-            inputs,
+            input_ids=input_ids,       # ← 명시적으로
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=temperature,
