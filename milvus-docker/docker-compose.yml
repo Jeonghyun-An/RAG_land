@@ -96,8 +96,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ../app:/app
-      - ../models:/models
+      - ..:/app
     environment:
       IS_DOCKER: "true"
       # MinIO/Milvus 접속 명시 (컨테이너 네트워크 이름으로)

@@ -11,9 +11,12 @@ COPY milvus-docker/requirements.txt ./requirements.txt
 # 의존성 설치
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 모댈 관련 의존성 설치
+# COPY milvus-docker/requirements-model.txt ./requirements-model.txt
+# RUN pip install --no-cache-dir -r requirements-model.txt
+
 # main.py가 있는 app 폴더의 내용만 복사 (디렉토리 X)
 COPY app/ ./app
-COPY models ./models
 
 
 # FastAPI 실행
