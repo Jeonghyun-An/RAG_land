@@ -54,6 +54,33 @@ minio/
 # 📄 문서
 *.pdf
 *.docx
+*.doc
+*.pptx
+*.ppt
+*.xlsx
+*.xls
+*.odt
+*.odp
+*.ods
+*.rtf
+*.html
+*.htm
+*.txt
+*.csv
+# 📂 이미지
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.webp
+# 📂 기타
+*.zip
+*.tar.gz
+*.tar.bz2
+*.md
 # 📂 Milvus 관련
 milvus/
 

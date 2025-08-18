@@ -13,6 +13,8 @@ from app.services.file_parser import parse_pdf
 from app.services.llama_model import generate_answer_unified
 from app.services.milvus_store import MilvusStore
 from app.services.minio_store import MinIOStore
+from app.services.pdf_converter import convert_to_pdf, ConvertError
+
 
 router = APIRouter(tags=["llama"])
 
@@ -71,45 +73,39 @@ def generate(body: GenerateReq):
 
 @router.post("/upload", response_model=UploadResp)
 async def upload_document(
-    background_tasks: BackgroundTasks,           # ✅ Optional/기본값 쓰지 말 것
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    indexing: str = Query("background", pattern="^(background|sync)$"),
 ):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "PDF 파일만 업로드 가능합니다.")
+    # 1) 로컬 저장
+    safe_name = os.path.basename(file.filename)
+    local_path = os.path.join(UPLOAD_DIR, safe_name)
+    content = await file.read()
+    with open(local_path, "wb") as f:
+        f.write(content)
 
-    minio = MinIOStore()
-
+    # 2) 비-PDF면 PDF로 변환
     try:
-        # 1) 로컬 저장
-        safe_name = os.path.basename(file.filename)
-        local_path = os.path.join(UPLOAD_DIR, safe_name)
-        content = await file.read()
-        with open(local_path, "wb") as f:
-            f.write(content)
-
-        # 2) MinIO 업로드 (유니크 오브젝트명)
-        object_name = f"uploaded/{uuid.uuid4().hex}_{safe_name}"
-        minio.upload(local_path, object_name=object_name, content_type="application/pdf")
-
-        # 3) Milvus 인덱싱
-        job_id = uuid.uuid4().hex
-        if indexing == "sync":
-            index_pdf_to_milvus(local_path)          # 즉시 실행 (재시작 영향 없음)
-        else:
-            background_tasks.add_task(index_pdf_to_milvus, local_path)  # 기존 백그라운드
-
-        return UploadResp(
-            filename=safe_name,
-            minio_object=object_name,
-            indexed="background",
-            job_id=job_id,
-        )
-
-    except HTTPException:
-        raise
+        pdf_path = convert_to_pdf(local_path)   # 이미 PDF면 그대로 반환
+    except ConvertError as e:
+        raise HTTPException(400, f"파일 변환 실패: {e}")
     except Exception as e:
-        raise HTTPException(500, f"업로드 처리 중 오류: {e}")
+        raise HTTPException(500, f"파일 변환 중 예외: {e}")
+
+    # 3) MinIO 업로드 (원본 + 변환본 둘 다 올리고 싶으면 선택)
+    minio = MinIOStore()
+    object_pdf = f"uploaded/{uuid.uuid4().hex}_{os.path.basename(pdf_path)}"
+    minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
+
+    # 4) 인덱싱(백그라운드)
+    job_id = uuid.uuid4().hex
+    background_tasks.add_task(index_pdf_to_milvus, pdf_path)
+
+    return UploadResp(
+        filename=safe_name,
+        minio_object=object_pdf,
+        indexed="background",
+        job_id=job_id,
+    )
 
 @router.post("/ask", response_model=AskResp)
 def ask_question(body: AskReq):
