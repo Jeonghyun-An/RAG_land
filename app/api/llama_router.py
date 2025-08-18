@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from app.services.chunker import chunk_text
 from app.services.file_parser import parse_pdf
-from app.services.llama_model import load_model, generate_answer
+from app.services.llama_model import generate_answer_unified
 from app.services.milvus_store import MilvusStore
 from app.services.minio_store import MinIOStore
 
@@ -22,11 +22,11 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ---------- Schemas ----------
 class GenerateReq(BaseModel):
     prompt: str
-    model_name: str = "meta-llama/Llama-3.2-1B-Instruct"
+    model_name: str = "llama-1b"
 
 class AskReq(BaseModel):
     question: str
-    model_name: str = "meta-llama/Llama-3.2-1B-Instruct"
+    model_name: str = "llama-1b"
     top_k: int = 3
 
 class UploadResp(BaseModel):
@@ -61,11 +61,11 @@ def test():
 @router.post("/generate")
 def generate(body: GenerateReq):
     try:
-        model, tokenizer = load_model(body.model_name)
-        result = generate_answer(body.prompt, model, tokenizer)
+        result = generate_answer_unified(body.prompt, body.model_name)
         return {"response": result}
     except Exception as e:
         raise HTTPException(500, f"모델 응답 생성 실패: {e}")
+
 
 @router.post("/upload", response_model=UploadResp)
 async def upload_document(
@@ -126,8 +126,7 @@ def ask_question(body: AskReq):
 
 [답변]
 """
-        model, tokenizer = load_model(body.model_name)
-        answer = generate_answer(prompt, model, tokenizer)
+        answer = generate_answer_unified(prompt, body.model_name)
         return AskResp(answer=answer, used_chunks=len(retrieved))
 
     except HTTPException:

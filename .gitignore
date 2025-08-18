@@ -56,3 +56,5 @@ minio/
 *.docx
 # 📂 Milvus 관련
 milvus/
+
+models/

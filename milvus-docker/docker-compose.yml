@@ -88,6 +88,39 @@ services:
       retries: 20
     restart: unless-stopped
 
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    networks: [ragnet]
+    ports:
+      - "8001:8000"               # 호스트 8001 → 컨테이너 8000
+    environment:
+      HF_HUB_OFFLINE: "0"         # 오프라인이면 1
+      TRANSFORMERS_OFFLINE: "0"
+    volumes:
+      - ../models/.hf-cache:/models:ro   # 오프라인 캐시 마운트(아래 4단계에서 채움)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           capabilities: [gpu]
+    # 로컬 PC에선 GPU 없을 수 있어서, 프로필로 꺼 두기
+    profiles: ["gpu"]
+    # 서버(L40s)에서만 이 프로필을 켜서 실행하면 됨
+    # 로컬에서 굳이 GPU 설정 안 넣어도 됨. 서버에선 다음 중 하나 사용:
+    # gpus: all   (Compose v2)
+    # 또는 swarm 모드라면 deploy.resources.reservations.devices...
+    command: [
+      "python","-m","vllm.entrypoints.openai.api_server",
+      "--model","/models/meta-llama/Llama-3.2-1B-Instruct",
+      # "--served-model-name","llama-1b",   # 나중에 서버 이식 시에 두 토큰 추가
+      "--max-model-len","8192",
+      "--tensor-parallel-size","1",
+      "--trust-remote-code"
+    ]
+    restart: unless-stopped
+
   fastapi:
     build:
       context: ..
@@ -97,6 +130,7 @@ services:
       - "8000:8000"
     volumes:
       - ..:/app
+      - ../models/.hf-cache:/models
     environment:
       IS_DOCKER: "true"
       # MinIO/Milvus 접속 명시 (컨테이너 네트워크 이름으로)
@@ -109,6 +143,14 @@ services:
       MODEL_ID: "meta-llama/Llama-3.2-1B-Instruct"
       HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"   # .env나 OS env에서 가져옴(없으면 빈 값)
       PYTHONUNBUFFERED: "1"
+      OPENAI_BASE_URL: "http://vllm:8000/v1"
+      OPENAI_API_KEY: "not-used"
+      MODEL_ALIASES: '{"llama-1b":"meta-llama/Llama-3.2-1B-Instruct"}'
+      USE_VLLM: "0"  # vllm 프로필을 켜면 1로 바꾸기
+      HF_HOME: "/models"
+      # (선택) vllm 프로필을 켜면 아래 ENV도 설정
+    # (선택) 기본 별칭명도 ENV로
+    # DEFAULT_MODEL_ALIAS: "llama-1b"
     networks:
       - ragnet
     depends_on:
@@ -116,6 +158,9 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+         # ⚠ 로컬에서 vllm 프로필을 안 켜면 depends_on에 넣지 않음
+      # vllm:
+      #   condition: service_started
     restart: unless-stopped
 
 volumes:
