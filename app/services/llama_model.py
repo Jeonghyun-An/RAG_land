@@ -8,6 +8,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from app.services.llm_client import chat_complete, list_vllm_models
 from app.config import HUGGINGFACE_TOKEN
 
+# 파일 상단 import 옆에 추가
+OPENAI_ALIAS_URLS = json.loads(os.getenv("OPENAI_ALIAS_URLS", "{}"))
+
+
 USE_VLLM = os.getenv("USE_VLLM", "1") == "1"
 # 👇 하드코딩 금지: ENV에서 alias→HF ID 매핑(JSON)만 읽음
 # 예) MODEL_ALIASES='{"llama-1b":"meta-llama/Llama-3.2-1B-Instruct"}'
@@ -84,39 +88,54 @@ def generate_answer(
 
 def generate_answer_unified(prompt: str, name_or_id: Optional[str]):
     """
-    1) vLLM가 살아 있고, 요청값이 vLLM의 served name과 일치하면 vLLM로 바로 호출
-    2) 아니면 요청값을 alias→HF ID 또는 '그대로 HF ID'로 해석
-       - vLLM가 있더라도 served name이 다르면 폴백(Transformers)
-    3) 마지막에 둘 다 못 하면 친절한 에러 메시지
+    우선순위:
+    1) alias별 vLLM URL(OPENAI_ALIAS_URLS)이 있으면 그리로 (served name=alias)
+    2) 현재 vLLM가 내놓은 served name 목록에 요청값이 있으면 거기로
+    3) alias/HF ID 해석(hf_id) → vLLM served name이 hf_id면 vLLM, 아니면 Transformers 폴백
     """
     name = (name_or_id or "").strip()
+    alias = name if name in MODEL_ALIASES else None
 
-    # 1) vLLM served names에 있으면 그대로 vLLM 호출
+    # 안전 가드
+    served = set()
+
+    # 1) alias별 vLLM 라우팅 (ko-8b, llama-1b 등)
+    if USE_VLLM and alias and alias in OPENAI_ALIAS_URLS:
+        try:
+            from app.services.llm_client import chat_complete_on
+            return chat_complete_on(OPENAI_ALIAS_URLS[alias], alias, prompt)
+        except Exception:
+            pass  # 실패 시 다음 단계로
+
+    # 2) vLLM가 현재 내놓은 served name에 직접 매칭되면 그걸로
     if USE_VLLM:
-        served = set(list_vllm_models())  # ex: {"llama-1b", "meta-llama/Llama-3.2-1B-Instruct", ...}
+        try:
+            served = set(list_vllm_models())  # ex) {"llama-1b","ko-8b"} 혹은 HF ID
+        except Exception:
+            served = set()
         if name and name in served:
-            return chat_complete(name, prompt)
+            try:
+                return chat_complete(name, prompt)
+            except Exception:
+                pass
 
-    # 2) alias/HF ID 해석
+    # 3) alias/HF ID 해석 → vLLM(hf_id 매칭) 또는 Transformers 폴백
     hf_id = _resolve_to_hf_id(name) or _resolve_to_hf_id(os.getenv("DEFAULT_MODEL_ALIAS", "llama-1b"))
     if hf_id:
-        # vLLM로도 호출해보되, served name이 다르면 실패할 수 있으니 예외 무시하고 폴백
-        if USE_VLLM and served:
+        if USE_VLLM and hf_id in served:
             try:
-                # served 이름이 HF ID와 같을 수도/다를 수도 있음. 같으면 운 좋게 바로 됨.
-                if hf_id in served:
-                    return chat_complete(hf_id, prompt)
+                return chat_complete(hf_id, prompt)
             except Exception:
                 pass
         # Transformers 폴백
         model, tok = load_model(hf_id)
         return generate_answer(prompt, model, tok)
 
-    # 3) 전부 실패: 가능한 이름 제안
-    suggestions = []
+    # 전부 실패 시 힌트
+    hints = []
     if USE_VLLM and served:
-        suggestions += list(sorted(served))
+        hints += sorted(served)
     if MODEL_ALIASES:
-        suggestions += [f"{k} -> {v}" for k, v in MODEL_ALIASES.items()]
-    hint = "; ".join(suggestions) or "환경변수 MODEL_ALIASES에 alias 매핑을 설정하세요."
-    raise RuntimeError(f"모델 식별 실패: '{name_or_id}'. 사용 가능한 이름(일부): {hint}")
+        hints += [f"{k} -> {v}" for k, v in MODEL_ALIASES.items()]
+    msg = "; ".join(hints) or "환경변수 MODEL_ALIASES에 alias 매핑을 설정하세요."
+    raise RuntimeError(f"모델 식별 실패: '{name_or_id}'. 사용 가능한 이름(일부): {msg}")
