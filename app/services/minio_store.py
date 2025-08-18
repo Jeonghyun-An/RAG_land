@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 from datetime import timedelta
-from typing import List, Optional
+from typing import Iterable, List, Optional, Union, BinaryIO
+from urllib.parse import urlparse
 
 from minio import Minio
 from minio.error import S3Error
@@ -15,12 +16,20 @@ def _as_bool(v: Optional[str], default: bool = False) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "y"}
 
 
+def _guess_secure(endpoint: str, secure_env: Optional[bool]) -> bool:
+    if secure_env is not None:
+        return secure_env
+    # endpoint가 스킴을 포함하면 그걸 따르고, 아니면 env 기본값 사용
+    parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+    return parsed.scheme == "https"
+
+
 class MinIOStore:
     """
     MinIO 헬퍼 클래스
-    - 로컬: 기본 localhost:9000
-    - Docker: IS_DOCKER=true면 minio:9000 자동 사용
-    - 버킷 없으면 자동 생성
+    - 도커: IS_DOCKER=true면 기본 endpoint를 minio:9000 으로
+    - 버킷 이름: MINIO_BUCKET_NAME 또는 MINIO_BUCKET 를 우선순위로 사용
+    - 주요 기능: 업/다운로드, 목록, presigned URL, 존재 확인/삭제, 바이트 업로드
     """
 
     def __init__(
@@ -42,10 +51,19 @@ class MinIOStore:
 
         access_key = access_key or os.getenv("MINIO_ACCESS_KEY", "minioadmin")
         secret_key = secret_key or os.getenv("MINIO_SECRET_KEY", "minioadmin")
-        secure = secure if secure is not None else _as_bool(os.getenv("MINIO_SECURE"), False)
-        self.bucket = bucket or os.getenv("MINIO_BUCKET", "rag-docs")
 
-        # 클라이언트 생성
+        # secure 자동 판단 (https://... 면 True)
+        secure = _guess_secure(endpoint, secure)
+
+        # 버킷 이름: NAME > BUCKET > 기본
+        self.bucket = (
+            bucket
+            or os.getenv("MINIO_BUCKET_NAME")
+            or os.getenv("MINIO_BUCKET")
+            or "rag-docs"
+        )
+
+        # MinIO 클라이언트
         self.client = Minio(
             endpoint=endpoint,
             access_key=access_key,
@@ -53,21 +71,26 @@ class MinIOStore:
             secure=secure,
         )
 
-        # 버킷 보장 (경쟁상황도 안전하게 처리)
+        self.ensure_bucket()
+
+    # ---------- Bucket helpers ----------
+    def ensure_bucket(self) -> None:
+        """버킷이 없으면 생성 (경쟁 상황 안전 처리)"""
         try:
             if not self.client.bucket_exists(self.bucket):
                 self.client.make_bucket(self.bucket)
         except S3Error as e:
-            # 이미 있거나 권한/레이스 케이스는 무시 가능
             if e.code not in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}:
                 raise
 
-    # ---------- Public APIs ----------
-
-    def upload(self, file_path: str, object_name: Optional[str] = None, content_type: Optional[str] = None) -> str:
-        """
-        파일을 버킷에 업로드하고 object_name을 반환.
-        """
+    # ---------- Object APIs ----------
+    def upload(
+        self,
+        file_path: str,
+        object_name: Optional[str] = None,
+        content_type: Optional[str] = None,
+    ) -> str:
+        """로컬 파일 업로드 → object_name 반환"""
         object_name = object_name or os.path.basename(file_path)
         try:
             self.client.fput_object(
@@ -80,46 +103,99 @@ class MinIOStore:
         except S3Error as e:
             raise RuntimeError(f"MinIO 업로드 실패: {e}") from e
 
+    def upload_bytes(
+        self,
+        data: Union[bytes, BinaryIO],
+        object_name: str,
+        content_type: Optional[str] = None,
+        length: Optional[int] = None,
+    ) -> str:
+        """
+        바이트/스트림 업로드 (대용량 스트리밍도 가능)
+        - data: bytes 또는 파일-like 객체
+        - length: 알면 지정(성능↑), 모르면 None (MinIO가 자동 처리 시도)
+        """
+        try:
+            if isinstance(data, (bytes, bytearray)):
+                length = length if length is not None else len(data)
+                self.client.put_object(
+                    self.bucket, object_name, data=data, length=length, content_type=content_type
+                )
+            else:
+                # file-like object
+                if length is None:
+                    raise ValueError("스트림 업로드는 length를 지정해야 합니다.")
+                self.client.put_object(
+                    self.bucket, object_name, data=data, length=length, content_type=content_type
+                )
+            return object_name
+        except S3Error as e:
+            raise RuntimeError(f"MinIO 바이트 업로드 실패: {e}") from e
+
     def download(self, object_name: str, target_path: str) -> str:
-        """
-        버킷에서 파일 다운로드 후 저장 경로 반환.
-        """
+        """오브젝트 다운로드 → 저장 경로 반환"""
         try:
             self.client.fget_object(self.bucket, object_name, target_path)
             return target_path
         except S3Error as e:
             raise RuntimeError(f"MinIO 다운로드 실패: {e}") from e
 
-    def list_files(self, prefix: str = "") -> List[str]:
-        """
-        버킷 내 파일 리스트(object_name) 반환.
-        """
+    def exists(self, object_name: str) -> bool:
+        """오브젝트 존재 여부"""
         try:
-            objects = self.client.list_objects(self.bucket, prefix=prefix, recursive=True)
-            return [obj.object_name for obj in objects]
+            self.client.stat_object(self.bucket, object_name)
+            return True
         except S3Error as e:
-            # 필요 시 빈 리스트 대신 예외를 올려도 됨
+            if e.code in {"NoSuchKey", "NoSuchObject"}:
+                return False
+            raise
+
+    def delete(self, object_name: str) -> None:
+        """오브젝트 삭제"""
+        try:
+            self.client.remove_object(self.bucket, object_name)
+        except S3Error as e:
+            raise RuntimeError(f"MinIO 삭제 실패: {e}") from e
+
+    def list_files(self, prefix: str = "") -> List[str]:
+        """버킷 내 파일 목록(object_name 리스트)"""
+        try:
+            objs = self.client.list_objects(self.bucket, prefix=prefix, recursive=True)
+            return [obj.object_name for obj in objs]
+        except S3Error as e:
             print(f"❌ MinIO 리스트 조회 오류: {e}")
             return []
 
-    def presigned_url(self, object_name: str, method: str = "GET", expires: timedelta = timedelta(hours=1)) -> str:
+    # ---------- Presigned URLs ----------
+    def presigned_url(
+        self,
+        object_name: str,
+        method: str = "GET",
+        expires: timedelta = timedelta(hours=1),
+        response_headers: Optional[dict] = None,
+    ) -> str:
         """
-        사전서명 URL 생성 (GET/PUT 등)
+        사전서명 URL 생성
+        - method: GET / PUT
+        - response_headers: {"response-content-disposition": "attachment; filename=..."} 등
         """
         method = method.upper()
         try:
             if method == "GET":
-                return self.client.presigned_get_object(self.bucket, object_name, expires=expires)
+                return self.client.presigned_get_object(
+                    self.bucket, object_name, expires=expires, response_headers=response_headers
+                )
             if method == "PUT":
-                return self.client.presigned_put_object(self.bucket, object_name, expires=expires)
+                return self.client.presigned_put_object(
+                    self.bucket, object_name, expires=expires
+                )
             raise ValueError(f"지원하지 않는 method: {method}")
         except S3Error as e:
             raise RuntimeError(f"MinIO presigned URL 생성 실패: {e}") from e
 
+    # ---------- Health ----------
     def healthcheck(self) -> bool:
-        """
-        간단한 헬스체크: 버킷 존재 여부 확인
-        """
+        """간단한 헬스체크: 버킷 존재 확인"""
         try:
             return bool(self.client.bucket_exists(self.bucket))
         except Exception:
