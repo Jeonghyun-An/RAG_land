@@ -68,7 +68,9 @@ def generate_answer(
 ) -> str:
     try:
         messages = [{"role": "user", "content": prompt}]
-        input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
+        input_ids = tokenizer.apply_chat_template(
+            messages, return_tensors="pt", add_generation_prompt=True,
+        )
     except Exception:
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
 
@@ -78,13 +80,23 @@ def generate_answer(
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
 
+    model.eval()  # 추론 모드
     with torch.no_grad():
         output_ids = model.generate(
-            input_ids=input_ids, max_new_tokens=max_new_tokens, do_sample=True,
-            temperature=temperature, top_p=top_p, top_k=top_k,
-            eos_token_id=eos_id, pad_token_id=pad_id,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            eos_token_id=eos_id,
+            pad_token_id=pad_id,
+            use_cache=True,
         )
-    return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+
+    # "생성된 부분만" 디코딩 (프롬프트 에코 제거)
+    gen_ids = output_ids[0, input_ids.shape[-1]:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
 def generate_answer_unified(prompt: str, name_or_id: Optional[str]):
     """
