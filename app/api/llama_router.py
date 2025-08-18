@@ -42,6 +42,7 @@ class AskResp(BaseModel):
 # ---------- Helpers ----------
 def index_pdf_to_milvus(file_path: str) -> None:
     """PDF → text → chunks → Milvus"""
+    print(f"[INDEX] start: {file_path}")
     text = parse_pdf(file_path)
     if not text:
         raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
@@ -52,6 +53,7 @@ def index_pdf_to_milvus(file_path: str) -> None:
     MilvusStore.wait_for_milvus()
     db = MilvusStore()
     db.add_texts(chunks)
+    print(f"[INDEX] done: {file_path} (chunks={len(chunks)})")
 
 # ---------- Routes ----------
 @router.get("/test")
@@ -71,6 +73,7 @@ def generate(body: GenerateReq):
 async def upload_document(
     background_tasks: BackgroundTasks,           # ✅ Optional/기본값 쓰지 말 것
     file: UploadFile = File(...),
+    indexing: str = Query("background", pattern="^(background|sync)$"),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "PDF 파일만 업로드 가능합니다.")
@@ -89,9 +92,12 @@ async def upload_document(
         object_name = f"uploaded/{uuid.uuid4().hex}_{safe_name}"
         minio.upload(local_path, object_name=object_name, content_type="application/pdf")
 
-        # 3) Milvus 인덱싱: 항상 백그라운드
+        # 3) Milvus 인덱싱
         job_id = uuid.uuid4().hex
-        background_tasks.add_task(index_pdf_to_milvus, local_path)
+        if indexing == "sync":
+            index_pdf_to_milvus(local_path)          # 즉시 실행 (재시작 영향 없음)
+        else:
+            background_tasks.add_task(index_pdf_to_milvus, local_path)  # 기존 백그라운드
 
         return UploadResp(
             filename=safe_name,
