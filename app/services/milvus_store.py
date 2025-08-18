@@ -44,7 +44,7 @@ class MilvusStore:
 
         self.collection = Collection(self.collection_name)
 
-        # 🔒 데이터가 있을 때만 load 수행
+        # 데이터가 있을 때만 load 수행
         try:
             if self.collection.num_entities > 0:
                 self.collection.load()

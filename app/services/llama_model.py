@@ -13,7 +13,7 @@ OPENAI_ALIAS_URLS = json.loads(os.getenv("OPENAI_ALIAS_URLS", "{}"))
 
 
 USE_VLLM = os.getenv("USE_VLLM", "1") == "1"
-# 👇 하드코딩 금지: ENV에서 alias→HF ID 매핑(JSON)만 읽음
+# 하드코딩 금지: ENV에서 alias→HF ID 매핑(JSON)만 읽음
 # 예) MODEL_ALIASES='{"llama-1b":"meta-llama/Llama-3.2-1B-Instruct"}'
 try:
     MODEL_ALIASES: Dict[str, str] = json.loads(os.getenv("MODEL_ALIASES", "{}"))
@@ -61,7 +61,7 @@ def generate_answer(
     prompt: str,
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 256, # 짧고 간경 128, 자세하게 256 정도
     temperature: float = 0.7,
     top_p: float = 0.9,
     top_k: int = 50,

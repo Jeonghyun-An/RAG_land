@@ -136,7 +136,7 @@ services:
     command: [
       "python","-m","vllm.entrypoints.openai.api_server",
       "--model","/models/saltlux/Ko-Llama3-Luxia-8B",
-      "--served-model-name","ko-8b",      # ⬅️ 별칭과 동일하게
+      "--served-model-name","ko-8b",      # 별칭과 동일하게
       "--max-model-len","4096",
       "--tensor-parallel-size","1",
       "--trust-remote-code"
