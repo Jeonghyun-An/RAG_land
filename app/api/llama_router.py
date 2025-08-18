@@ -1,9 +1,11 @@
 # app/api/llama_router.py
+from __future__ import annotations
+
 import os
 import uuid
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
 from pydantic import BaseModel
 
 from app.services.chunker import chunk_text
@@ -12,7 +14,7 @@ from app.services.llama_model import load_model, generate_answer
 from app.services.milvus_store import MilvusStore
 from app.services.minio_store import MinIOStore
 
-router = APIRouter()
+router = APIRouter(tags=["llama"])
 
 UPLOAD_DIR = "data"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -24,14 +26,37 @@ class GenerateReq(BaseModel):
 
 class AskReq(BaseModel):
     question: str
-    model_name: str ="meta-llama/Llama-3.2-1B-Instruct"
+    model_name: str = "meta-llama/Llama-3.2-1B-Instruct"
     top_k: int = 3
 
+class UploadResp(BaseModel):
+    filename: str
+    minio_object: str
+    indexed: str  # "background"
+    job_id: Optional[str] = None
 
+class AskResp(BaseModel):
+    answer: str
+    used_chunks: int
+
+# ---------- Helpers ----------
+def index_pdf_to_milvus(file_path: str) -> None:
+    """PDF → text → chunks → Milvus"""
+    text = parse_pdf(file_path)
+    if not text:
+        raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
+    chunks = chunk_text(text)
+    if not chunks:
+        raise RuntimeError("Chunking 결과가 비었습니다.")
+
+    MilvusStore.wait_for_milvus()
+    db = MilvusStore()
+    db.add_texts(chunks)
+
+# ---------- Routes ----------
 @router.get("/test")
 def test():
     return {"status": "LLaMA router is working"}
-
 
 @router.post("/generate")
 def generate(body: GenerateReq):
@@ -40,16 +65,17 @@ def generate(body: GenerateReq):
         result = generate_answer(body.prompt, model, tokenizer)
         return {"response": result}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"모델 응답 생성 실패: {e}")
+        raise HTTPException(500, f"모델 응답 생성 실패: {e}")
 
-
-@router.post("/upload")
-async def upload_document(file: UploadFile = File(...), bg: BackgroundTasks = None):
-    # 간단한 확장자 체크 (pdf만 허용)
+@router.post("/upload", response_model=UploadResp)
+async def upload_document(
+    background_tasks: BackgroundTasks,           # ✅ Optional/기본값 쓰지 말 것
+    file: UploadFile = File(...),
+):
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
+        raise HTTPException(400, "PDF 파일만 업로드 가능합니다.")
 
-    minio_store = MinIOStore()
+    minio = MinIOStore()
 
     try:
         # 1) 로컬 저장
@@ -61,49 +87,35 @@ async def upload_document(file: UploadFile = File(...), bg: BackgroundTasks = No
 
         # 2) MinIO 업로드 (유니크 오브젝트명)
         object_name = f"uploaded/{uuid.uuid4().hex}_{safe_name}"
-        minio_store.upload(local_path, object_name=object_name, content_type="application/pdf")
+        minio.upload(local_path, object_name=object_name, content_type="application/pdf")
 
-        # 3) 텍스트 → chunk → Milvus 저장 (무거우면 백그라운드로)
-        def _index_pdf(path: str):
-            text = parse_pdf(path)
-            if not text:
-                # 파싱 실패나 빈 문서
-                raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
-            chunks = chunk_text(text)
-            if not chunks:
-                raise RuntimeError("Chunking 결과가 비었습니다.")
+        # 3) Milvus 인덱싱: 항상 백그라운드
+        job_id = uuid.uuid4().hex
+        background_tasks.add_task(index_pdf_to_milvus, local_path)
 
-            MilvusStore.wait_for_milvus()
-            db = MilvusStore()
-            db.add_texts(chunks)
-
-        if bg is not None:
-            # 비동기 인덱싱 (업로드 응답은 즉시 반환)
-            bg.add_task(_index_pdf, local_path)
-            return {"filename": safe_name, "minio_object": object_name, "indexed": "background"}
-        else:
-            # 동기 인덱싱 (요청이 끝날 때까지 대기)
-            _index_pdf(local_path)
-            return {"filename": safe_name, "minio_object": object_name, "indexed": "sync"}
+        return UploadResp(
+            filename=safe_name,
+            minio_object=object_name,
+            indexed="background",
+            job_id=job_id,
+        )
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"업로드 처리 중 오류: {e}")
+        raise HTTPException(500, f"업로드 처리 중 오류: {e}")
 
-
-@router.post("/ask")
+@router.post("/ask", response_model=AskResp)
 def ask_question(body: AskReq):
     try:
         MilvusStore.wait_for_milvus()
         db = MilvusStore()
-        retrieved_chunks: List[str] = db.search(body.question, top_k=body.top_k)
+        retrieved: List[str] = db.search(body.question, top_k=body.top_k)
 
-        if not retrieved_chunks:
-            # 콜드 스타트 등 대비
-            raise HTTPException(status_code=404, detail="관련 문서를 찾지 못했습니다. 먼저 문서를 업로드/인덱싱 해주세요.")
+        if not retrieved:
+            raise HTTPException(404, "관련 문서를 찾지 못했습니다. 먼저 문서를 업로드/인덱싱 해주세요.")
 
-        context = "\n\n".join(retrieved_chunks)
+        context = "\n\n".join(retrieved)
         prompt = f"""아래 문서를 참고해서 질문에 정확히 답하세요. 근거가 없으면 모른다고 답합니다.
 
 [문서 발췌]
@@ -114,34 +126,65 @@ def ask_question(body: AskReq):
 
 [답변]
 """
-
         model, tokenizer = load_model(body.model_name)
         answer = generate_answer(prompt, model, tokenizer)
-        return {"answer": answer, "used_chunks": len(retrieved_chunks)}
+        return AskResp(answer=answer, used_chunks=len(retrieved))
 
     except HTTPException:
         raise
     except RuntimeError as milvus_error:
-        raise HTTPException(status_code=503, detail=f"Milvus 연결 대기/검색 실패: {milvus_error}")
+        raise HTTPException(503, f"Milvus 연결 대기/검색 실패: {milvus_error}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"질의 처리 중 오류: {e}")
+        raise HTTPException(500, f"질의 처리 중 오류: {e}")
 
-
+# ---------- MinIO Utilities ----------
 @router.get("/files")
-def list_files():
-    minio_store = MinIOStore()
+def list_files(
+    prefix: str = Query("", description="prefix로 필터링 (예: 'uploaded/')"),
+):
     try:
-        files = minio_store.list_files()
-        return {"files": files}
+        return {"files": MinIOStore().list_files(prefix=prefix)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"MinIO 파일 조회 실패: {e}")
-    
+        raise HTTPException(500, f"MinIO 파일 조회 실패: {e}")
+
 @router.get("/file/{object_name}")
-def get_file(object_name: str):
-    minio_store = MinIOStore()
+def get_file_url(
+    object_name: str,
+    method: str = Query("GET", pattern="^(GET|PUT)$"),
+    minutes: int = Query(60, ge=1, le=7*24*60, description="URL 만료 시간(분)"),
+    download_name: Optional[str] = Query(
+        None, description="다운로드 파일명 지정 시 Content-Disposition 헤더 세팅"
+    ),
+):
     try:
-        url = minio_store.presigned_url(object_name, method="GET")
+        from datetime import timedelta
+        minio = MinIOStore()
+
+        response_headers = None
+        if download_name:
+            response_headers = {
+                "response-content-disposition": f'attachment; filename="{download_name}"'
+            }
+
+        url = minio.presigned_url(
+            object_name=object_name,
+            method=method,
+            expires=timedelta(minutes=minutes),
+            response_headers=response_headers,
+        )
         return {"url": url}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"파일 다운로드 URL 생성 실패: {e}")
-    
+        raise HTTPException(500, f"파일 사전서명 URL 생성 실패: {e}")
+
+@router.delete("/file/{object_name}")
+def delete_file(object_name: str):
+    try:
+        minio = MinIOStore()
+        if not minio.exists(object_name):
+            raise HTTPException(404, "파일이 존재하지 않습니다.")
+        minio.delete(object_name)
+        return {"status": "ok", "deleted": object_name}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"파일 삭제 실패: {e}")
