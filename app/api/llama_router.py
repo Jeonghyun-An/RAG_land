@@ -266,6 +266,29 @@ def doc_status(doc_id: str):
     except Exception as e:
         raise HTTPException(500, f"Milvus 조회 실패: {e}")
 
+# ========== SSE Stream for Job Status =========
+@router.get("/job/{job_id}/stream")
+async def stream_job(job_id: str):
+    async def event_gen():
+        last_serialized = None
+        while True:
+            st = job_state.get(job_id)
+            if not st:
+                yield {"event": "error", "data": json.dumps({"error": "not found"}, ensure_ascii=False)}
+                break
+
+            data = json.dumps(st, ensure_ascii=False)
+            if data != last_serialized:
+                yield {"event": "update", "data": data}
+                last_serialized = data
+
+                # 종료 조건
+                if st.get("status") in ("done", "error"):
+                    break
+
+            await asyncio.sleep(1)
+
+    return EventSourceResponse(event_gen())
 
 # ---------- MinIO Utilities ----------
 @router.get("/files")
