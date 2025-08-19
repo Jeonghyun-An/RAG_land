@@ -169,7 +169,7 @@ services:
       MILVUS_PORT: "19530"
       MILVUS_COLLECTION: "rag_chunks_v2"
       # 컬렉션 초기화/업서트 옵션 (필요 시만 1로)
-      RAG_RESET_COLLECTION: "1"
+      RAG_RESET_COLLECTION: "0"
       RAG_REPLACE_DOC: "0"
       RAG_DELETE_AFTER_INDEX: "0"
       # 임베딩

@@ -278,3 +278,57 @@ def delete_file(object_name: str):
         raise
     except Exception as e:
         raise HTTPException(500, f"파일 삭제 실패: {e}")
+
+# ---------- Bulk delete MinIO files under a prefix ----------
+@router.delete("/files/purge", tags=["llama"])
+def purge_files(
+    prefix: str = Query("uploaded/", description="지울 경로 prefix (반드시 'uploaded/'로 시작)"),
+    dry_run: bool = Query(False, description="true면 실제 삭제하지 않고 목록만 반환"),
+    limit_preview: int = Query(50, ge=1, le=500, description="dry_run 때 미리보기 최대 개수"),
+):
+    """
+    MinIO에서 특정 prefix 하위 객체들을 일괄 삭제.
+    - 안전장치: prefix가 'uploaded/'로 시작하지 않으면 400 에러
+    - dry_run=True 면 삭제 없이 목록 미리보기만
+    """
+    if not prefix or not prefix.startswith("uploaded/"):
+        raise HTTPException(400, "prefix는 반드시 'uploaded/'로 시작해야 합니다.")
+
+    try:
+        minio = MinIOStore()
+        files = minio.list_files(prefix=prefix)
+    except Exception as e:
+        raise HTTPException(500, f"MinIO 목록 조회 실패: {e}")
+
+    matched = len(files)
+    if dry_run:
+        # 너무 길면 일부만 보여줌
+        preview = files[:limit_preview]
+        more = max(0, matched - len(preview))
+        return {
+            "status": "dry-run",
+            "prefix": prefix,
+            "matched": matched,
+            "preview": preview,
+            "more": more,
+        }
+
+    deleted = 0
+    failed = 0
+    errors = []
+    for obj in files:
+        try:
+            minio.delete(obj)
+            deleted += 1
+        except Exception as e:
+            failed += 1
+            errors.append({"object": obj, "error": str(e)})
+
+    return {
+        "status": "ok",
+        "prefix": prefix,
+        "matched": matched,
+        "deleted": deleted,
+        "failed": failed,
+        "errors": errors,
+    }
