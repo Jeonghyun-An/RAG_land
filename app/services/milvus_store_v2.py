@@ -208,3 +208,16 @@ class MilvusStoreV2:
                 }
             )
         return out
+    
+# ----------------카운트 관련----------------
+    def count_by_doc(self, doc_id: str) -> int:
+        try:
+            self.col.load()
+        except Exception:
+            pass
+        res = self.col.query(
+            expr=f'doc_id == "{doc_id}"',
+            output_fields=["doc_id"],
+            limit=100000
+        )
+        return len(res) if res else 0
