@@ -14,6 +14,11 @@ from app.services.llama_model import generate_answer_unified
 from app.services.milvus_store import MilvusStore
 from app.services.minio_store import MinIOStore
 from app.services.pdf_converter import convert_to_pdf, ConvertError
+from app.services.chunker import smart_chunk_pages
+from app.services.milvus_store_v2 import MilvusStoreV2
+from app.services.embedding_model import get_embedding_model, embed
+from app.services.reranker import rerank
+
 
 
 router = APIRouter(tags=["llama"])
@@ -40,21 +45,31 @@ class UploadResp(BaseModel):
 class AskResp(BaseModel):
     answer: str
     used_chunks: int
+    # (선택) 출처 제공
+    sources: Optional[List[dict]] = None
+
 
 # ---------- Helpers ----------
 def index_pdf_to_milvus(file_path: str) -> None:
-    """PDF → text → chunks → Milvus"""
     print(f"[INDEX] start: {file_path}")
-    text = parse_pdf(file_path)
-    if not text:
+    # 1) 페이지별 텍스트
+    pages = parse_pdf(file_path, by_page=True)
+    if not pages:
         raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
-    chunks = chunk_text(text)
+
+    # 2) 임베딩 토크나이저로 토큰 기준 청킹
+    model = get_embedding_model()
+    tokenizer = getattr(model, "tokenizer", None)
+    encode = tokenizer.encode if tokenizer and hasattr(tokenizer, "encode") else (lambda s: s.split())
+
+    chunks = smart_chunk_pages(pages, encode)
     if not chunks:
         raise RuntimeError("Chunking 결과가 비었습니다.")
 
-    MilvusStore.wait_for_milvus()
-    db = MilvusStore()
-    db.add_texts(chunks)
+    # 3) v2 컬렉션에 메타 포함 저장
+    store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+    doc_id = os.path.basename(file_path)
+    store.insert(doc_id, chunks, embed_fn=embed)
     print(f"[INDEX] done: {file_path} (chunks={len(chunks)})")
 
 # ---------- Routes ----------
@@ -110,14 +125,28 @@ async def upload_document(
 @router.post("/ask", response_model=AskResp)
 def ask_question(body: AskReq):
     try:
-        MilvusStore.wait_for_milvus()
-        db = MilvusStore()
-        retrieved: List[str] = db.search(body.question, top_k=body.top_k)
-
-        if not retrieved:
+        # 1) 초기 넉넉히 검색 (예: 20)
+        model = get_embedding_model()
+        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        cands = store.search(body.question, embed_fn=embed, topk=max(20, body.top_k*5))
+        if not cands:
             raise HTTPException(404, "관련 문서를 찾지 못했습니다. 먼저 문서를 업로드/인덱싱 해주세요.")
 
-        context = "\n\n".join(retrieved)
+        # 2) 리랭크 후 상위 k
+        topk = rerank(body.question, cands, top_k=body.top_k)
+
+        # 3) 임계값 컷오프(리랭커 스코어 기준, 필요시 조정)
+        THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.2"))
+        if "re_score" in topk[0] and topk[0]["re_score"] < THRESH:
+            return AskResp(answer="문서에서 답을 확실히 찾기 어렵습니다.", used_chunks=0, sources=[])
+
+        # 4) 컨텍스트 + 출처 만들기
+        context = ""
+        sources = []
+        for i, c in enumerate(topk, 1):
+            context += f"[{i}] (doc:{c['doc_id']} p.{c['page']} {c['section']})\n{c['chunk']}\n\n"
+            sources.append({"id": i, "doc_id": c["doc_id"], "page": c["page"], "section": c["section"]})
+
         prompt = f"""아래 문서를 참고해서 질문에 정확히 답하세요. 근거가 없으면 모른다고 답합니다.
 
 [문서 발췌]
@@ -126,10 +155,12 @@ def ask_question(body: AskReq):
 [질문]
 {body.question}
 
-[답변]
+[형식]
+- 한 문장 핵심 답
+- 필요하면 근거 출처 번호로 인용: [1]
 """
         answer = generate_answer_unified(prompt, body.model_name)
-        return AskResp(answer=answer, used_chunks=len(retrieved))
+        return AskResp(answer=answer, used_chunks=len(topk), sources=sources)
 
     except HTTPException:
         raise
