@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import json
+from io import BytesIO
 from datetime import timedelta
 from typing import Iterable, List, Optional, Union, BinaryIO
 from urllib.parse import urlparse
@@ -206,3 +208,14 @@ class MinIOStore:
         stat = self.client.stat_object(self.bucket, object_name)
         return getattr(stat, "size", 0)
 
+    def put_json(self, object_name: str, obj: dict) -> None:
+        """딕셔너리를 JSON으로 직렬화하여 MinIO에 저장(상태체크 등)"""
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        bio = BytesIO(data)
+        self.client.put_object(
+            bucket_name=self.bucket,
+            object_name=object_name,
+            data=bio,
+            length=len(data),
+            content_type="application/json",
+        )
