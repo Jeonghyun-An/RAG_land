@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import os
 import uuid
-import hashlib
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
 from pydantic import BaseModel
+import asyncio, json
+from sse_starlette.sse import EventSourceResponse  # ✅ 요구사항: sse-starlette
+from app.services import job_state
 
 from app.services.file_parser import parse_pdf
 from app.services.llama_model import generate_answer_unified
@@ -50,55 +52,69 @@ class AskResp(BaseModel):
 
 # ---------- Helpers ----------
 def index_pdf_to_milvus(
+    job_id: str,
     file_path: str,
     minio_object: str | None = None,
     uploaded: bool = True,
     remove_local: bool = True,
     doc_id: str | None = None,
 ) -> None:
-    print(f"[INDEX] start: {file_path}")
+    try:
+        job_state.update(job_id, status="parsing", step="parse_pdf:start")
+        print(f"[INDEX] start: {file_path}")
 
-    # 1) 페이지별 텍스트 파싱
-    pages = parse_pdf(file_path, by_page=True)
-    if not pages:
-        raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
+        # 1) 페이지별 텍스트 파싱
+        pages = parse_pdf(file_path, by_page=True)
+        if not pages:
+            raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
 
-    # 2) 토큰 기준 청킹
-    model = get_embedding_model()
-    tokenizer = getattr(model, "tokenizer", None)
-    if tokenizer and hasattr(tokenizer, "encode"):
-        encode = lambda s: tokenizer.encode(s, add_special_tokens=False)
-    else:
-        encode = lambda s: s.split()
+        # 2) 토큰 기준 청킹
+        model = get_embedding_model()
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer and hasattr(tokenizer, "encode"):
+            encode = lambda s: tokenizer.encode(s, add_special_tokens=False)
+        else:
+            encode = lambda s: s.split()
 
-    chunks = smart_chunk_pages(pages, encode)
-    if not chunks:
-        raise RuntimeError("Chunking 결과가 비었습니다.")
+        job_state.update(job_id, status="chunking", step="chunk:start", progress=35)
+        chunks = smart_chunk_pages(pages, encode)
+        if not chunks:
+            raise RuntimeError("Chunking 결과가 비었습니다.")
+        job_state.update(job_id, status="chunking", step="chunk:done", chunks=len(chunks), progress=50)
 
-    # 3) doc_id 확정 (넘겨받은 값 > MinIO 객체명 > 파일명)
-    if not doc_id:
-        base_from_obj = os.path.splitext(os.path.basename(minio_object or ""))[0] if minio_object else None
-        doc_id = base_from_obj or os.path.splitext(os.path.basename(file_path))[0]
+        # 3) doc_id 확정 (넘겨받은 값 > MinIO 객체명 > 파일명)
+        if not doc_id:
+            base_from_obj = os.path.splitext(os.path.basename(minio_object or ""))[0] if minio_object else None
+            doc_id = base_from_obj or os.path.splitext(os.path.basename(file_path))[0]
 
-    # 4) Milvus upsert
-    store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-    store.insert(doc_id, chunks, embed_fn=embed)
-    print(f"[INDEX] done: {file_path} (doc_id={doc_id}, chunks={len(chunks)})")
+        # 4) Milvus upsert
+        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        job_state.update(job_id, status="embedding", step="embed:start", progress=60)
+        store.insert(doc_id, chunks, embed_fn=embed)
+        print(f"[INDEX] done: {file_path} (doc_id={doc_id}, chunks={len(chunks)})")
+        job_state.update(job_id, status="indexing", step="milvus:inserted", progress=90)
 
-    # 5) MinIO 원본 삭제는 "이번에 새로 올린(uploaded=True)" 경우에만
-    if os.getenv("RAG_DELETE_AFTER_INDEX", "0") == "1" and minio_object and uploaded:
-        try:
-            MinIOStore().delete(minio_object)
-            print(f"[CLEANUP] deleted from MinIO: {minio_object}")
-        except Exception as e:
-            print(f"[CLEANUP] delete failed: {e}")
+        # 5) MinIO 원본 삭제는 "이번에 새로 올린(uploaded=True)" 경우에만
+        if os.getenv("RAG_DELETE_AFTER_INDEX", "0") == "1" and minio_object and uploaded:
+            try:
+                MinIOStore().delete(minio_object)
+                print(f"[CLEANUP] deleted from MinIO: {minio_object}")
+                job_state.update(job_id, status="cleanup", step="minio:deleted", minio_object=minio_object, progress=95)
+            except Exception as e:
+                print(f"[CLEANUP] delete failed: {e}")
+                job_state.update(job_id, status="cleanup", step=f"minio:delete_failed:{e!s}")
 
-    # 6) 로컬 파일 정리 옵션
-    if remove_local:
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
+
+        # 6) 로컬 파일 정리 옵션
+        if remove_local:
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+        job_state.complete(job_id, pages=len(pages), chunks=len(chunks), doc_id=(doc_id or os.path.basename(file_path)))
+    except Exception as e:
+        job_state.fail(job_id, str(e))
+        raise
 
 # ---------- Routes ----------
 @router.get("/test")
@@ -114,7 +130,6 @@ def generate(body: GenerateReq):
         raise HTTPException(500, f"모델 응답 생성 실패: {e}")
 
 
-# app/api/llama_router.py (업로드 함수 일부만 교체)
 
 @router.post("/upload", response_model=UploadResp)
 async def upload_document(
@@ -169,6 +184,8 @@ async def upload_document(
 
     # 인덱싱(백그라운드) - uploaded 플래그 전달
     job_id = uuid.uuid4().hex
+    job_state.start(job_id, doc_id=doc_id, minio_object=object_pdf)
+    job_state.update(job_id, status="uploaded", step="minio:ok", filename=safe_name, progress=10)
     # 백그라운드 호출 시 'uploaded'와 'doc_id'를 반드시 넘겨야 함
     background_tasks.add_task(index_pdf_to_milvus, pdf_path, object_pdf, uploaded, True, doc_id)
 
@@ -226,6 +243,29 @@ def ask_question(body: AskReq):
         raise HTTPException(503, f"Milvus 연결 대기/검색 실패: {milvus_error}")
     except Exception as e:
         raise HTTPException(500, f"질의 처리 중 오류: {e}")
+
+# ---------- Job State Management ----------
+@router.get("/job/{job_id}")
+def get_job(job_id: str):
+    st = job_state.get(job_id)
+    if not st:
+        raise HTTPException(404, "해당 job_id를 찾을 수 없습니다.")
+    return st
+
+@router.get("/jobs")
+def list_jobs(status: Optional[str] = Query(None), limit: int = Query(50, ge=1, le=500)):
+    return {"jobs": job_state.list_jobs(status=status, limit=limit)}
+
+@router.get("/doc/{doc_id}")
+def doc_status(doc_id: str):
+    try:
+        model = get_embedding_model()
+        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        cnt = store.count_by_doc(doc_id)
+        return {"doc_id": doc_id, "chunks": cnt, "indexed": cnt > 0}
+    except Exception as e:
+        raise HTTPException(500, f"Milvus 조회 실패: {e}")
+
 
 # ---------- MinIO Utilities ----------
 @router.get("/files")
