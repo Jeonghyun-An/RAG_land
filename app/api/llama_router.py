@@ -8,10 +8,8 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
 from pydantic import BaseModel
 
-from app.services.chunker import chunk_text
 from app.services.file_parser import parse_pdf
 from app.services.llama_model import generate_answer_unified
-from app.services.milvus_store import MilvusStore
 from app.services.minio_store import MinIOStore
 from app.services.pdf_converter import convert_to_pdf, ConvertError
 from app.services.chunker import smart_chunk_pages
@@ -60,7 +58,11 @@ def index_pdf_to_milvus(file_path: str) -> None:
     # 2) 임베딩 토크나이저로 토큰 기준 청킹
     model = get_embedding_model()
     tokenizer = getattr(model, "tokenizer", None)
-    encode = tokenizer.encode if tokenizer and hasattr(tokenizer, "encode") else (lambda s: s.split())
+    if tokenizer and hasattr(tokenizer, "encode"):
+        encode = lambda s: tokenizer.encode(s, add_special_tokens=False)
+    else:
+        encode = lambda s: s.split()
+
 
     chunks = smart_chunk_pages(pages, encode)
     if not chunks:
