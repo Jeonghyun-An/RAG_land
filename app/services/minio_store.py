@@ -200,3 +200,9 @@ class MinIOStore:
             return bool(self.client.bucket_exists(self.bucket))
         except Exception:
             return False
+        
+    def size(self, object_name: str) -> int:
+        """객체 크기(바이트) 리턴. 없으면 예외."""
+        stat = self.client.stat_object(self.bucket, object_name)
+        return getattr(stat, "size", 0)
+

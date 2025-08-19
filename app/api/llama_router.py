@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import hashlib
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
@@ -48,14 +49,21 @@ class AskResp(BaseModel):
 
 
 # ---------- Helpers ----------
-def index_pdf_to_milvus(file_path: str) -> None:
+def index_pdf_to_milvus(
+    file_path: str,
+    minio_object: str | None = None,
+    uploaded: bool = True,
+    remove_local: bool = True,
+    doc_id: str | None = None,
+) -> None:
     print(f"[INDEX] start: {file_path}")
-    # 1) 페이지별 텍스트
+
+    # 1) 페이지별 텍스트 파싱
     pages = parse_pdf(file_path, by_page=True)
     if not pages:
         raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
 
-    # 2) 임베딩 토크나이저로 토큰 기준 청킹
+    # 2) 토큰 기준 청킹
     model = get_embedding_model()
     tokenizer = getattr(model, "tokenizer", None)
     if tokenizer and hasattr(tokenizer, "encode"):
@@ -63,16 +71,34 @@ def index_pdf_to_milvus(file_path: str) -> None:
     else:
         encode = lambda s: s.split()
 
-
     chunks = smart_chunk_pages(pages, encode)
     if not chunks:
         raise RuntimeError("Chunking 결과가 비었습니다.")
 
-    # 3) v2 컬렉션에 메타 포함 저장
+    # 3) doc_id 확정 (넘겨받은 값 > MinIO 객체명 > 파일명)
+    if not doc_id:
+        base_from_obj = os.path.splitext(os.path.basename(minio_object or ""))[0] if minio_object else None
+        doc_id = base_from_obj or os.path.splitext(os.path.basename(file_path))[0]
+
+    # 4) Milvus upsert
     store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-    doc_id = os.path.basename(file_path)
     store.insert(doc_id, chunks, embed_fn=embed)
-    print(f"[INDEX] done: {file_path} (chunks={len(chunks)})")
+    print(f"[INDEX] done: {file_path} (doc_id={doc_id}, chunks={len(chunks)})")
+
+    # 5) MinIO 원본 삭제는 "이번에 새로 올린(uploaded=True)" 경우에만
+    if os.getenv("RAG_DELETE_AFTER_INDEX", "0") == "1" and minio_object and uploaded:
+        try:
+            MinIOStore().delete(minio_object)
+            print(f"[CLEANUP] deleted from MinIO: {minio_object}")
+        except Exception as e:
+            print(f"[CLEANUP] delete failed: {e}")
+
+    # 6) 로컬 파일 정리 옵션
+    if remove_local:
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
 
 # ---------- Routes ----------
 @router.get("/test")
@@ -87,6 +113,8 @@ def generate(body: GenerateReq):
     except Exception as e:
         raise HTTPException(500, f"모델 응답 생성 실패: {e}")
 
+
+# app/api/llama_router.py (업로드 함수 일부만 교체)
 
 @router.post("/upload", response_model=UploadResp)
 async def upload_document(
@@ -110,12 +138,40 @@ async def upload_document(
 
     # 3) MinIO 업로드 (원본 + 변환본 둘 다 올리고 싶으면 선택)
     minio = MinIOStore()
-    object_pdf = f"uploaded/{uuid.uuid4().hex}_{os.path.basename(pdf_path)}"
-    minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
 
-    # 4) 인덱싱(백그라운드)
+    # ✅ 기본 키: 파일명 그대로
+    pdf_name = os.path.basename(pdf_path)               # 예: doc.pdf
+    object_pdf = f"uploaded/{pdf_name}"                 # 예: uploaded/doc.pdf
+    uploaded = True
+
+    # 중복 체크: 이름 같고, 사이즈(바이트) 같으면 스킵
+    if minio.exists(object_pdf):
+        try:
+            remote_size = minio.size(object_pdf)
+        except Exception:
+            remote_size = -1
+        local_size = os.path.getsize(pdf_path)
+
+        if remote_size == local_size and remote_size > -1:
+            uploaded = False
+            print(f"[UPLOAD] dedup hit: {object_pdf} (same name & size)")
+        else:
+            # 이름은 같지만 사이즈 다르면 충돌 회피용 새 키로 저장
+            object_pdf = f"uploaded/{uuid.uuid4().hex}_{pdf_name}"
+            minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
+            print(f"[UPLOAD] name match but size differs -> stored as: {object_pdf}")
+    else:
+        minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
+        print(f"[UPLOAD] stored: {object_pdf}")
+
+    # doc_id는 오브젝트 파일명(확장자 제외)로 통일하면 충돌 안 남
+    doc_id = os.path.splitext(os.path.basename(object_pdf))[0]
+
+    # 인덱싱(백그라운드) - uploaded 플래그 전달
     job_id = uuid.uuid4().hex
-    background_tasks.add_task(index_pdf_to_milvus, pdf_path)
+    # 백그라운드 호출 시 'uploaded'와 'doc_id'를 반드시 넘겨야 함
+    background_tasks.add_task(index_pdf_to_milvus, pdf_path, object_pdf, uploaded, True, doc_id)
+
 
     return UploadResp(
         filename=safe_name,
