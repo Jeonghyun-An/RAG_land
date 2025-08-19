@@ -186,8 +186,7 @@ async def upload_document(
     job_id = uuid.uuid4().hex
     job_state.start(job_id, doc_id=doc_id, minio_object=object_pdf)
     job_state.update(job_id, status="uploaded", step="minio:ok", filename=safe_name, progress=10)
-    # 백그라운드 호출 시 'uploaded'와 'doc_id'를 반드시 넘겨야 함
-    background_tasks.add_task(index_pdf_to_milvus, pdf_path, object_pdf, uploaded, True, doc_id)
+    background_tasks.add_task(index_pdf_to_milvus,job_id, pdf_path, object_pdf, uploaded, True, doc_id)
 
 
     return UploadResp(
