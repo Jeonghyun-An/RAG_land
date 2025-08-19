@@ -35,7 +35,7 @@ services:
     networks: [ragnet]
     ports: []               # 외부 노출 불필요 (fastapi가 내부에서 호출)
     restart: unless-stopped
-    
+
   minio:
     image: minio/minio:RELEASE.2023-01-20T02-05-44Z
     container_name: minio
@@ -167,6 +167,14 @@ services:
       MINIO_SECRET_KEY: "minioadmin"
       MILVUS_HOST: "milvus"
       MILVUS_PORT: "19530"
+      MILVUS_COLLECTION: "rag_chunks_v2"
+      # 컬렉션 초기화/업서트 옵션 (필요 시만 1로)
+      RAG_RESET_COLLECTION: "1"
+      RAG_REPLACE_DOC: "0"
+      RAG_DELETE_AFTER_INDEX: "0"
+      # 임베딩
+      EMBEDDING_MODEL: "jhgan/ko-sbert-nli"
+      EMBED_MAX_TOKENS: "128"
       # 모델 기본값/토큰
       MODEL_ID: "meta-llama/Llama-3.2-1B-Instruct"
       HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"   # .env나 OS env에서 가져옴(없으면 빈 값)
