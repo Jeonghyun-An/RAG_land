@@ -171,7 +171,11 @@ services:
       RAG_JOB_STATE_PERSIST: "minio"
       # 컬렉션 초기화/업서트 옵션 (필요 시만 1로)
       RAG_RESET_COLLECTION: "0"
-      RAG_REPLACE_DOC: "0"
+      # Dedup / 교체 정책
+      RAG_SKIP_IF_EXISTS: "0"              # 같은 doc_id 있으면 스킵 (매니페스트 OFF일 때)
+      RAG_REPLACE_DOC: "1"                 # 같은 doc_id 있으면 삭제 후 재삽입
+      RAG_DEDUP_MANIFEST: "1"              # MinIO docs/{doc_id}.json 해시 비교/저장
+      RAG_UNIQUE_SUFFIX_ON_CONFLICT: "1"   # REPLACE=0이고 충돌이면 doc_id__hash 로 새로 삽입
       RAG_DELETE_AFTER_INDEX: "0"
       # 임베딩
       EMBEDDING_MODEL: "jhgan/ko-sbert-nli"

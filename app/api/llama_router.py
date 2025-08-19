@@ -60,13 +60,15 @@ def index_pdf_to_milvus(
     doc_id: str | None = None,
 ) -> None:
     try:
+        # 0) 시작 로그
         job_state.update(job_id, status="parsing", step="parse_pdf:start")
         print(f"[INDEX] start: {file_path}")
 
-        # 1) 페이지별 텍스트 파싱
+        # 1) PDF → 페이지 텍스트
         pages = parse_pdf(file_path, by_page=True)
         if not pages:
             raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
+        job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
 
         # 2) 토큰 기준 청킹
         model = get_embedding_model()
@@ -87,14 +89,33 @@ def index_pdf_to_milvus(
             base_from_obj = os.path.splitext(os.path.basename(minio_object or ""))[0] if minio_object else None
             doc_id = base_from_obj or os.path.splitext(os.path.basename(file_path))[0]
 
-        # 4) Milvus upsert
+        # 4) Milvus upsert (삽입/스킵 결과 반영)
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
         job_state.update(job_id, status="embedding", step="embed:start", progress=60)
-        store.insert(doc_id, chunks, embed_fn=embed)
-        print(f"[INDEX] done: {file_path} (doc_id={doc_id}, chunks={len(chunks)})")
-        job_state.update(job_id, status="indexing", step="milvus:inserted", progress=90)
 
-        # 5) MinIO 원본 삭제는 "이번에 새로 올린(uploaded=True)" 경우에만
+        res = store.insert(doc_id, chunks, embed_fn=embed)  # <- 반환값 활용! {inserted, skipped, reason, doc_id}
+        real_doc_id = res.get("doc_id", doc_id)
+
+        if res.get("skipped"):
+            job_state.update(
+                job_id,
+                status="indexing",
+                step=f"milvus:skipped:{res.get('reason')}",
+                progress=90,
+                doc_id=real_doc_id,
+            )
+            print(f"[INDEX] skipped: doc_id={real_doc_id}, reason={res.get('reason')}")
+        else:
+            job_state.update(
+                job_id,
+                status="indexing",
+                step=f"milvus:inserted:{res.get('inserted',0)}",
+                progress=90,
+                doc_id=real_doc_id,
+            )
+            print(f"[INDEX] done: {file_path} (doc_id={real_doc_id}, chunks={len(chunks)}, inserted={res.get('inserted',0)})")
+
+        # 5) MinIO 원본 삭제(옵션) — 이번 요청에서 새로 올린(uploaded=True) 건만 정리
         if os.getenv("RAG_DELETE_AFTER_INDEX", "0") == "1" and minio_object and uploaded:
             try:
                 MinIOStore().delete(minio_object)
@@ -104,17 +125,28 @@ def index_pdf_to_milvus(
                 print(f"[CLEANUP] delete failed: {e}")
                 job_state.update(job_id, status="cleanup", step=f"minio:delete_failed:{e!s}")
 
-
-        # 6) 로컬 파일 정리 옵션
+        # 6) 로컬 파일 정리(옵션)
         if remove_local:
             try:
                 os.remove(file_path)
             except Exception:
                 pass
-        job_state.complete(job_id, pages=len(pages), chunks=len(chunks), doc_id=(doc_id or os.path.basename(file_path)))
+
+        # 7) 완료 (삽입/스킵 모두 완료로 마무리)
+        job_state.complete(
+            job_id,
+            pages=len(pages),
+            chunks=len(chunks),
+            doc_id=real_doc_id,
+            inserted=int(res.get("inserted", 0)),
+            skipped=bool(res.get("skipped", False)),
+            reason=res.get("reason"),
+        )
+
     except Exception as e:
         job_state.fail(job_id, str(e))
         raise
+
 
 # ---------- Routes ----------
 @router.get("/test")
@@ -394,3 +426,44 @@ def purge_files(
         "failed": failed,
         "errors": errors,
     }
+
+# ========= Debug / Inspection =========
+
+@router.get("/debug/milvus/info")
+def debug_milvus_info():
+    """ Milvus 상태 정보 조회"""
+    try:
+        model = get_embedding_model()
+        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        return store.stats()
+    except Exception as e:
+        raise HTTPException(500, f"Milvus info 조회 실패: {e}")
+
+@router.get("/debug/milvus/peek")
+def debug_milvus_peek(limit: int = 5):
+    """ Milvus 컬렉션의 일부 데이터 미리보기 """
+    try:
+        model = get_embedding_model()
+        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        return {"items": store.peek(limit=limit)}
+    except Exception as e:
+        raise HTTPException(500, f"Milvus peek 실패: {e}")
+
+@router.get("/debug/milvus/by-doc")
+def debug_milvus_by_doc(doc_id: str, limit: int = 10):
+    try:
+        model = get_embedding_model()
+        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        return {"items": store.query_by_doc(doc_id=doc_id, limit=limit)}
+    except Exception as e:
+        raise HTTPException(500, f"Milvus by-doc 실패: {e}")
+
+@router.get("/debug/search")
+def debug_vector_search(q: str, k: int = 5):
+    try:
+        model = get_embedding_model()
+        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        raw = store.debug_search(q, embed_fn=embed, topk=k)
+        return {"results": raw}
+    except Exception as e:
+        raise HTTPException(500, f"디버그 검색 실패: {e}")
