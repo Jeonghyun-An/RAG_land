@@ -29,7 +29,7 @@ def embed(texts: List[str]) -> List[List[float]]:
         texts,
         convert_to_numpy=True,
         normalize_embeddings=True,  # ← IP 사용 시 cos와 동일하게
-        truncate=True               # ← 길면 안전하게 자르기
+        # truncate=True               # ← 길면 안전하게 자르기
     ).tolist()
 
 # (옵션) 다른 모듈에서 편하게 쓰라고 헬퍼 추가
