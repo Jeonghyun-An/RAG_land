@@ -1,33 +1,284 @@
-# app/services/file_parser.py
 from __future__ import annotations
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional
+import os
+
+"""
+PDF 텍스트 추출
+- OCR 모드: OCR_MODE in {"auto","always","never"} (default=auto)
+- OCR 엔진: OCR_ENGINE in {"paddle","tesseract","easyocr"} (default=paddle)
+- 언어:
+    * paddle : "korean" 또는 "en", "ch" 등
+    * tesseract : "kor+eng" 같은 조합
+    * easyocr : "ko,en" 같은 콤마구분
+- 렌더링 DPI: OCR_DPI (default=300)
+- 추가 옵션:
+    * OCR_TESSERACT_CMD: pytesseract 실행 파일 경로(Windows 등)
+    * OCR_EASYOCR_GPU: "1"이면 GPU 사용 시도, 기본 "0"
+    * OCR_MIN_CHARS: auto 모드에서 OCR 전환 기준(기본 40)
+"""
+
+# ---------------------- Text extract (no OCR) ---------------------- #
+def _extract_text_pdfminer(path: str, by_page: bool) -> Union[str, List[Tuple[int, str]]]:
+    import pdfminer.high_level
+    from pdfminer.layout import LAParams
+    laparams = LAParams()
+    if not by_page:
+        return (pdfminer.high_level.extract_text(path, laparams=laparams) or "").strip()
+    pages: List[Tuple[int, str]] = []
+    for i, page in enumerate(pdfminer.high_level.extract_pages(path, laparams=laparams), start=1):
+        text = "".join([elem.get_text() for elem in page if hasattr(elem, "get_text")]).strip()
+        if text:
+            pages.append((i, text))
+    return pages
+
+def _extract_text_pypdf2(path: str, by_page: bool) -> Union[str, List[Tuple[int, str]]]:
+    from PyPDF2 import PdfReader
+    reader = PdfReader(path)
+    if not by_page:
+        txt = "\n\n".join([(p.extract_text() or "") for p in reader.pages]).strip()
+        return txt
+    pages: List[Tuple[int, str]] = []
+    for i, p in enumerate(reader.pages, start=1):
+        t = (p.extract_text() or "").strip()
+        if t:
+            pages.append((i, t))
+    return pages
+
+# ---------------------- Common rendering (PyMuPDF) ---------------------- #
+def _render_pdf_pages_fitz(path: str, dpi: int):
+    """Yields (page_index_1based, np.ndarray[h,w,3] RGB)"""
+    import fitz  # PyMuPDF
+    import numpy as np
+
+    zoom = max(1.0, dpi / 72.0)  # 72dpi 기준
+    mat = fitz.Matrix(zoom, zoom)
+    doc = fitz.open(path)
+
+    for i, page in enumerate(doc, start=1):
+        pix = page.get_pixmap(matrix=mat, alpha=False)  # RGB
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        yield i, img
+
+# ---------------------- OCR engines (via fitz images) ---------------------- #
+def _ocr_with_paddle(images_iter, by_page: bool, lang: str) -> Union[str, List[Tuple[int, str]]]:
+    from paddleocr import PaddleOCR
+    ocr = PaddleOCR(lang=("korean" if lang in ("kor", "korean", "ko") else lang), show_log=False)
+    pages: List[Tuple[int, str]] = []
+    for pno, img in images_iter:
+        result = ocr.ocr(img, cls=True)
+        # result[0] = [ [box, (text, conf)], ... ]
+        text = " ".join([line[1][0] for line in (result[0] or []) if line[1] and line[1][0]]).strip()
+        if text:
+            pages.append((pno, text))
+    if by_page:
+        return pages
+    return "\n\n".join([t for _, t in pages]).strip()
+
+def _ocr_with_tesseract(images_iter, by_page: bool, lang: str) -> Union[str, List[Tuple[int, str]]]:
+    import pytesseract
+    from PIL import Image
+    # Windows 등 경로 지정이 필요할 때:
+    tcmd = os.getenv("OCR_TESSERACT_CMD")
+    if tcmd:
+        pytesseract.pytesseract.tesseract_cmd = tcmd
+
+    pages: List[Tuple[int, str]] = []
+    for pno, img in images_iter:
+        pil = Image.fromarray(img)
+        text = pytesseract.image_to_string(pil, lang=(lang or "kor+eng")).strip()
+        if text:
+            pages.append((pno, text))
+    if by_page:
+        return pages
+    return "\n\n".join([t for _, t in pages]).strip()
+
+def _ocr_with_easyocr(images_iter, by_page: bool, lang: str) -> Union[str, List[Tuple[int, str]]]:
+    import easyocr
+    # easyocr 언어코드: ['ko','en'] 형태
+    langs = [l.strip() for l in (lang or "ko,en").replace("+", ",").split(",")]
+    gpu = os.getenv("OCR_EASYOCR_GPU", "0").strip() == "1"
+    reader = easyocr.Reader(langs, gpu=gpu)
+
+    pages: List[Tuple[int, str]] = []
+    for pno, img in images_iter:
+        res = reader.readtext(img)  # [ [box, text, conf], ... ]
+        text = " ".join([x[1] for x in res if len(x) >= 2 and x[1]]).strip()
+        if text:
+            pages.append((pno, text))
+    if by_page:
+        return pages
+    return "\n\n".join([t for _, t in pages]).strip()
+
+# ---------------------- Heuristic for OCR fallback ---------------------- #
+def _should_ocr(txt_or_pages: Union[str, List[Tuple[int, str]]]) -> bool:
+    """
+    텍스트 밀도 낮으면 OCR로 전환 (auto 모드에서만 사용)
+    - 문자열: 길이 < OCR_MIN_CHARS (기본 40)
+    - by_page 결과: 모든 페이지 텍스트 길이 합 < OCR_MIN_CHARS
+    """
+    try:
+        th = int(os.getenv("OCR_MIN_CHARS", "40"))
+    except Exception:
+        th = 40
+    if isinstance(txt_or_pages, str):
+        return len(txt_or_pages.strip()) < th
+    total = sum(len(t or "") for _, t in (txt_or_pages or []))
+    return total < th
+
+# ---------------------- Public API ---------------------- #
+# 추가: Word/Excel 파서
+def parse_docx_sections(path: str) -> List[Tuple[int, str]]:
+    """
+    DOCX를 '섹션 단위'로 반환: (section_no, text)
+    - 제목(Heading 1~3) 경계로 묶고, 표는 행단위 문자열로 합쳐 섹션 뒤에 덧붙임
+    """
+    from docx import Document
+    doc = Document(path)
+    sections: List[str] = []
+    cur = []
+    sec_no = 0
+
+    def flush():
+        nonlocal cur, sec_no
+        if cur:
+            sec_no += 1
+            sections.append((sec_no, "\n".join(cur).strip()))
+            cur = []
+
+    # 본문/제목
+    for p in doc.paragraphs:
+        style = (p.style.name or "").lower() if p.style else ""
+        line = p.text.strip()
+        if not line:
+            continue
+        if "heading" in style:  # 새 섹션
+            flush()
+            cur.append(line)
+        else:
+            cur.append(line)
+
+    # 표
+    for t in doc.tables:
+        lines = []
+        for r in t.rows:
+            cells = [c.text.strip().replace("\n", " ") for c in r.cells]
+            lines.append(" | ".join(cells))
+        if lines:
+            cur.append("[표]\n" + "\n".join(lines))
+
+    flush()
+    return sections  # [(1,"..."), (2,"...")]
+
+def parse_xlsx_tables(path: str) -> List[Tuple[int, str]]:
+    """
+    XLSX를 시트 단위로 반환: (sheet_index_1based, sheet_text)
+    - 첫 행을 헤더로 보고 "열:값" 형태로 행을 직렬화
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=True)
+    out: List[Tuple[int,str]] = []
+    for si, ws in enumerate(wb.worksheets, start=1):
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            continue
+        headers = [str(h or "").strip() for h in rows[0]]
+        lines = [f"[시트] {ws.title}"]
+        for r in rows[1:]:
+            pairs = []
+            for h, v in zip(headers, r):
+                if h:
+                    pairs.append(f"{h}: {'' if v is None else str(v)}")
+            if pairs:
+                lines.append(", ".join(pairs))
+        txt = "\n".join(lines).strip()
+        if txt:
+            out.append((si, txt))
+    return out
 
 def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, str]]]:
-    # 1) 먼저 pdfminer 사용
-    try:
-        import pdfminer.high_level
-        from pdfminer.layout import LAParams
-        laparams = LAParams()
-        if not by_page:
-            return pdfminer.high_level.extract_text(path, laparams=laparams)
-        pages = []
-        for i, page in enumerate(pdfminer.high_level.extract_pages(path, laparams=laparams), start=1):
-            text = "".join([elem.get_text() for elem in page if hasattr(elem, "get_text")]).strip()
-            if text:
-                pages.append((i, text))
-        return pages
-    except Exception:
-        # 2) 폴백: PyPDF2
+    ocr_mode   = os.getenv("OCR_MODE", "auto").lower()          # auto | always | never
+    ocr_engine = os.getenv("OCR_ENGINE", "paddle").lower()      # paddle | tesseract | easyocr
+    ocr_dpi    = int(os.getenv("OCR_DPI", "300"))
+
+    # 언어 기본값
+    if ocr_engine == "tesseract":
+        ocr_lang = os.getenv("OCR_LANG", "kor+eng")
+    elif ocr_engine == "easyocr":
+        ocr_lang = os.getenv("OCR_LANG", "ko,en")
+    else:
+        ocr_lang = os.getenv("OCR_LANG", "korean")
+
+    # 1) 텍스트 파싱 (auto/never)
+    text_result: Optional[Union[str, List[Tuple[int, str]]]] = None
+    if ocr_mode in ("auto", "never"):
         try:
-            from PyPDF2 import PdfReader
-            reader = PdfReader(path)
-            if not by_page:
-                return "\n\n".join([p.extract_text() or "" for p in reader.pages]).strip()
-            pages = []
-            for i, p in enumerate(reader.pages, start=1):
-                t = (p.extract_text() or "").strip()
-                if t:
-                    pages.append((i, t))
-            return pages
-        except Exception as e:
-            raise RuntimeError(f"PDF 텍스트 추출 실패: {e}")
+            text_result = _extract_text_pdfminer(path, by_page)
+        except Exception:
+            try:
+                text_result = _extract_text_pypdf2(path, by_page)
+            except Exception:
+                text_result = "" if not by_page else []
+        if ocr_mode == "never":
+            if text_result is None:
+                raise RuntimeError("PDF 텍스트 추출 실패(never 모드): 내부 파서 실패")
+            return text_result
+        if text_result and not _should_ocr(text_result):
+            return text_result
+
+    # 2) OCR (PyMuPDF로 렌더 → 선택한 엔진)
+    try:
+        images_iter = _render_pdf_pages_fitz(path, ocr_dpi)
+        if ocr_engine == "tesseract":
+            return _ocr_with_tesseract(images_iter, by_page, ocr_lang)
+        elif ocr_engine == "easyocr":
+            return _ocr_with_easyocr(images_iter, by_page, ocr_lang)
+        else:
+            return _ocr_with_paddle(images_iter, by_page, ocr_lang)
+    except Exception as e:
+        # OCR 실패 시: 텍스트 결과라도 반환
+        if text_result and ((isinstance(text_result, str) and text_result.strip()) or (isinstance(text_result, list) and len(text_result) > 0)):
+            return text_result
+        raise RuntimeError(f"OCR 실패 및 텍스트 추출 실패: {e}")
+    
+    
+def parse_any(path: str) -> List[Tuple[int, str]]:
+    """
+    파일 확장자에 따라:
+      - PDF: parse_pdf(by_page=True)
+      - DOCX: parse_docx_sections()
+      - XLSX/CSV: parse_xlsx_tables()/CSV 파싱
+      - 기타: (옵션) PDF 변환 → parse_pdf
+    반드시 [(index:int, text:str)] 형태로 반환
+    """
+    ext = (os.path.splitext(path)[1] or "").lower()
+    direct_docx = os.getenv("RAG_PARSE_DIRECT_DOCX", "1") == "1"
+    direct_xlsx = os.getenv("RAG_PARSE_DIRECT_XLSX", "1") == "1"
+    allow_convert = os.getenv("RAG_CONVERT_NONPDF_TO_PDF", "1") == "1"
+
+    if ext == ".pdf":
+        return parse_pdf(path, by_page=True)
+
+    if ext in (".docx",) and direct_docx:
+        return parse_docx_sections(path)
+
+    if ext in (".xlsx", ".xlsm", ".csv") and direct_xlsx:
+        if ext == ".csv":
+            # 간단 CSV → 시트1로 취급
+            import csv
+            lines = []
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                rdr = csv.reader(f)
+                for row in rdr:
+                    lines.append(" | ".join([c.strip() for c in row]))
+            return [(1, "\n".join(lines))]
+        return parse_xlsx_tables(path)
+
+    # 최후: PDF로 변환 (이미 라우터에 convert_to_pdf가 있으면 그걸 사용)
+    if allow_convert:
+        from app.services.pdf_converter import convert_to_pdf
+        pdf_path = convert_to_pdf(path)
+        return parse_pdf(pdf_path, by_page=True)
+
+    # 변환 불가 시 실패 처리
+    raise RuntimeError(f"Unsupported file type without conversion: {ext}")
+
