@@ -49,6 +49,31 @@ class AskResp(BaseModel):
     # (선택) 출처 제공
     sources: Optional[List[dict]] = None
 
+def _coerce_chunks_for_milvus(chs):
+    safe = []
+    for t in chs:
+        if not isinstance(t, (list, tuple)) or len(t) < 2:
+            continue
+        text, meta = t[0], t[1]
+        text = "" if text is None else str(text)
+        if not isinstance(meta, dict):
+            meta = {}
+        # page는 int, section은 str 강제
+        try:
+            page = int(meta.get("page", 0))
+        except Exception:
+            page = 0
+        section = str(meta.get("section", ""))[:512]
+        safe.append((text, {"page": page, "section": section}))
+    # 빈/중복 제거
+    out = []
+    last = None
+    for it in safe:
+        if it[0] and it != last:
+            out.append(it)
+            last = it
+    return out
+
 
 # ---------- Helpers ----------
 def index_pdf_to_milvus(
@@ -80,6 +105,7 @@ def index_pdf_to_milvus(
 
         job_state.update(job_id, status="chunking", step="chunk:start", progress=35)
         chunks = smart_chunk_pages(pages, encode)
+        chunks = _coerce_chunks_for_milvus(chunks) # “메타 타입 꼬임”, “빈 문자열”, “연속 중복”을 한번 더 정리해서 insert()로 들어가는 형태를 항상 보장
         if not chunks:
             raise RuntimeError("Chunking 결과가 비었습니다.")
         job_state.update(job_id, status="chunking", step="chunk:done", chunks=len(chunks), progress=50)
