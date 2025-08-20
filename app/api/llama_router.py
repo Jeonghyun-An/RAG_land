@@ -313,7 +313,7 @@ def ask_question(body: AskReq):
         sources = []
         for i, c in enumerate(topk, 1):
             context += f"[{i}] (doc:{c['doc_id']} p.{c['page']} {c['section']})\n{c['chunk']}\n\n"
-            sources.append({"id": i, "doc_id": c["doc_id"], "page": c["page"], "section": c["section"]})
+            sources.append({"id": i, "doc_id": c["doc_id"], "page": c["page"], "section": c["section"], "chunk": c["chunk"]})
 
         prompt = f"""아래 문서를 참고해서 질문에 정확히 답하세요. 근거가 없으면 모른다고 답합니다.
 

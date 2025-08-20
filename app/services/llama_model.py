@@ -93,8 +93,9 @@ def generate_answer(
             pad_token_id=pad_id,
             use_cache=True,
         )
-
-    # "생성된 부분만" 디코딩 (프롬프트 에코 제거)
+    # 테스트용: 디코딩된 전체 출력(전체 청크 및 프롬프트 확인용ㅇㅅㅇ)
+    # return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+    # # "생성된 부분만" 디코딩 (프롬프트 에코 제거)
     gen_ids = output_ids[0, input_ids.shape[-1]:]
     return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
