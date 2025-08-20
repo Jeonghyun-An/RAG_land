@@ -34,6 +34,12 @@ services:
     container_name: gotenberg
     networks: [ragnet]
     ports: []               # 외부 노출 불필요 (fastapi가 내부에서 호출)
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
     restart: unless-stopped
 
   minio:
@@ -177,6 +183,34 @@ services:
       RAG_DEDUP_MANIFEST: "1"              # MinIO docs/{doc_id}.json 해시 비교/저장
       RAG_UNIQUE_SUFFIX_ON_CONFLICT: "1"   # REPLACE=0이고 충돌이면 doc_id__hash 로 새로 삽입
       RAG_DELETE_AFTER_INDEX: "0"
+      # RAG 청킹/인코딩 옵션
+      RAG_CHUNK_TOKENS: 256             # 청킹 토큰 수
+      RAG_CHUNK_OVERLAP: 64              # 청킹 오버랩 토큰 수
+      RAG_SCORE_THRESHOLD: 0.2           # 리랭커 스코어 컷오프
+      RAG_PARSE_LAYOUT: 1                # 레이아웃 인지 청킹
+      # --- OCR/파서 ---
+      OCR_MODE: "auto"             # auto | always | never
+      OCR_ENGINE: "paddle"         # paddle | tesseract | easyocr
+      OCR_LANG: "korean"           # paddle: korean / tesseract: kor+eng / easyocr: ko,en
+      OCR_DPI: "300"
+      OCR_MIN_CHARS: "40"
+      # tesseract 바이너리 경로가 필요하면(윈도우 베이스 아님) 비워둬도 OK
+      OCR_TESSERACT_CMD: ""
+      OCR_EASYOCR_GPU: "0"
+
+      # --- 변환(pdf_converter) ---
+      GOTENBERG_URL: "http://gotenberg:3000"
+      CONVERT_BACKENDS: "gotenberg,soffice"  # gotenberg 실패 시 soffice 폴백
+      GOTENBERG_TIMEOUT: "120"
+      GOTENBERG_MAX_RETRIES: "3"
+      GOTENBERG_BACKOFF_BASE: "0.6"
+      PDF_PAPER: "A4"              # 보고서 품질 안정용
+      PDF_MARGIN_MM: "10"
+
+      # --- DOCX/XLSX direct 파싱 여부 ---
+      RAG_PARSE_DIRECT_DOCX: "1"
+      RAG_PARSE_DIRECT_XLSX: "1"
+      RAG_CONVERT_NONPDF_TO_PDF: "1"   # 기타 포맷 변환 허용
       # 임베딩
       EMBEDDING_MODEL: "jhgan/ko-sbert-nli"
       EMBED_MAX_TOKENS: "128"
@@ -202,6 +236,8 @@ services:
       milvus:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      gotenberg:
         condition: service_healthy
          # ⚠ 로컬에서 vllm 프로필을 안 켜면 depends_on에 넣지 않음
       # vllm:
