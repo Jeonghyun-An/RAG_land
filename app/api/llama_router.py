@@ -111,8 +111,10 @@ def index_pdf_to_milvus(
 
         # embedding 모델의 최대 길이에 맞춰 target/overlap 산정
         max_len = int(getattr(model, "max_seq_length", 128))
-        target_tokens = max(64, max_len - 16)
-        overlap_tokens = min(96, target_tokens // 3)  # 일반 문서보다 살짝 크게
+        default_target = max(64, max_len - 16)
+        default_overlap = min(96, default_target // 3)
+        target_tokens = int(os.getenv("RAG_CHUNK_TOKENS", str(default_target)))
+        overlap_tokens = int(os.getenv("RAG_CHUNK_OVERLAP", str(default_overlap)))
 
         # >>> CHUNKING START — 레이아웃 인지 청킹 시도 → 실패 시 기존 스마트 청킹 폴백
         chunks = None
@@ -126,6 +128,7 @@ def index_pdf_to_milvus(
                 raise RuntimeError("layout-aware 결과 비어있음")
         except Exception:
             # 폴백: 기존 문단/토큰 패킹 청킹
+            print(f"[CHUNK] layout-aware failed, fallback to smart: {e}")
             chunks = smart_chunk_pages(
                 pages, encode, target_tokens=target_tokens, overlap_tokens=overlap_tokens
             )
@@ -296,6 +299,9 @@ def ask_question(body: AskReq):
 
         # 2) 리랭크 후 상위 k
         topk = rerank(body.question, cands, top_k=body.top_k)
+        if not topk:
+            return AskResp(answer="문서에서 확신할 수 있는 근거를 찾지 못했습니다.", used_chunks=0, sources=[])
+
 
         # 3) 임계값 컷오프(리랭커 스코어 기준, 필요시 조정)
         THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.2"))

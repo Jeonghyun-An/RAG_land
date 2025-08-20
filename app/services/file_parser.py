@@ -134,7 +134,7 @@ def parse_docx_sections(path: str) -> List[Tuple[int, str]]:
     """
     from docx import Document
     doc = Document(path)
-    sections: List[str] = []
+    sections: List[Tuple[int, str]] = []
     cur = []
     sec_no = 0
 
@@ -266,7 +266,7 @@ def parse_any(path: str) -> List[Tuple[int, str]]:
             # 간단 CSV → 시트1로 취급
             import csv
             lines = []
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, "r", encoding="utf-8", errors="ignore",newline="") as f:
                 rdr = csv.reader(f)
                 for row in rdr:
                     lines.append(" | ".join([c.strip() for c in row]))
