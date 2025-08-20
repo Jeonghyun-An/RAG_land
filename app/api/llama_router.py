@@ -16,11 +16,10 @@ from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
 from app.services.pdf_converter import convert_to_pdf, ConvertError
 from app.services.chunker import smart_chunk_pages
+# (지연 import로 대체) from app.services.layout_chunker import layout_aware_chunks
 from app.services.milvus_store_v2 import MilvusStoreV2
 from app.services.embedding_model import get_embedding_model, embed
 from app.services.reranker import rerank
-
-
 
 router = APIRouter(tags=["llama"])
 
@@ -46,26 +45,31 @@ class UploadResp(BaseModel):
 class AskResp(BaseModel):
     answer: str
     used_chunks: int
-    # (선택) 출처 제공
-    sources: Optional[List[dict]] = None
+    sources: Optional[List[dict]] = None  # (선택) 출처 제공
 
+
+# ---------- Helpers ----------
 def _coerce_chunks_for_milvus(chs):
+    """
+    (텍스트, 메타) 리스트를 Milvus insert 형태로 정규화:
+    - 메타 타입 보정(dict 강제), page=int, section<=512자
+    - 빈 텍스트/연속 중복 제거
+    """
     safe = []
-    for t in chs:
+    for t in chs or []:
         if not isinstance(t, (list, tuple)) or len(t) < 2:
             continue
         text, meta = t[0], t[1]
         text = "" if text is None else str(text)
         if not isinstance(meta, dict):
             meta = {}
-        # page는 int, section은 str 강제
         try:
             page = int(meta.get("page", 0))
         except Exception:
             page = 0
         section = str(meta.get("section", ""))[:512]
         safe.append((text, {"page": page, "section": section}))
-    # 빈/중복 제거
+
     out = []
     last = None
     for it in safe:
@@ -75,7 +79,6 @@ def _coerce_chunks_for_milvus(chs):
     return out
 
 
-# ---------- Helpers ----------
 def index_pdf_to_milvus(
     job_id: str,
     file_path: str,
@@ -96,18 +99,43 @@ def index_pdf_to_milvus(
         job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
 
         # 2) 토큰 기준 청킹
+        job_state.update(job_id, status="chunking", step="chunk:start", progress=35)
+
         model = get_embedding_model()
         tokenizer = getattr(model, "tokenizer", None)
-        if tokenizer and hasattr(tokenizer, "encode"):
-            encode = lambda s: tokenizer.encode(s, add_special_tokens=False)
-        else:
-            encode = lambda s: s.split()
+        encode = (
+            (lambda s: tokenizer.encode(s, add_special_tokens=False))
+            if (tokenizer and hasattr(tokenizer, "encode"))
+            else (lambda s: s.split())
+        )
 
-        job_state.update(job_id, status="chunking", step="chunk:start", progress=35)
-        chunks = smart_chunk_pages(pages, encode)
-        chunks = _coerce_chunks_for_milvus(chunks) # “메타 타입 꼬임”, “빈 문자열”, “연속 중복”을 한번 더 정리해서 insert()로 들어가는 형태를 항상 보장
+        # embedding 모델의 최대 길이에 맞춰 target/overlap 산정
+        max_len = int(getattr(model, "max_seq_length", 128))
+        target_tokens = max(64, max_len - 16)
+        overlap_tokens = min(96, target_tokens // 3)  # 일반 문서보다 살짝 크게
+
+        # >>> CHUNKING START — 레이아웃 인지 청킹 시도 → 실패 시 기존 스마트 청킹 폴백
+        chunks = None
+        try:
+            # 지연 import: 레이아웃 청커 모듈이 없어도 라우터는 살아있게
+            from app.services.layout_chunker import layout_aware_chunks  # type: ignore
+            chunks = layout_aware_chunks(
+                pages, encode, target_tokens, overlap_tokens, slide_rows=4
+            )
+            if not chunks:
+                raise RuntimeError("layout-aware 결과 비어있음")
+        except Exception:
+            # 폴백: 기존 문단/토큰 패킹 청킹
+            chunks = smart_chunk_pages(
+                pages, encode, target_tokens=target_tokens, overlap_tokens=overlap_tokens
+            )
+        # <<< CHUNKING END
+
+        # Milvus 삽입 안전망(메타/빈문자/연속중복 정리)
+        chunks = _coerce_chunks_for_milvus(chunks)
         if not chunks:
             raise RuntimeError("Chunking 결과가 비었습니다.")
+
         job_state.update(job_id, status="chunking", step="chunk:done", chunks=len(chunks), progress=50)
 
         # 3) doc_id 확정 (넘겨받은 값 > MinIO 객체명 > 파일명)
@@ -119,7 +147,7 @@ def index_pdf_to_milvus(
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
         job_state.update(job_id, status="embedding", step="embed:start", progress=60)
 
-        res = store.insert(doc_id, chunks, embed_fn=embed)  # <- 반환값 활용! {inserted, skipped, reason, doc_id}
+        res = store.insert(doc_id, chunks, embed_fn=embed)  # {inserted, skipped, reason, doc_id}
         real_doc_id = res.get("doc_id", doc_id)
 
         if res.get("skipped"):
@@ -139,14 +167,20 @@ def index_pdf_to_milvus(
                 progress=90,
                 doc_id=real_doc_id,
             )
-            print(f"[INDEX] done: {file_path} (doc_id={real_doc_id}, chunks={len(chunks)}, inserted={res.get('inserted',0)})")
+            print(
+                f"[INDEX] done: {file_path} (doc_id={real_doc_id}, chunks={len(chunks)}, "
+                f"inserted={res.get('inserted',0)})"
+            )
 
         # 5) MinIO 원본 삭제(옵션) — 이번 요청에서 새로 올린(uploaded=True) 건만 정리
         if os.getenv("RAG_DELETE_AFTER_INDEX", "0") == "1" and minio_object and uploaded:
             try:
                 MinIOStore().delete(minio_object)
                 print(f"[CLEANUP] deleted from MinIO: {minio_object}")
-                job_state.update(job_id, status="cleanup", step="minio:deleted", minio_object=minio_object, progress=95)
+                job_state.update(
+                    job_id, status="cleanup", step="minio:deleted",
+                    minio_object=minio_object, progress=95
+                )
             except Exception as e:
                 print(f"[CLEANUP] delete failed: {e}")
                 job_state.update(job_id, status="cleanup", step=f"minio:delete_failed:{e!s}")
@@ -158,7 +192,7 @@ def index_pdf_to_milvus(
             except Exception:
                 pass
 
-        # 7) 완료 (삽입/스킵 모두 완료로 마무리)
+        # 7) 완료
         job_state.complete(
             job_id,
             pages=len(pages),
@@ -187,8 +221,6 @@ def generate(body: GenerateReq):
     except Exception as e:
         raise HTTPException(500, f"모델 응답 생성 실패: {e}")
 
-
-
 @router.post("/upload", response_model=UploadResp)
 async def upload_document(
     background_tasks: BackgroundTasks,
@@ -212,7 +244,6 @@ async def upload_document(
     # 3) MinIO 업로드 (원본 + 변환본 둘 다 올리고 싶으면 선택)
     minio = MinIOStore()
 
-    # ✅ 기본 키: 파일명 그대로
     pdf_name = os.path.basename(pdf_path)               # 예: doc.pdf
     object_pdf = f"uploaded/{pdf_name}"                 # 예: uploaded/doc.pdf
     uploaded = True
@@ -244,8 +275,7 @@ async def upload_document(
     job_id = uuid.uuid4().hex
     job_state.start(job_id, doc_id=doc_id, minio_object=object_pdf)
     job_state.update(job_id, status="uploaded", step="minio:ok", filename=safe_name, progress=10)
-    background_tasks.add_task(index_pdf_to_milvus,job_id, pdf_path, object_pdf, uploaded, False, doc_id)
-
+    background_tasks.add_task(index_pdf_to_milvus, job_id, pdf_path, object_pdf, uploaded, False, doc_id)
 
     return UploadResp(
         filename=safe_name,
@@ -260,7 +290,7 @@ def ask_question(body: AskReq):
         # 1) 초기 넉넉히 검색 (예: 20)
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-        cands = store.search(body.question, embed_fn=embed, topk=max(20, body.top_k*5))
+        cands = store.search(body.question, embed_fn=embed, topk=max(20, body.top_k * 5))
         if not cands:
             raise HTTPException(404, "관련 문서를 찾지 못했습니다. 먼저 문서를 업로드/인덱싱 해주세요.")
 
@@ -339,7 +369,6 @@ async def stream_job(job_id: str):
                 yield {"event": "update", "data": data}
                 last_serialized = data
 
-                # 종료 조건
                 if st.get("status") in ("done", "error"):
                     break
 
@@ -422,16 +451,9 @@ def purge_files(
 
     matched = len(files)
     if dry_run:
-        # 너무 길면 일부만 보여줌
         preview = files[:limit_preview]
         more = max(0, matched - len(preview))
-        return {
-            "status": "dry-run",
-            "prefix": prefix,
-            "matched": matched,
-            "preview": preview,
-            "more": more,
-        }
+        return {"status": "dry-run", "prefix": prefix, "matched": matched, "preview": preview, "more": more}
 
     deleted = 0
     failed = 0
@@ -444,17 +466,9 @@ def purge_files(
             failed += 1
             errors.append({"object": obj, "error": str(e)})
 
-    return {
-        "status": "ok",
-        "prefix": prefix,
-        "matched": matched,
-        "deleted": deleted,
-        "failed": failed,
-        "errors": errors,
-    }
+    return {"status": "ok", "prefix": prefix, "matched": matched, "deleted": deleted, "failed": failed, "errors": errors}
 
 # ========= Debug / Inspection =========
-
 @router.get("/debug/milvus/info")
 def debug_milvus_info():
     """ Milvus 상태 정보 조회"""
