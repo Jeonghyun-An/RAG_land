@@ -190,6 +190,14 @@ def pack_by_tokens(
         if not p or not p.strip():
             continue
         ids = encode(p)
+        # 문단 자체가 너무 크면 단독 청크로라도 포함
+        if len(ids) > target_tokens:
+            if cur_paras:
+                _emit()
+            chunks.append(p.strip())
+            cur_paras, cur_ids = [], []
+            continue
+
         if not cur_paras:
             cur_paras, cur_ids = [p], ids
             continue
@@ -200,7 +208,9 @@ def pack_by_tokens(
             _emit()
             tail_paras, tail_ids = _tail_paras_by_tokens(cur_paras, encode, max(0, overlap_tokens))
             if len(tail_ids) + len(ids) > target_tokens:
-                cur_paras, cur_ids = [p], ids
+                # 새 청크 시작
+                chunks.append(p.strip())
+                cur_paras, cur_ids = [], []
             else:
                 cur_paras, cur_ids = tail_paras + [p], tail_ids + ids
     if cur_paras:
