@@ -239,7 +239,31 @@ def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, st
         if text_result and ((isinstance(text_result, str) and text_result.strip()) or (isinstance(text_result, list) and len(text_result) > 0)):
             return text_result
         raise RuntimeError(f"OCR 실패 및 텍스트 추출 실패: {e}")
-    
+
+
+def parse_pdf_blocks(path: str) -> list[tuple[int, list[dict]]]:
+    """
+    PyMuPDF 기반: 각 페이지의 텍스트 블록을 [ {text, bbox:[x0,y0,x1,y1]} ] 형태로 반환.
+    반환: [(page_no, blocks), ...]
+    """
+    import fitz  # PyMuPDF
+    out = []
+    doc = fitz.open(path)
+    for i, page in enumerate(doc, start=1):
+        blocks = []
+        # get_text("blocks"): (x0, y0, x1, y1, text, block_no, ...)
+        for b in page.get_text("blocks"):
+            if not b or len(b) < 5:
+                continue
+            x0, y0, x1, y1, txt = b[0], b[1], b[2], b[3], (b[4] or "").strip()
+            if txt:
+                blocks.append({
+                    "text": txt,
+                    "bbox": [float(x0), float(y0), float(x1), float(y1)]
+                })
+        out.append((i, blocks))
+    return out
+
     
 def parse_any(path: str) -> List[Tuple[int, str]]:
     """
