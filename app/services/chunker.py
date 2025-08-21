@@ -1,6 +1,6 @@
 # app/services/chunker.py
 from __future__ import annotations
-import re, hashlib
+import re, hashlib, os, itertools
 from typing import List, Tuple, Callable, Iterable, Any, Dict
 
 # ===================== 유틸 =====================
@@ -155,12 +155,21 @@ def _normalize_paras(paras: List[str], encode: Callable[[str], List[Any]], targe
 
 # ===================== 페이지 헤더/푸터 제거 =====================
 
-def _detect_repeating_lines(pages: List[Tuple[int, str]], head_n: int = 3, tail_n: int = 3, min_ratio: float = 0.2) -> Dict[str, int]:
+def _detect_repeating_lines(pages: List[Tuple[int, str]], head_n: int = 3, tail_n: int = 3, min_ratio: float = 0.6) -> Dict[str, int]:
     """
     여러 페이지에서 반복되는 상/하단 라인을 찾아낸다.
-    - 각 페이지 앞 head_n줄 + 뒤 tail_n줄만 샘플링
-    - 전체 페이지의 min_ratio 이상에서 등장하면 반복 라인으로 간주
+    - 제목(HEADING_RE)은 절대 제거하지 않음
+    - 기본 임계치: env RAG_STRIP_REPEAT_MINRATIO (기본 0.6)
+    - 전체 비활성화: env RAG_STRIP_REPEAT_LINES=0
     """
+    if os.getenv("RAG_STRIP_REPEAT_LINES", "1") != "1":
+        return {}
+
+    try:
+        min_ratio = float(os.getenv("RAG_STRIP_REPEAT_MINRATIO", "0.6"))
+    except Exception:
+        min_ratio = 0.6
+
     freq: Dict[str, int] = {}
     total = max(1, len(pages))
     for _, txt in pages:
@@ -168,14 +177,16 @@ def _detect_repeating_lines(pages: List[Tuple[int, str]], head_n: int = 3, tail_
         heads = lines[:head_n]
         tails = lines[-tail_n:] if len(lines) >= tail_n else []
         for ln in heads + tails:
-            # 페이지바 같은 것들 정리해서 안정화
+            # 제목/헤딩은 제거 후보에서 제외
+            if HEADING_RE.match(ln):
+                continue
             key = re.sub(r"\s*\|\s*\d+\s*$", "", ln)
             if len(key) <= 2:
                 continue
             freq[key] = freq.get(key, 0) + 1
-    # 임계치 이상만 남김
     cut = int(total * min_ratio)
     return {k: v for k, v in freq.items() if v >= cut and len(k) > 2}
+
 
 def _strip_repeating_lines(text: str, repeating: Dict[str, int]) -> str:
     if not text or not repeating:
@@ -404,3 +415,183 @@ def token_safe_chunks(text: str, target_tokens: int | None = None, overlap_token
         if not dedup or _norm_text(dedup[-1]) != _norm_text(c):
             dedup.append(c)
     return dedup
+
+
+def _guess_section_for_paragraph(paragraph: str, last_section: str) -> str:
+    # 문단 맨 앞 라인이 제목 패턴이면 해당 라인을 섹션으로, 아니면 직전 섹션 계승
+    for ln in (paragraph or "").splitlines():
+        if HEADING_RE.match(ln):
+            return ln.strip()
+        break
+    return last_section
+
+def _attach_bboxes_to_paragraph(para: str, page_blocks: list[dict]) -> list[list[float]]:
+    """
+    간이 매칭: 블록 텍스트가 문단에 '부분 포함'되면 해당 블록의 bbox를 채택.
+    과하게 붙지 않도록 안전 필터 적용.
+    """
+    if not para or not page_blocks:
+        return []
+    p = para.replace("\n", " ").strip()
+    if not p:
+        return []
+    bboxes = []
+    # 매칭 강도: 블록 텍스트의 앞부분(최대 40자) 또는 전체 중 1개라도 포함되면 채택
+    for blk in page_blocks:
+        t = (blk.get("text") or "").strip()
+        if not t:
+            continue
+        probe = t[:40] if len(t) > 40 else t
+        if probe and probe in p:
+            bb = blk.get("bbox")
+            if isinstance(bb, (list, tuple)) and len(bb) == 4:
+                bboxes.append([float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])])
+    return bboxes
+
+def smart_chunk_pages_plus(
+    pages: List[Tuple[int, str]],
+    encode,
+    target_tokens: int | None = None,
+    overlap_tokens: int | None = None,
+    layout_blocks: dict[int, list[dict]] | None = None,
+) -> List[Tuple[str, dict]]:
+    """
+    기존 smart_chunk_pages를 확장:
+      - 섹션(제목) 계승
+      - 페이지 경계 오버랩(옵션)
+      - 각 청크에 포함된 모든 페이지 목록 + 페이지별 BBOX 리스트 포함
+    반환: [(chunk_text, {"page":int, "section":str, "pages":[int], "bboxes":{page:[bbox...]}})]
+    """
+    # 0) 토크나이저/기본 길이
+    enc = _ensure_encode(encode)
+    if target_tokens is None or overlap_tokens is None:
+        try:
+            from app.services.embedding_model import get_embedding_model
+            m = get_embedding_model()
+            max_len = int(getattr(m, "max_seq_length", 128))
+        except Exception:
+            max_len = 128
+        if target_tokens is None:
+            target_tokens = max(64, max_len - 16)
+        if overlap_tokens is None:
+            overlap_tokens = min(96, target_tokens // 3)
+
+    target_tokens = int(max(16, target_tokens))
+    overlap_tokens = int(max(0, min(overlap_tokens, target_tokens // 2)))
+
+    cross_page = os.getenv("RAG_CROSS_PAGE_CHUNK", "1") == "1"
+
+    # 1) 반복 라인 보수 제거
+    repeating = _detect_repeating_lines(pages, head_n=3, tail_n=3)
+
+    # 2) 페이지→문단(para) 단위로 전개 + 섹션 계승 + para별 bbox 붙이기
+    para_items: list[dict] = []
+    last_section = ""
+    for page_no, text in pages:
+        txt = _strip_repeating_lines(text, repeating)
+        paras = _split_to_paragraphs(txt)
+        # 과대 문단 세분화
+        safe_paras: List[str] = []
+        for p in paras:
+            if _toklen(enc, p) <= target_tokens:
+                if p.strip():
+                    safe_paras.append(p.strip())
+            else:
+                safe_paras.extend(_split_oversize_to_tokens(p, enc, target_tokens))
+        # para each → attach section/bbox
+        blocks = (layout_blocks or {}).get(int(page_no), [])
+        for p in safe_paras:
+            sec = _guess_section_for_paragraph(p, last_section)
+            if sec != last_section and sec:
+                last_section = sec
+            bbs = _attach_bboxes_to_paragraph(p, blocks)
+            para_items.append({
+                "page": int(page_no),
+                "section": last_section,
+                "text": p,
+                "bboxes": bbs,
+            })
+
+    # 3) 토큰 패킹(페이지 경계 오버랩 허용)
+    chunks: List[Tuple[str, dict]] = []
+    cur_texts: List[str] = []
+    cur_ids: List[Any] = []
+    cur_pages: List[int] = []
+    cur_bboxes: dict[int, list[list[float]]] = {}
+    cur_section: str = ""
+
+    def _emit():
+        nonlocal cur_texts, cur_ids, cur_pages, cur_bboxes, cur_section
+        if not cur_texts:
+            return
+        piece = "\n\n".join(cur_texts).strip()
+        if not piece:
+            return
+        # META 라인 (텍스트 최상단에 삽입)
+        meta = {
+            "type": "text",
+            "section": cur_section or "",
+            "pages": sorted(list(dict.fromkeys(cur_pages))),  # unique-preserving order
+            "bboxes": {int(k): v for k, v in cur_bboxes.items() if v},
+        }
+        meta_line = "META: " + json.dumps(meta, ensure_ascii=False)
+        chunk_text = meta_line + "\n" + piece
+
+        # 첫 페이지(호환) 및 section 저장
+        comp_meta = {
+            "page": int(meta["pages"][0]) if meta["pages"] else (cur_pages[0] if cur_pages else 0),
+            "section": meta["section"],
+            "pages": meta["pages"],
+            "bboxes": meta["bboxes"],
+        }
+        # 인접 완전중복 방지
+        if not chunks or _norm_text(chunks[-1][0]) != _norm_text(chunk_text):
+            chunks.append((chunk_text, comp_meta))
+
+        cur_texts, cur_ids, cur_pages, cur_bboxes, cur_section = [], [], [], {}, ""
+
+    import json
+    for it in para_items:
+        ids = enc(it["text"])
+        # 현재 버퍼가 비어있다면 초기화
+        if not cur_texts:
+            cur_texts = [it["text"]]
+            cur_ids = list(ids)
+            cur_pages = [it["page"]]
+            if it["bboxes"]:
+                cur_bboxes[it["page"]] = list(it["bboxes"])
+            cur_section = it["section"]
+            continue
+
+        # 같은 섹션이면 그대로 잇고, 섹션 바뀌면 지금까지 emit
+        if it["section"] and it["section"] != cur_section:
+            _emit()
+            cur_texts = [it["text"]]
+            cur_ids = list(ids)
+            cur_pages = [it["page"]]
+            cur_bboxes = {it["page"]: list(it["bboxes"])} if it["bboxes"] else {}
+            cur_section = it["section"]
+            continue
+
+        # 토큰 용량 검사
+        if len(cur_ids) + len(ids) <= target_tokens:
+            cur_texts.append(it["text"])
+            cur_ids += ids
+            # 페이지/박스 갱신
+            if cross_page or (it["page"] == cur_pages[-1]):
+                if it["page"] not in cur_pages:
+                    cur_pages.append(it["page"])
+            if it["bboxes"]:
+                cur_bboxes.setdefault(it["page"], []).extend(it["bboxes"])
+        else:
+            # 오버랩 적용
+            _emit()
+            # 새 버퍼 시작
+            cur_texts = [it["text"]]
+            cur_ids = list(ids)
+            cur_pages = [it["page"]]
+            cur_bboxes = {it["page"]: list(it["bboxes"])} if it["bboxes"] else {}
+            cur_section = it["section"]
+
+    _emit()
+    return chunks
