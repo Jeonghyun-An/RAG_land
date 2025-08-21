@@ -11,11 +11,11 @@ import asyncio, json
 from sse_starlette.sse import EventSourceResponse  # ✅ 요구사항: sse-starlette
 from app.services import job_state
 
-from app.services.file_parser import parse_pdf
+from app.services.file_parser import parse_pdf, parse_pdf_blocks
 from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
 from app.services.pdf_converter import convert_to_pdf, ConvertError
-from app.services.chunker import smart_chunk_pages
+from app.services.chunker import smart_chunk_pages, smart_chunk_pages_plus
 # (지연 import로 대체) from app.services.layout_chunker import layout_aware_chunks
 from app.services.milvus_store_v2 import MilvusStoreV2
 from app.services.embedding_model import get_embedding_model, embed
@@ -53,6 +53,7 @@ def _coerce_chunks_for_milvus(chs):
     """
     (텍스트, 메타) 리스트를 Milvus insert 형태로 정규화:
     - 메타 타입 보정(dict 강제), page=int, section<=512자
+    - 다중 페이지 지원: meta.pages가 있으면 page는 첫 페이지로
     - 빈 텍스트/연속 중복 제거
     """
     safe = []
@@ -63,12 +64,23 @@ def _coerce_chunks_for_milvus(chs):
         text = "" if text is None else str(text)
         if not isinstance(meta, dict):
             meta = {}
-        try:
-            page = int(meta.get("page", 0))
-        except Exception:
-            page = 0
+
+        # section 우선 결정
         section = str(meta.get("section", ""))[:512]
-        safe.append((text, {"page": page, "section": section}))
+        # page 정규화: pages가 있으면 첫 페이지
+        pages = meta.get("pages")
+        if isinstance(pages, (list, tuple)) and len(pages) > 0:
+            try:
+                page = int(pages[0])
+            except Exception:
+                page = int(meta.get("page", 0))
+        else:
+            try:
+                page = int(meta.get("page", 0))
+            except Exception:
+                page = 0
+
+        safe.append((text, {"page": page, "section": section, "pages": pages or [], "bboxes": meta.get("bboxes", {})}))
 
     out = []
     last = None
@@ -97,6 +109,10 @@ def index_pdf_to_milvus(
         if not pages:
             raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
         job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
+        
+        # 레이아웃 블록(BBOX)
+        blocks_by_page_list = parse_pdf_blocks(file_path)  # [(page_no, [ {text,bbox} ])]
+        layout_map = {p: blks for p, blks in blocks_by_page_list}
 
         # 2) 토큰 기준 청킹
         job_state.update(job_id, status="chunking", step="chunk:start", progress=35)
@@ -122,16 +138,22 @@ def index_pdf_to_milvus(
             # 지연 import: 레이아웃 청커 모듈이 없어도 라우터는 살아있게
             from app.services.layout_chunker import layout_aware_chunks  # type: ignore
             chunks = layout_aware_chunks(
-                pages, encode, target_tokens, overlap_tokens, slide_rows=4
+                pages, encode, target_tokens, overlap_tokens, slide_rows=4, layout_blocks=layout_map
             )
             if not chunks:
                 raise RuntimeError("layout-aware 결과 비어있음")
-        except Exception:
-            # 폴백: 기존 문단/토큰 패킹 청킹
-            print(f"[CHUNK] layout-aware failed, fallback to smart: {e}")
-            chunks = smart_chunk_pages(
-                pages, encode, target_tokens=target_tokens, overlap_tokens=overlap_tokens
-            )
+        except Exception as e1:
+            try:
+                chunks = smart_chunk_pages_plus(
+                    pages, encode, target_tokens=target_tokens, overlap_tokens=overlap_tokens, layout_blocks=layout_map
+                )
+                if not chunks:
+                    raise RuntimeError("plus 결과 비어있음")
+            except Exception as e2:
+                print(f"[CHUNK] layout-aware/plus failed ({e1}); fallback to smart")
+                chunks = smart_chunk_pages(
+                    pages, encode, target_tokens=target_tokens, overlap_tokens=overlap_tokens
+                )
         # <<< CHUNKING END
 
         # Milvus 삽입 안전망(메타/빈문자/연속중복 정리)
@@ -486,20 +508,28 @@ def debug_milvus_info():
         raise HTTPException(500, f"Milvus info 조회 실패: {e}")
 
 @router.get("/debug/milvus/peek")
-def debug_milvus_peek(limit: int = 5):
+def debug_milvus_peek(limit: int = 5, full: bool = False, max_chars:int|None = None):
     """ Milvus 컬렉션의 일부 데이터 미리보기 """
     try:
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        if full:
+            os.environ["DEBUG_PEEK_MAX_CHARS"] = "0"
+        elif max_chars is not None:
+            os.environ["DEBUG_PEEK_MAX_CHARS"] = str(max_chars)
         return {"items": store.peek(limit=limit)}
     except Exception as e:
         raise HTTPException(500, f"Milvus peek 실패: {e}")
 
 @router.get("/debug/milvus/by-doc")
-def debug_milvus_by_doc(doc_id: str, limit: int = 10):
+def debug_milvus_by_doc(doc_id: str, limit: int = 10, full: bool = False, max_chars:int|None = None):
     try:
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        if full:
+            os.environ["DEBUG_PEEK_MAX_CHARS"] = "0"
+        elif max_chars is not None:
+            os.environ["DEBUG_PEEK_MAX_CHARS"] = str(max_chars)
         return {"items": store.query_by_doc(doc_id=doc_id, limit=limit)}
     except Exception as e:
         raise HTTPException(500, f"Milvus by-doc 실패: {e}")
