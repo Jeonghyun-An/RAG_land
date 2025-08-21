@@ -188,6 +188,19 @@ services:
       RAG_CHUNK_OVERLAP: 64              # 청킹 오버랩 토큰 수
       RAG_SCORE_THRESHOLD: 0.2           # 리랭커 스코어 컷오프
       RAG_PARSE_LAYOUT: 1                # 레이아웃 인지 청킹
+      RAG_PARSE_LAYOUT_MIN_CHARS: 100    # 레이아웃 인지 청킹 최소 문자 수
+      RAG_PARSE_LAYOUT_MAX_TOKENS: 512   # 레이아웃 인지 청킹 최대 토큰 수
+      RAG_PARSE_LAYOUT_MIN_WORDS: 10     # 레이아웃 인지 청킹 최소 단어 수
+      RAG_PARSE_LAYOUT_MAX_WORDS: 100    # 레이아웃 인지 청킹 최대 단어 수
+      # --- RAG 청킹/인코딩 옵션 ---
+      RAG_PARSE_PDF: "1"                 # PDF 파싱 여부
+      RAG_PARSE_DOCX: "1"                # DOCX 파싱 여부
+      RAG_PARSE_XLSX: "1"                # XLSX 파싱 여부
+      RAG_PARSE_TXT: "1"                 # TXT 파싱 여부
+      RAG_PARSE_HTML: "1"                # HTML 파싱 여부
+      RAG_PARSE_PPTX: "1"                # PPTX 파싱 여부
+      # --- DEBUG/로깅 ---
+      DEBUG_PEEK_MAX_CHARS: "500"  # 디버그용: 청크 미리보기 최대 문자 수
       # --- OCR/파서 ---
       OCR_MODE: "auto"             # auto | always | never
       OCR_ENGINE: "paddle"         # paddle | tesseract | easyocr

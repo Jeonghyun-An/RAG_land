@@ -361,17 +361,20 @@ class MilvusStoreV2:
             output_fields=["doc_id", "page", "section", "chunk"],
             limit=limit
         )
-        # rows: List[Dict]
-        # 텍스트가 길 수 있으니 미리 자르기(디버그 가독성)
-        out = []
-        for r in rows:
-            out.append({
+        return [
+            {
                 "doc_id": r.get("doc_id"),
                 "page": int(r.get("page", -1)),
                 "section": r.get("section", ""),
-                "chunk": (r.get("chunk") or "")[:300]
-            })
-        return out
+                # 잘림 길이를 라우터에서 제어하도록 환경변수 허용 (기본 300)
+                "chunk": (
+                    (r.get("chunk") or "")[: int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))]
+                    if os.getenv("DEBUG_PEEK_MAX_CHARS", "300") != "0"
+                    else (r.get("chunk") or "")
+                ),
+            }
+            for r in rows
+        ]
 
     def peek(self, limit: int = 5) -> list[dict]:
         """아무거나 몇 개 보기(샘플)"""
@@ -380,16 +383,20 @@ class MilvusStoreV2:
             output_fields=["doc_id", "page", "section", "chunk"],
             limit=limit
         )
-        out = []
-        for r in rows:
-            out.append({
+        return [
+            {
                 "doc_id": r.get("doc_id"),
                 "page": int(r.get("page", -1)),
                 "section": r.get("section", ""),
-                "chunk": (r.get("chunk") or "")[:300]
-            })
-        return out
-
+                "chunk": (
+                    (r.get("chunk") or "")[: int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))]
+                    if os.getenv("DEBUG_PEEK_MAX_CHARS", "300") != "0"
+                    else (r.get("chunk") or "")
+                ),
+            }
+            for r in rows
+        ]
+        
     def debug_search(self, query: str, embed_fn, topk: int = 5) -> list[dict]:
         """리랭크 전 순수 벡터 검색 결과 보기"""
         qv = embed_fn([query])[0]
