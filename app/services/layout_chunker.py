@@ -1,7 +1,7 @@
 # app/services/layout_chunker.py
 from __future__ import annotations
-import re
-from typing import List, Tuple, Dict, Any, Callable
+import re, json
+from typing import List, Tuple, Dict, Any, Callable, Optional
 
 #표는 “행=정확 데이터”라 원자화 + 인접행 보조청크가 필수.
 # 조항/불릿은 문맥형이므로 제목 단위로 묶고 토큰 오버랩.
@@ -11,10 +11,11 @@ from typing import List, Tuple, Dict, Any, Callable
 HEADING_LINE = re.compile(r"^\s*(표\s*[A-Z]-?\d+\.?|[A-Za-z가-힣0-9].*?:\s*$)")
 BULLET_LINE  = re.compile(r"^\s*[-*•·]\s+\S|^\s*\d+\.\s+\S")
 GRID_HINT    = re.compile(r"[│┃┆┇┋┊┋|]")  # 표의 세로선 문자 or 파이프
+HEADING_RE = re.compile(r'^\s*(?:제\s*\d+\s*(조|장|절)|[0-9]+[.)]\s+|[IVXLCM]+\.\s+|[A-Z][A-Za-z0-9\s\-]{0,40}:?$)')
 
 def _is_heading(line: str) -> bool:
     # 예: "표 C-5. ...", "비즈니스 규칙: PIL", "데이터 필드: ..."
-    return bool(HEADING_LINE.match(line.strip()))
+    return bool(HEADING_RE.match(line.strip()))
 
 def _is_bullet(line: str) -> bool:
     return bool(BULLET_LINE.match(line))
@@ -96,55 +97,71 @@ def _windowed(lst: List, k: int, step: int=1):
     for i in range(0, max(0, len(lst)-k+1), step):
         yield lst[i:i+k]
 
+def _attach_bboxes_simple(text: str, page_blocks: list[dict]) -> list[list[float]]:
+    if not text or not page_blocks:
+        return []
+    t = text.replace("\n", " ").strip()
+    out = []
+    for blk in page_blocks:
+        bt = (blk.get("text") or "").strip()
+        probe = bt[:40] if len(bt) > 40 else bt
+        if probe and probe in t:
+            bb = blk.get("bbox")
+            if isinstance(bb, (list, tuple)) and len(bb) == 4:
+                out.append([float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])])
+    return out
+
 def layout_aware_chunks(
     pages: List[Tuple[int,str]],
     encode: Callable[[str], list],
     target_tokens: int,
     overlap_tokens: int,
-    slide_rows: int = 4
+    slide_rows: int = 4,
+    layout_blocks: Optional[dict[int, list[dict]]] = None
 ) -> List[Tuple[str, dict]]:
-    """
-    표/불릿/텍스트를 타입별로 나눠 원자청크 생성 + 표는 보조(슬라이딩) 청크.
-    반환: List[(text, {"page","section"})]
-    """
     blocks = _split_pages_to_blocks(pages)
     out: List[Tuple[str,dict]] = []
 
-    def meta_line(d: Dict[str,Any]) -> str:
-        m = {"type": d["type"], "section": (d.get("title") or "").strip()}
-        import json
-        return "META: " + json.dumps(m, ensure_ascii=False)
+    def meta_line(d: Dict[str,Any], page:int, bboxes: list[list[float]], title: str) -> str:
+        meta = {"type": d["type"], "section": (title or "").strip(),
+                "pages": [page], "bboxes": {int(page): bboxes} if bboxes else {}}
+        return "META: " + json.dumps(meta, ensure_ascii=False)
 
     for page, b in blocks:
         title = (b.get("title") or "").strip()
+        page_bbs = (layout_blocks or {}).get(int(page), [])
+
         if b["type"] == "table":
             rows = _parse_table_rows(b["body"])
             if not rows:
-                # 파싱 실패 → 본문 통짜로
-                text = f"{meta_line(b)}\n[{title}]\n{b['body']}"
-                out.append((text, {"page":page, "section":title})); continue
-            # (1) 행 원자청크
+                bbs = _attach_bboxes_simple(b["body"], page_bbs)
+                text = f"{meta_line(b, page, bbs, title)}\n[{title}]\n{b['body']}"
+                out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
+                continue
+
+            # (1) 원자 행
             for idx, row in enumerate(rows):
                 alias = ", ".join([v for v in row.values() if v])
-                text = f"""{meta_line(b)}
-[{title}] 행#{idx+1}
-열: {", ".join(row.keys())}
-값: {alias}"""
-                out.append((text, {"page":page, "section":title}))
-            # (2) 보조: 인접 행 묶음(오버랩)
+                body = f"[{title}] 행#{idx+1}\n열: {', '.join(row.keys())}\n값: {alias}"
+                bbs = _attach_bboxes_simple(alias, page_bbs)
+                text = f"{meta_line(b, page, bbs, title)}\n{body}"
+                out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
+
+            # (2) 인접 행 보조
             for win in _windowed(rows, slide_rows, step=1):
                 alias = "\n".join([", ".join(r.values()) for r in win])
-                text = f"""{meta_line(b)}
-[{title}] 인접행 묶음
-{alias}"""
-                out.append((text, {"page":page, "section":title}))
+                bbs = _attach_bboxes_simple(alias, page_bbs)
+                text = f"{meta_line(b, page, bbs, title)}\n[{title}] 인접행 묶음\n{alias}"
+                out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
+
         elif b["type"] == "bullet":
-            text = f"{meta_line(b)}\n[{title}]\n{b['body']}"
-            out.append((text, {"page":page, "section":title}))
+            bbs = _attach_bboxes_simple(b["body"], page_bbs)
+            text = f"{meta_line(b, page, bbs, title)}\n[{title}]\n{b['body']}"
+            out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
         else:
-            # 일반 텍스트는 기존 청킹으로 토큰 기준 패킹
             from app.services.chunker import token_safe_chunks
             for ch in token_safe_chunks(b["body"], target_tokens, overlap_tokens):
-                text = f"{meta_line(b)}\n[{title}]\n{ch}"
-                out.append((text, {"page":page, "section":title}))
+                bbs = _attach_bboxes_simple(ch, page_bbs)
+                text = f"{meta_line(b, page, bbs, title)}\n[{title}]\n{ch}"
+                out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
     return out
