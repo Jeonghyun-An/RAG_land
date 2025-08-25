@@ -16,6 +16,42 @@ from pymilvus import (
 
 # 컬렉션 이름(환경변수로 덮어쓰기 가능)
 COLLECTION = os.getenv("MILVUS_COLLECTION", "rag_chunks_v2")
+SECTION_MAX = int(os.getenv("MILVUS_SECTION_MAX", "512"))
+DOC_ID_MAX  = int(os.getenv("MILVUS_DOCID_MAX",  "256"))
+CHUNK_MAX   = int(os.getenv("MILVUS_CHUNK_MAX",  "8192"))
+
+
+
+def _vmax(field):
+    """
+    Milvus 2.2.x는 field.params 형태가 다를 수 있어 방어적으로 추출
+    - field.params.get("max_length")
+    - field.params.get("type_params", {}).get("max_length")
+    - getattr(field, "max_length", 0)
+    """
+    try:
+        p = getattr(field, "params", {}) or {}
+        if isinstance(p, dict):
+            if "max_length" in p:
+                return int(p["max_length"])
+            tp = p.get("type_params") or {}
+            if "max_length" in tp:
+                return int(tp["max_length"])
+    except Exception:
+        pass
+    try:
+        return int(getattr(field, "max_length", 0) or 0)
+    except Exception:
+        return 0
+    
+def _get_schema_limits(col: Collection) -> dict:
+    f = {x.name: x for x in col.schema.fields}
+    return {
+        "doc_id":  _vmax(f.get("doc_id"))  or DOC_ID_MAX,
+        "section": _vmax(f.get("section")) or SECTION_MAX,
+        "chunk":   _vmax(f.get("chunk"))   or CHUNK_MAX,
+    }
+
 
 
 class MilvusStoreV2:
@@ -78,6 +114,18 @@ class MilvusStoreV2:
             emb_dim = emb.params.get("dim") if hasattr(emb, "params") else getattr(emb, "dim", None)
             if int(emb_dim or 0) != int(expect_dim):
                 return True
+            
+            def vmax(field):
+                try:
+                    return int(field.params.get("max_length"))
+                except Exception:
+                    try:
+                        return int(getattr(field, "max_length", 0))
+                    except Exception:
+                        return 0
+            if vmax(fdict["doc_id"]) != DOC_ID_MAX: return True
+            if vmax(fdict["section"]) != SECTION_MAX: return True
+            if vmax(fdict["chunk"])   != CHUNK_MAX:  return True
             return False
         except Exception:
             return True
@@ -85,10 +133,10 @@ class MilvusStoreV2:
     def _create_collection(self) -> Collection:
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=256),
+            FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length= DOC_ID_MAX),
             FieldSchema(name="page", dtype=DataType.INT64),
-            FieldSchema(name="section", dtype=DataType.VARCHAR, max_length=512),
-            FieldSchema(name="chunk", dtype=DataType.VARCHAR, max_length=8192),
+            FieldSchema(name="section", dtype=DataType.VARCHAR, max_length= SECTION_MAX),
+            FieldSchema(name="chunk", dtype=DataType.VARCHAR, max_length= CHUNK_MAX),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.dim),
         ]
         schema = CollectionSchema(fields, description="RAG chunks with metadata (v2)")
@@ -137,12 +185,7 @@ class MilvusStoreV2:
 
     # ---------------- public ----------------
 
-    def insert(
-        self,
-        doc_id: str,
-        chunks: List[Tuple[str, Dict[str, Any]]],
-        embed_fn: Callable[[List[str]], List[List[float]]],
-) ->     Dict[str, Any]:
+    def insert(self, doc_id: str, chunks: List[Tuple[str, Dict[str, Any]]], embed_fn: Callable[[List[str]], List[List[float]]], ) -> Dict[str, Any]:
         """
         중복 방지 & 안전 삽입:
         - RAG_SKIP_IF_EXISTS=1  : 같은 doc_id 존재 시 스킵
@@ -217,6 +260,13 @@ class MilvusStoreV2:
                     return out
 
         # -------- 3) 메타 정규화
+        limits = _get_schema_limits(self.col)
+        SEC_MAX   = int(limits["section"])
+        CHK_MAX = int(limits["chunk"])
+        SAFE_VARCHAR_CAP = 512
+        SEC_MAX = min(SEC_MAX if SEC_MAX>0 else SECTION_MAX, SAFE_VARCHAR_CAP)
+        RAG_SEC_MAX = int(os.getenv("RAG_SECTION_MAX", 160))
+        
         metas = [c[1] for c in chunks]
         pages = []
         sections = []
@@ -225,7 +275,13 @@ class MilvusStoreV2:
                 pages.append(int(m.get("page", 0)))
             except Exception:
                 pages.append(0)
-            sections.append(str(m.get("section", ""))[:512])
+            s = "" if m.get("section") is None else str(m.get("section"))
+            s=s[:RAG_SEC_MAX]
+            sections.append(s[:SEC_MAX])  #  실제 스키마 길이로 clamp
+            
+        # -------- 4) 텍스트 준비 (임베딩 전에 잘라서 "임베딩 내용 == 저장 내용")
+        texts = [(c[0] or "") for c in chunks]
+        texts = [t[:CHUNK_MAX] for t in texts]  #  하드 클램프
 
         # -------- 4) 임베딩 + 차원 검증
         vecs = embed_fn(texts)
@@ -239,6 +295,11 @@ class MilvusStoreV2:
                 raise RuntimeError(f"embedding dim mismatch at {i}: {len(v)}")
 
         # -------- 5) 리스트-컬럼 방식으로 삽입 (스키마: [id, doc_id, page, section, chunk, embedding])
+        if len(doc_id) > DOC_ID_MAX:
+            import hashlib
+            suf = hashlib.sha256(doc_id.encode("utf-8","ignore")).hexdigest()[:8]
+            doc_id = doc_id[:(DOC_ID_MAX-10)] + "__" + suf
+        # 리스트로 묶어서 삽입
         entities = [
             [doc_id] * len(texts),   # doc_id
             pages,                   # page
@@ -322,7 +383,7 @@ class MilvusStoreV2:
         res = self.col.query(
             expr=f'doc_id == "{doc_id}"',
             output_fields=["doc_id"],
-            limit=100000
+            limit=1
         )
         return len(res) if res else 0
 
@@ -416,6 +477,10 @@ class MilvusStoreV2:
                     "doc_id": h.entity.get("doc_id"),
                     "page": int(h.entity.get("page")),
                     "section": h.entity.get("section"),
-                    "chunk": (h.entity.get("chunk") or "")[:300],
+                    "chunk": (
+                         (h.entity.get("chunk") or "")[: int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))]
+                         if os.getenv("DEBUG_PEEK_MAX_CHARS", "300") != "0"
+                         else (h.entity.get("chunk") or "")
+                     ),
                 })
         return out

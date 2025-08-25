@@ -255,6 +255,7 @@ async def upload_document(
     safe_name = os.path.basename(file.filename)
     local_path = os.path.join(UPLOAD_DIR, safe_name)
     content = await file.read()
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
     with open(local_path, "wb") as f:
         f.write(content)
 

@@ -1,6 +1,6 @@
 # app/services/layout_chunker.py
 from __future__ import annotations
-import re, json
+import re, json, os
 from typing import List, Tuple, Dict, Any, Callable, Optional
 
 #표는 “행=정확 데이터”라 원자화 + 인접행 보조청크가 필수.
@@ -24,6 +24,26 @@ def _is_tableish_block(lines: List[str]) -> bool:
     # 라인에 세로선/구분기호가 반복되거나, 2칸 이상 공백 분할이 지속되면 표로 간주
     marks = sum(1 for ln in lines if GRID_HINT.search(ln) or ("  " in ln))
     return marks >= max(3, len(lines)//3)
+
+SECTION_CAP = int(os.getenv("RAG_SECTION_CAP", "160"))
+#   대표 제목이 없을 때 본문 첫 문장(최대 80자)로 대체
+def _pick_section_title(title: str, body: str) -> str:
+    t = (title or "").strip()
+    if t:
+        return t[:SECTION_CAP]
+    b = (body or "").strip()
+    if not b:
+        return ""
+    first = b.splitlines()[0].strip()
+    return first[:80]
+
+#   BBOX 음수/역전 방지 + 중복 제거
+def _clamp_bbox(bb: list[float]) -> list[float]:
+    x0, y0, x1, y1 = map(float, bb[:4])
+    x0 = max(0.0, x0); y0 = max(0.0, y0)
+    x1 = max(x0, x1); y1 = max(y0, y1)
+    return [x0, y0, x1, y1]
+
 
 def _split_pages_to_blocks(pages: List[Tuple[int,str]]) -> List[Tuple[int, Dict[str,Any]]]:
     """페이지 텍스트를 (타입,본문,제목) 블록으로 분해"""
@@ -108,8 +128,16 @@ def _attach_bboxes_simple(text: str, page_blocks: list[dict]) -> list[list[float
         if probe and probe in t:
             bb = blk.get("bbox")
             if isinstance(bb, (list, tuple)) and len(bb) == 4:
-                out.append([float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])])
-    return out
+                out.append(_clamp_bbox(list(bb)))
+
+    # 중복 제거
+    seen, uniq = set(), []
+    for bb in out:
+        key = tuple(round(v, 3) for v in bb)  # 너무 미세한 차이는 동일 처리
+        if key not in seen:
+            seen.add(key)
+            uniq.append(bb)
+    return uniq
 
 def layout_aware_chunks(
     pages: List[Tuple[int,str]],
@@ -123,45 +151,60 @@ def layout_aware_chunks(
     out: List[Tuple[str,dict]] = []
 
     def meta_line(d: Dict[str,Any], page:int, bboxes: list[list[float]], title: str) -> str:
-        meta = {"type": d["type"], "section": (title or "").strip(),
-                "pages": [page], "bboxes": {int(page): bboxes} if bboxes else {}}
+        section = _pick_section_title(title, d.get("body", ""))[:SECTION_CAP]
+        meta = {
+            "type": d["type"],
+            "section": section,
+            "pages": [page],
+            "bboxes": {int(page): bboxes} if bboxes else {}
+        }
         return "META: " + json.dumps(meta, ensure_ascii=False)
 
     for page, b in blocks:
         title = (b.get("title") or "").strip()
         page_bbs = (layout_blocks or {}).get(int(page), [])
+        section = _pick_section_title(title, b.get("body", ""))[:SECTION_CAP]
 
         if b["type"] == "table":
             rows = _parse_table_rows(b["body"])
             if not rows:
                 bbs = _attach_bboxes_simple(b["body"], page_bbs)
-                text = f"{meta_line(b, page, bbs, title)}\n[{title}]\n{b['body']}"
-                out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
+                head = f"\n[{section}]\n" if section else "\n"
+                text = f"{meta_line(b, page, bbs, title)}{head}{b['body']}"
+                out.append((text, {"page": page, "section": section, "pages": [page],
+                                   "bboxes": {int(page): bbs} if bbs else {}}))
                 continue
 
             # (1) 원자 행
             for idx, row in enumerate(rows):
                 alias = ", ".join([v for v in row.values() if v])
-                body = f"[{title}] 행#{idx+1}\n열: {', '.join(row.keys())}\n값: {alias}"
+                body = f"{f'[{section}]\n' if section else ''}행#{idx+1}\n열: {', '.join(row.keys())}\n값: {alias}"
                 bbs = _attach_bboxes_simple(alias, page_bbs)
                 text = f"{meta_line(b, page, bbs, title)}\n{body}"
-                out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
+                out.append((text, {"page": page, "section": section, "pages": [page],
+                                   "bboxes": {int(page): bbs} if bbs else {}}))
 
             # (2) 인접 행 보조
             for win in _windowed(rows, slide_rows, step=1):
                 alias = "\n".join([", ".join(r.values()) for r in win])
                 bbs = _attach_bboxes_simple(alias, page_bbs)
-                text = f"{meta_line(b, page, bbs, title)}\n[{title}] 인접행 묶음\n{alias}"
-                out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
-
+                body = f"{f'[{section}] 인접행 묶음\n' if section else '인접행 묶음\n'}{alias}"
+                text = f"{meta_line(b, page, bbs, title)}\n{body}"
+                out.append((text, {"page": page, "section": section, "pages": [page],
+                                   "bboxes": {int(page): bbs} if bbs else {}}))
         elif b["type"] == "bullet":
             bbs = _attach_bboxes_simple(b["body"], page_bbs)
-            text = f"{meta_line(b, page, bbs, title)}\n[{title}]\n{b['body']}"
-            out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
+            head = f"\n[{section}]\n" if section else "\n"
+            text = f"{meta_line(b, page, bbs, title)}{head}{b['body']}"
+            out.append((text, {"page": page, "section": section, "pages": [page],
+                               "bboxes": {int(page): bbs} if bbs else {}}))
+
         else:
             from app.services.chunker import token_safe_chunks
             for ch in token_safe_chunks(b["body"], target_tokens, overlap_tokens):
                 bbs = _attach_bboxes_simple(ch, page_bbs)
-                text = f"{meta_line(b, page, bbs, title)}\n[{title}]\n{ch}"
-                out.append((text, {"page":page, "section":title, "pages":[page], "bboxes": {int(page): bbs} if bbs else {}}))
+                head = f"\n[{section}]\n" if section else "\n"
+                text = f"{meta_line(b, page, bbs, title)}{head}{ch}"
+                out.append((text, {"page": page, "section": section, "pages": [page],
+                                   "bboxes": {int(page): bbs} if bbs else {}}))
     return out

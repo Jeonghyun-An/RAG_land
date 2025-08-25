@@ -175,6 +175,11 @@ services:
       MILVUS_PORT: "19530"
       MILVUS_COLLECTION: "rag_chunks_v2"
       RAG_JOB_STATE_PERSIST: "minio"
+      MILVUS_SECTION_MAX: "512"  # 섹션 최대 문자 수
+      MILVUS_DOCID_MAX: "256"     # doc_id 최대 문자 수
+      MILVUS_CHUNK_MAX: "8192"    # 청크 최대 문자 수
+      RAG_SECTION_MAX: "160"  # 레이아웃 인지 청킹 섹션 최대 문자 수
+      SEC_CAP: "160"  # 레이아웃 인지 청킹 섹션 최대 문자 수
       # 컬렉션 초기화/업서트 옵션 (필요 시만 1로)
       RAG_RESET_COLLECTION: "0"
       # Dedup / 교체 정책
@@ -200,13 +205,15 @@ services:
       RAG_PARSE_HTML: "1"                # HTML 파싱 여부
       RAG_PARSE_PPTX: "1"                # PPTX 파싱 여부
       # --- DEBUG/로깅 ---
-      DEBUG_PEEK_MAX_CHARS: "500"  # 디버그용: 청크 미리보기 최대 문자 수
+      DEBUG_PEEK_MAX_CHARS: 0  # 디버그용: 청크 미리보기 최대 문자 수
       # --- OCR/파서 ---
       OCR_MODE: "auto"             # auto | always | never
       OCR_ENGINE: "paddle"         # paddle | tesseract | easyocr
       OCR_LANG: "korean"           # paddle: korean / tesseract: kor+eng / easyocr: ko,en
       OCR_DPI: "300"
       OCR_MIN_CHARS: "40"
+      OCR_MIN_CHARS_PER_PAGE : "50"
+      OCR_MAX_PAGES_FOR_OCR : "500"
       # tesseract 바이너리 경로가 필요하면(윈도우 베이스 아님) 비워둬도 OK
       OCR_TESSERACT_CMD: ""
       OCR_EASYOCR_GPU: "0"
@@ -225,7 +232,7 @@ services:
       RAG_PARSE_DIRECT_XLSX: "1"
       RAG_CONVERT_NONPDF_TO_PDF: "1"   # 기타 포맷 변환 허용
       # 임베딩
-      EMBEDDING_MODEL: "jhgan/ko-sbert-nli"
+      EMBEDDING_MODEL: "jhgan/ko-sbert-nli" 
       EMBED_MAX_TOKENS: "128"
       # 모델 기본값/토큰
       MODEL_ID: "meta-llama/Llama-3.2-1B-Instruct"

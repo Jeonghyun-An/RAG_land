@@ -25,6 +25,12 @@ def get_embedding_model():
 
 def embed(texts: List[str]) -> List[List[float]]:
     model = get_embedding_model()
+    try:
+        if hasattr(model, "max_seq_length"):
+            # 모델이 max_seq_length 속성을 지원하면 그걸 사용
+            model.max_seq_length = EMBED_MAX_TOKENS
+    except Exception:
+        pass
     return model.encode(
         texts,
         convert_to_numpy=True,
