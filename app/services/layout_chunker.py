@@ -25,7 +25,7 @@ def _is_tableish_block(lines: List[str]) -> bool:
     marks = sum(1 for ln in lines if GRID_HINT.search(ln) or ("  " in ln))
     return marks >= max(3, len(lines)//3)
 
-SECTION_CAP = int(os.getenv("RAG_SECTION_MAX", "160"))
+SECTION_CAP = int(os.getenv("RAG_SECTION_CAP", "160"))
 #   대표 제목이 없을 때 본문 첫 문장(최대 80자)로 대체
 def _pick_section_title(title: str, body: str) -> str:
     t = (title or "").strip()

@@ -1,13 +1,16 @@
 # app/api/llama_router.py
 from __future__ import annotations
 
-import os, re, asyncio, json, uuid
+import os
+import uuid
 from typing import List, Optional
+
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
 from pydantic import BaseModel
-
-from sse_starlette.sse import EventSourceResponse  # 요구사항: sse-starlette
+import asyncio, json
+from sse_starlette.sse import EventSourceResponse  # ✅ 요구사항: sse-starlette
 from app.services import job_state
+
 from app.services.file_parser import parse_pdf, parse_pdf_blocks
 from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
@@ -54,8 +57,7 @@ def _coerce_chunks_for_milvus(chs):
     - 빈 텍스트/연속 중복 제거
     """
     safe = []
-    SEC_CAP = int(os.getenv("RAG_SECTION_MAX", "160"))  # 환경변수 사용
-    for idx, t in enumerate( chs or []):
+    for t in chs or []:
         if not isinstance(t, (list, tuple)) or len(t) < 2:
             continue
         text, meta = t[0], t[1]
@@ -77,13 +79,8 @@ def _coerce_chunks_for_milvus(chs):
                 page = int(meta.get("page", 0))
             except Exception:
                 page = 0
-        seq = meta.get("seq",idx)
-        try:
-            seq = int(seq)
-        except Exception:
-            seq = idx
 
-        safe.append((text, {"page": page, "section": section, "pages": pages or [], "bboxes": meta.get("bboxes", {}), "seq": seq}))
+        safe.append((text, {"page": page, "section": section, "pages": pages or [], "bboxes": meta.get("bboxes", {})}))
 
     out = []
     last = None
@@ -236,98 +233,6 @@ def index_pdf_to_milvus(
         raise
 
 
-def _strip_meta(chunk_text: str) -> str:
-    """청크 맨 위 META: 라인을 제거하고 본문만 돌려줌"""
-    t = chunk_text or ""
-    if t.startswith("META:"):
-        nl = t.find("\n")
-        t = t[nl+1:] if nl != -1 else ""
-    return t.strip()
-
-def _toklen(encode, s: str) -> int:
-    try:
-        return len(encode(s) or [])
-    except Exception:
-        return len(s or "")
-
-def _safe_norm(s: str) -> str:
-    t = (s or "").strip()
-    t = re.sub(r"\s+", " ", t)
-    return t[:512]
-
-def build_context_with_seq_neighbors(
-    store,
-    hits: list[dict],
-    tokenizer,                       # huggingface 토크나이저
-    token_budget: int = 2048,
-    k_before: int = 2,
-    k_after: int = 2,
-) -> list[str]:
-    """
-    Milvus 검색 결과(hits)에 대해 각 히트의 seq ±(k_before, k_after) 이웃을 묶어
-    문맥을 구성해 준다. 반환은 LLM 프롬프트에 넣을 청크 문자열 리스트.
-    """
-    encode = lambda s: tokenizer.encode(s, add_special_tokens=False) if tokenizer else []
-    used = set()
-    out_texts: list[str] = []
-    cur_tokens = 0
-
-    for h in hits:
-        doc_id = h.get("doc_id")
-        seq = int(h.get("seq", -1))
-        if doc_id is None or seq < 0:
-            # seq 없는 히트(구버전) 호환: 본문만 사용
-            t = _strip_meta(h.get("chunk", ""))
-            if not t:
-                continue
-            need = _toklen(encode, t)
-            if cur_tokens + need > token_budget:
-                break
-            out_texts.append(t)
-            cur_tokens += need
-            continue
-
-        key = (doc_id, seq)
-        if key in used:
-            continue
-        used.add(key)
-
-        # 이웃 번들 가져오기 (center 포함)
-        bundle = store.neighbors_by_seq(doc_id, seq, k_before=k_before, k_after=k_after)
-        texts: list[str] = []
-        seen_texts = set()
-
-        for r in bundle:
-            t = _strip_meta(r.get("chunk", ""))
-            if not t:
-                continue
-            nkey = (r.get("doc_id"), int(r.get("seq", -1)), _safe_norm(t))
-            if nkey in seen_texts:
-                continue
-            seen_texts.add(nkey)
-            texts.append(t)
-
-        if not texts:
-            continue
-
-        merged = "\n\n".join(texts).strip()
-        need = _toklen(encode, merged)
-
-        # 예산 초과면 메인(첫 텍스트)만이라도 시도
-        if cur_tokens + need > token_budget:
-            main_text = texts[0]
-            mneed = _toklen(encode, main_text)
-            if cur_tokens + mneed <= token_budget:
-                out_texts.append(main_text)
-                cur_tokens += mneed
-            break
-
-        out_texts.append(merged)
-        cur_tokens += need
-
-    return out_texts
-
-
 # ---------- Routes ----------
 @router.get("/test")
 def test():
@@ -407,104 +312,46 @@ async def upload_document(
 
 @router.post("/ask", response_model=AskResp)
 def ask_question(body: AskReq):
-    """
-    - Milvus 벡터 검색 → rerank → (가능하면) seq 이웃 묶기 → 예산 내 컨텍스트 구성
-    - LLM 프롬프트는 규칙 블록으로 고정해 '형식' 텍스트가 답변으로 흘러들어가는 현상 방지
-    - META 라인은 임베딩/컨텍스트에서 제거(출처는 별도 sources로 반환)
-    """
     try:
-        # 0) 모델/스토어 준비
+        # 1) 초기 넉넉히 검색 (예: 20)
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-
-        # 1) 초기 검색(넉넉히)
-        raw_topk = max(20, body.top_k * 5)
-        cands = store.search(body.question, embed_fn=embed, topk=raw_topk)
+        cands = store.search(body.question, embed_fn=embed, topk=max(20, body.top_k * 5))
         if not cands:
             raise HTTPException(404, "관련 문서를 찾지 못했습니다. 먼저 문서를 업로드/인덱싱 해주세요.")
 
-        # 2) 리랭크
-        ranked = rerank(body.question, cands, top_k=body.top_k)
-        if not ranked:
+        # 2) 리랭크 후 상위 k
+        topk = rerank(body.question, cands, top_k=body.top_k)
+        if not topk:
             return AskResp(answer="문서에서 확신할 수 있는 근거를 찾지 못했습니다.", used_chunks=0, sources=[])
 
-        # 3) 신뢰도 컷오프(옵션)
+
+        # 3) 임계값 컷오프(리랭커 스코어 기준, 필요시 조정)
         THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.2"))
-        if "re_score" in ranked[0] and ranked[0]["re_score"] < THRESH:
+        if "re_score" in topk[0] and topk[0]["re_score"] < THRESH:
             return AskResp(answer="문서에서 답을 확실히 찾기 어렵습니다.", used_chunks=0, sources=[])
 
-        # 4) 컨텍스트 구성 (seq 이웃 + 토큰 예산)
-        tokenizer = getattr(model, "tokenizer", None)
-        encode = (lambda s: tokenizer.encode(s, add_special_tokens=False)) if (tokenizer and hasattr(tokenizer, "encode")) else (lambda s: s.split())
-        budget = int(os.getenv("RAG_CONTEXT_BUDGET_TOKENS", "1024"))
-        k_before = int(os.getenv("RAG_SEQ_NEIGHBOR_BEFORE", "1"))
-        k_after  = int(os.getenv("RAG_SEQ_NEIGHBOR_AFTER",  "1"))
+        # 4) 컨텍스트 + 출처 만들기
+        context = ""
+        sources = []
+        for i, c in enumerate(topk, 1):
+            context += f"[{i}] (doc:{c['doc_id']} p.{c['page']} {c['section']})\n{c['chunk']}\n\n"
+            sources.append({"id": i, "doc_id": c["doc_id"], "page": c["page"], "section": c["section"], "chunk": c["chunk"]})
 
-        # seq 기반 이웃을 사용할 수 있는지 점검(필드+메서드 존재)
-        can_use_seq = any(("seq" in h and isinstance(h.get("seq", -1), int) and h["seq"] >= 0) for h in ranked) and hasattr(store, "neighbors_by_seq")
+        prompt = f"""아래 문서를 참고해서 질문에 정확히 답하세요. 근거가 없으면 모른다고 답합니다.
 
-        if can_use_seq:
-            context_chunks = build_context_with_seq_neighbors(
-                store=store,
-                hits=ranked,
-                tokenizer=tokenizer,
-                token_budget=budget,
-                k_before=k_before,
-                k_after=k_after,
-            )
-        else:
-            # 폴백: rerank 상위 청크 본문(body_only)들을 예산 내로 순차 채우기
-            context_chunks = []
-            cur = 0
-            for h in ranked:
-                body_only = _strip_meta(h.get("chunk", ""))
-                if not body_only:
-                    continue
-                need = _toklen(encode, body_only)
-                if need == 0:
-                    continue
-                if cur + need > budget:
-                    break
-                context_chunks.append(body_only)
-                cur += need
-
-        if not context_chunks:
-            return AskResp(answer="문서에서 근거 컨텍스트를 구성하지 못했습니다.", used_chunks=0, sources=[])
-
-        # 컨텍스트 합치기(청크 간 구분선)
-        context = "\n\n---\n\n".join(context_chunks)
-
-        # 5) 출처(source) 만들기 (LLM엔 본문만 주고, UI엔 META 포함 원문/메타 제공)
-        sources: List[dict] = []
-        for i, c in enumerate(ranked, 1):
-            sources.append({
-                "id": i,
-                "doc_id": c.get("doc_id"),
-                "page": c.get("page"),
-                "seq": c.get("seq", -1),
-                "section": c.get("section"),
-                "chunk": c.get("chunk"),
-                "score": float(c.get("re_score", c.get("score", 0.0)))
-            })
-
-        # 6) LLM 프롬프트(형식 텍스트가 답변에 섞이지 않도록 규칙 블록으로 분리)
-        prompt = f"""아래 문서를 참고해서 질문에 정확히 한문장 핵심문장 형식으로 답하세요. 근거가 없으면 모른다고 답합니다.
-
-[문서발췌]
+[문서 발췌]
 {context}
 
 [질문]
 {body.question}
 
+[형식]
+- 한 문장 핵심 답
+- 필요하면 근거 출처 번호로 인용: [1]
 """
-
         answer = generate_answer_unified(prompt, body.model_name)
-
-        return AskResp(
-            answer=answer.strip(),
-            used_chunks=len(context_chunks),
-            sources=sources
-        )
+        return AskResp(answer=answer, used_chunks=len(topk), sources=sources)
 
     except HTTPException:
         raise
@@ -662,7 +509,7 @@ def debug_milvus_info():
         raise HTTPException(500, f"Milvus info 조회 실패: {e}")
 
 @router.get("/debug/milvus/peek")
-def debug_milvus_peek(limit: int = 10, full: bool = True, max_chars:int|None = None):
+def debug_milvus_peek(limit: int = 5, full: bool = False, max_chars:int|None = None):
     """ Milvus 컬렉션의 일부 데이터 미리보기 """
     try:
         model = get_embedding_model()
