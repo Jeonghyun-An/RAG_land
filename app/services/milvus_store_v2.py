@@ -106,7 +106,7 @@ class MilvusStoreV2:
         try:
             fdict = {f.name: f for f in col.schema.fields}
             # 필수 필드 체크
-            required = ("doc_id", "page", "section", "chunk", "embedding")
+            required = ("doc_id", "seq", "page", "section", "chunk", "embedding")
             if any(r not in fdict for r in required):
                 return True
             emb = fdict["embedding"]
@@ -134,6 +134,7 @@ class MilvusStoreV2:
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
             FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length= DOC_ID_MAX),
+            FieldSchema(name="seq", dtype=DataType.INT64),
             FieldSchema(name="page", dtype=DataType.INT64),
             FieldSchema(name="section", dtype=DataType.VARCHAR, max_length= SECTION_MAX),
             FieldSchema(name="chunk", dtype=DataType.VARCHAR, max_length= CHUNK_MAX),
@@ -282,6 +283,8 @@ class MilvusStoreV2:
         # -------- 4) 텍스트 준비 (임베딩 전에 잘라서 "임베딩 내용 == 저장 내용")
         texts = [(c[0] or "") for c in chunks]
         texts = [t[:CHUNK_MAX] for t in texts]  #  하드 클램프
+        
+        seqs = list(range(len(texts)))
 
         # -------- 4) 임베딩 + 차원 검증
         vecs = embed_fn(texts)
@@ -302,6 +305,7 @@ class MilvusStoreV2:
         # 리스트로 묶어서 삽입
         entities = [
             [doc_id] * len(texts),   # doc_id
+            seqs,                    # seq(in doc)
             pages,                   # page
             sections,                # section
             [t[:8192] for t in texts],  # chunk
@@ -356,7 +360,7 @@ class MilvusStoreV2:
             anns_field="embedding",
             param={"metric_type": "IP", "params": {"ef": 64}},
             limit=topk,
-            output_fields=["doc_id", "page", "section", "chunk"],
+            output_fields=["doc_id", "seq", "page", "section", "chunk"],
             consistency_level="Strong",  # 바로 insert한 것도 검색 반영
         )
 
@@ -367,6 +371,7 @@ class MilvusStoreV2:
                 {
                     "score": float(hit.distance),  # IP similarity (normalized → cosine과 동일하게 해석)
                     "doc_id": ent.get("doc_id"),
+                    "seq": int(ent.get("seq")),
                     "page": int(ent.get("page")),
                     "section": ent.get("section"),
                     "chunk": ent.get("chunk"),
@@ -419,7 +424,7 @@ class MilvusStoreV2:
         expr = f'doc_id == "{doc_id}"'
         rows = self.col.query(
             expr=expr,
-            output_fields=["doc_id", "page", "section", "chunk"],
+            output_fields=["doc_id", "seq", "page", "section", "chunk"],
             limit=limit
         )
         return [
@@ -441,7 +446,7 @@ class MilvusStoreV2:
         """아무거나 몇 개 보기(샘플)"""
         rows = self.col.query(
             expr="page >= 0",
-            output_fields=["doc_id", "page", "section", "chunk"],
+            output_fields=["doc_id", "seq", "page", "section", "chunk"],
             limit=limit
         )
         return [
@@ -467,7 +472,7 @@ class MilvusStoreV2:
             anns_field="embedding",
             param={"metric_type": "IP", "params": {"ef": 64}},
             limit=topk,
-            output_fields=["doc_id", "page", "section", "chunk"]
+            output_fields=["doc_id", "seq", "page", "section", "chunk"]
         )
         out = []
         if res and res[0]:
@@ -484,3 +489,66 @@ class MilvusStoreV2:
                      ),
                 })
         return out
+    
+    # def neighbors_by_seq(self, doc_id: str, center_seq: int, k_before: int = 2, k_after: int = 2) -> list[dict]:
+    #     lo = max(0, int(center_seq) - int(k_before))
+    #     hi = int(center_seq) + int(k_after)
+    #     expr = f'doc_id == "{doc_id}" and seq >= {lo} and seq <= {hi}'
+    #     rows = self.col.query(
+    #         expr=expr,
+    #         output_fields=["doc_id", "seq", "page", "section", "chunk"],
+    #         limit= max(1, (k_before + k_after + 1)) * 5   # 안전 여유치
+    #     )
+    #     # seq 기준 정렬 + 중복 제거
+    #     rows = sorted(rows, key=lambda r: int(r.get("seq", 0)))
+    #     dedup = []
+    #     seen = set()
+    #     for r in rows:
+    #         key = (r.get("doc_id"), int(r.get("seq", -1)))
+    #         if key in seen: continue
+    #         seen.add(key)
+    #         dedup.append({
+    #             "doc_id": r.get("doc_id"),
+    #             "seq": int(r.get("seq", -1)),
+    #             "page": int(r.get("page", -1)),
+    #             "section": r.get("section", ""),
+    #             "chunk": r.get("chunk") or "",
+    #         })
+    #     return dedup
+
+
+    def neighbors_by_seq(self, doc_id: str, center_seq: int, k_before: int = 1, k_after: int = 1) -> list[dict]:
+        """
+        같은 doc_id 내에서 seq 기준으로 앞뒤 이웃을 포함해 묶음을 돌려준다.
+        반환: [{doc_id, page, seq, section, chunk}, ...] (seq 오름차순)
+        """
+        try:
+            self.col.load()
+        except Exception:
+            pass
+        start = int(center_seq) - int(k_before)
+        end   = int(center_seq) + int(k_after)
+        expr = f'doc_id == "{doc_id}" && seq >= {start} && seq <= {end}'
+        rows = self.col.query(
+            expr=expr,
+            output_fields=["doc_id", "page", "seq", "section", "chunk"],
+            limit=10000
+        )
+        rows = rows or []
+        rows.sort(key=lambda r: int(r.get("seq", 0)))
+        # page/seq 정규화 + 미리보기 자르기(환경변수)
+        out = []
+        for r in rows:
+            out.append({
+                "doc_id": r.get("doc_id"),
+                "page": int(r.get("page", -1)),
+                "seq": int(r.get("seq", -1)),
+                "section": r.get("section", ""),
+                "chunk": (
+                    (r.get("chunk") or "")[: int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))]
+                    if os.getenv("DEBUG_PEEK_MAX_CHARS", "300") != "0"
+                    else (r.get("chunk") or "")
+                ),
+            })
+        return out
+    
