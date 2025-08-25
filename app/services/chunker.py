@@ -44,6 +44,13 @@ def _norm_text(s: str) -> str:
 def _hash_text(s: str) -> str:
     return hashlib.sha1(_norm_text(s).encode("utf-8", errors="ignore")).hexdigest()
 
+# ---- bbox helper ----
+def _clamp_bbox(bb: List[float]) -> List[float]:
+    x0, y0, x1, y1 = map(float, bb[:4])
+    x0 = max(0.0, x0); y0 = max(0.0, y0)
+    x1 = max(x0, x1); y1 = max(y0, y1)
+    return [x0, y0, x1, y1]
+
 # ===================== 패턴 =====================
 
 HEADING_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*|[IVXLC]+\.|[A-Z]\))\s+\S|^\s*#{1,6}\s+\S", re.M)
@@ -220,27 +227,49 @@ def pack_by_tokens(
 ) -> List[str]:
     """
     오버랩은 유지하되, '완전히 동일한 문단'이 두 번 들어가면 방지.
+    + 너무 작은 청크(하한 미만)는 다음/이전과 자동 병합
     """
+    MIN_TOK = int(os.getenv("RAG_MIN_CHUNK_TOKENS", "0") or 0)
+
     chunks: List[str] = []
     cur_paras: List[str] = []
     cur_ids: List[Any] = []
 
-    def _emit():
+    def _emit(final: bool = False):
         if not cur_paras:
             return
         piece = "\n\n".join(cur_paras).strip()
         if not piece:
             return
-        # 바로 직전 청크와 완전 동일하면 스킵
-        if chunks and _norm_text(chunks[-1]) == _norm_text(piece):
+
+        # 하한 미만인데 최종 emit이 아니면 일단 보류(다음 문단과 합치기 대기)
+        if MIN_TOK > 0 and _toklen(encode, piece) < MIN_TOK and not final:
             return
+
+        # 최종 emit인데 하한 미만이면 직전 청크에 병합 시도
+        if MIN_TOK > 0 and _toklen(encode, piece) < MIN_TOK and final and chunks:
+            prev = chunks[-1]
+            merged = (prev + "\n\n" + piece).strip()
+            if _toklen(encode, merged) <= target_tokens and _norm_text(prev) != _norm_text(merged):
+                chunks[-1] = merged
+                cur_paras.clear(); cur_ids.clear()
+                return
+            # 병합 불가면 그냥 내보냄 (유실 방지)
+
+        # 바로 직전과 완전 동일하면 스킵
+        if chunks and _norm_text(chunks[-1]) == _norm_text(piece):
+            cur_paras.clear(); cur_ids.clear()
+            return
+
         chunks.append(piece)
+        cur_paras.clear(); cur_ids.clear()
 
     for p in paras:
         if not p or not p.strip():
             continue
         ids = encode(p)
-        # 문단이 target보다 크면 단독 청크로(단, 직전과 동일시 스킵)
+
+        # 문단이 target 초과면 단독 청크로(단, 직전과 동일시 스킵)
         if len(ids) > target_tokens:
             _emit()
             candidate = p.strip()
@@ -257,6 +286,14 @@ def pack_by_tokens(
             cur_paras.append(p)
             cur_ids += ids
         else:
+            # ---- 하한 보호: 끊기 직전에 새 문단을 더 붙여도 target을 넘지 않으면 붙여서 자투리 방지 ----
+            if MIN_TOK > 0 and cur_paras:
+                tmp = "\n\n".join(cur_paras + [p]).strip()
+                if _toklen(encode, tmp) <= target_tokens:
+                    cur_paras.append(p)
+                    cur_ids += ids
+                    continue
+
             _emit()
             tail_paras, tail_ids = _tail_paras_by_tokens(cur_paras, encode, max(0, overlap_tokens))
             # tail + p 가 target 초과하면 p를 단독으로
@@ -267,7 +304,9 @@ def pack_by_tokens(
                 cur_paras, cur_ids = [], []
             else:
                 cur_paras, cur_ids = tail_paras + [p], tail_ids + ids
-    _emit()
+
+    # ---- 마지막 잔여 버퍼를 최종 규칙으로 emit (병합 시도 포함) ----
+    _emit(final=True)
 
     # 인접 동일 제거(이미 했지만 2차 안전망)
     dedup: List[str] = []
@@ -435,7 +474,7 @@ def _attach_bboxes_to_paragraph(para: str, page_blocks: list[dict]) -> list[list
     p = para.replace("\n", " ").strip()
     if not p:
         return []
-    bboxes = []
+    bboxes: list[list[float]] = []
     # 매칭 강도: 블록 텍스트의 앞부분(최대 40자) 또는 전체 중 1개라도 포함되면 채택
     for blk in page_blocks:
         t = (blk.get("text") or "").strip()
@@ -445,8 +484,14 @@ def _attach_bboxes_to_paragraph(para: str, page_blocks: list[dict]) -> list[list
         if probe and probe in p:
             bb = blk.get("bbox")
             if isinstance(bb, (list, tuple)) and len(bb) == 4:
-                bboxes.append([float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])])
-    return bboxes
+                bboxes.append(_clamp_bbox([float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])]))
+    # 중복 bbox 제거(과한 붙임 방지)
+    seen, uniq = set(), []
+    for bb in bboxes:
+        key = tuple(round(v, 3) for v in bb)
+        if key not in seen:
+            seen.add(key); uniq.append(bb)
+    return uniq
 
 def smart_chunk_pages_plus(
     pages: List[Tuple[int, str]],
@@ -481,8 +526,7 @@ def smart_chunk_pages_plus(
 
     cross_page = os.getenv("RAG_CROSS_PAGE_CHUNK", "1") == "1"
 
-    # 1) 반복 라인 보수 제거
-    repeating = _detect_repeating_lines(pages, head_n=3, tail_n=3)
+    repeating = _detect_repeating_lines(pages, head_n=3, tail_n=3, min_ratio=0.2)
 
     # 2) 페이지→문단(para) 단위로 전개 + 섹션 계승 + para별 bbox 붙이기
     para_items: list[dict] = []
@@ -504,6 +548,12 @@ def smart_chunk_pages_plus(
             sec = _guess_section_for_paragraph(p, last_section)
             if sec != last_section and sec:
                 last_section = sec
+            # 새 페이지 첫 문단이 직전 섹션 제목과 동일한 헤딩이면, 헤딩 라인은 버리고 본문만 사용
+            lines = p.splitlines()
+            if lines and HEADING_RE.match(lines[0]) and lines[0].strip() == last_section:
+                p = "\n".join(lines[1:]).strip()
+                if not p:
+                    continue
             bbs = _attach_bboxes_to_paragraph(p, blocks)
             para_items.append({
                 "page": int(page_no),
@@ -519,6 +569,8 @@ def smart_chunk_pages_plus(
     cur_pages: List[int] = []
     cur_bboxes: dict[int, list[list[float]]] = {}
     cur_section: str = ""
+    SECTION_CAP = int(os.getenv("RAG_SECTION_MAX", "160"))
+    seen_text_hashes: set[str] = set()
 
     def _emit():
         nonlocal cur_texts, cur_ids, cur_pages, cur_bboxes, cur_section
@@ -527,12 +579,25 @@ def smart_chunk_pages_plus(
         piece = "\n\n".join(cur_texts).strip()
         if not piece:
             return
+        # 텍스트만 기준으로 전역 dedup (META/페이지 리스트 차이 때문에 생기는 중복 방지)
+        norm = _norm_text(piece)
+        h = _hash_text(norm)
+        if h in seen_text_hashes:
+            cur_texts, cur_ids, cur_pages, cur_bboxes, cur_section = [], [], [], {}, ""
+            return
+        seen_text_hashes.add(h)
         # META 라인 (텍스트 최상단에 삽입)
         meta = {
             "type": "text",
-            "section": cur_section or "",
+            "section": (cur_section or "")[:SECTION_CAP],
             "pages": sorted(list(dict.fromkeys(cur_pages))),  # unique-preserving order
-            "bboxes": {int(k): v for k, v in cur_bboxes.items() if v},
+            # 페이지별 bbox 중복 제거
+            "bboxes": {
+                int(k): (lambda lst: (lambda seen=set(), u=[]: ([
+                    (seen.add(tuple(round(v,3) for v in bb)) or u.append(bb))
+                    for bb in lst if tuple(round(v,3) for v in bb) not in seen
+                ], u)[1])())(v) for k, v in cur_bboxes.items() if v
+            },
         }
         meta_line = "META: " + json.dumps(meta, ensure_ascii=False)
         chunk_text = meta_line + "\n" + piece
@@ -572,15 +637,23 @@ def smart_chunk_pages_plus(
             cur_bboxes = {it["page"]: list(it["bboxes"])} if it["bboxes"] else {}
             cur_section = it["section"]
             continue
-
+        
         # 토큰 용량 검사
         if len(cur_ids) + len(ids) <= target_tokens:
+            # cross_page가 꺼져 있고 새 페이지라면 이전 청크를 마무리하고 끊는다.
+            if (not cross_page) and (it["page"] != cur_pages[-1]):
+                _emit()
+                cur_texts = [it["text"]]
+                cur_ids   = list(ids)
+                cur_pages = [it["page"]]
+                cur_bboxes = {it["page"]: list(it["bboxes"])} if it["bboxes"] else {}
+                cur_section = it["section"]
+                continue
+            # 같은 페이지이거나 cross_page가 켜져 있을 때만 이어붙임
             cur_texts.append(it["text"])
             cur_ids += ids
-            # 페이지/박스 갱신
-            if cross_page or (it["page"] == cur_pages[-1]):
-                if it["page"] not in cur_pages:
-                    cur_pages.append(it["page"])
+            if (cross_page or it["page"] == cur_pages[-1]) and (it["page"] not in cur_pages):
+                cur_pages.append(it["page"])
             if it["bboxes"]:
                 cur_bboxes.setdefault(it["page"], []).extend(it["bboxes"])
         else:
