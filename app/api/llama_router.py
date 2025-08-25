@@ -509,7 +509,7 @@ def debug_milvus_info():
         raise HTTPException(500, f"Milvus info 조회 실패: {e}")
 
 @router.get("/debug/milvus/peek")
-def debug_milvus_peek(limit: int = 5, full: bool = False, max_chars:int|None = None):
+def debug_milvus_peek(limit: int = 100, full: bool = True, max_chars:int|None = None):
     """ Milvus 컬렉션의 일부 데이터 미리보기 """
     try:
         model = get_embedding_model()
