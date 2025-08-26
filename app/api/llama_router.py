@@ -1,7 +1,7 @@
 # app/api/llama_router.py
 from __future__ import annotations
 
-import os
+import os, re
 import uuid
 from typing import List, Optional
 
@@ -232,6 +232,43 @@ def index_pdf_to_milvus(
         job_state.fail(job_id, str(e))
         raise
 
+def _strip_meta_line(chunk_text: str) -> str:
+    """청크 맨 위 META: 라인을 제거하고 본문만 반환"""
+    t = chunk_text or ""
+    if t.startswith("META:"):
+        nl = t.find("\n")
+        t = t[nl+1:] if nl != -1 else ""
+    return t.strip()
+
+_DEF_PATTS = ("뭐야", "무엇", "뭔가", "의미", "정의", "설명", "어떤", "무엇인가", "무엇인지")
+
+def normalize_query(q: str) -> str:
+    """
+    정의/설명형 질문을 검색 친화적으로 보강:
+    - '... 뭐야/무엇/의미' 등을 '... 내용'으로 보강
+    - 너무 과하게 바꾸지 않고 원문을 유지하되 '내용', '정의' 토큰을 추가
+    """
+    base = q.strip()
+    lowered = base.lower()
+    if any(p in base for p in _DEF_PATTS):
+        # 핵심 키워드 보존 + 내용/정의를 덧붙여 벡터 검색 친화화
+        return f"{base} 내용 정의"
+    return base
+
+_KW_TOKEN_RE = re.compile(r"[A-Za-z가-힣0-9\.#\-]+")  # '57b항', '§57(b)', 'AEA-57b' 류 보존
+
+def extract_keywords(q: str) -> list[str]:
+    """
+    질문에서 검색 키워드 후보 추출(짧은 조사류/한 글자 토큰 제거)
+    """
+    toks = [t for t in _KW_TOKEN_RE.findall(q) if len(t) >= 2]
+    # 중복 제거(순서 보존)
+    seen, out = set(), []
+    for t in toks:
+        tl = t.lower()
+        if tl not in seen:
+            seen.add(tl); out.append(t)
+    return out
 
 # ---------- Routes ----------
 @router.get("/test")
@@ -313,32 +350,59 @@ async def upload_document(
 @router.post("/ask", response_model=AskResp)
 def ask_question(body: AskReq):
     try:
-        # 1) 초기 넉넉히 검색 (예: 20)
+        # 0) 모델/스토어 준비
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-        cands = store.search(body.question, embed_fn=embed, topk=max(20, body.top_k * 5))
+
+        # 1) 질문 전처리(쿼리 보강) + 초기 넉넉히 검색
+        query_for_search = normalize_query(body.question)
+        raw_topk = max(20, body.top_k * 5)
+        cands = store.search(query_for_search, embed_fn=embed, topk=raw_topk)
         if not cands:
             raise HTTPException(404, "관련 문서를 찾지 못했습니다. 먼저 문서를 업로드/인덱싱 해주세요.")
 
-        # 2) 리랭크 후 상위 k
+        # 2) 키워드 부스트(간단 가산점) — rerank 전에 상위권으로 끌어올림
+        kws = extract_keywords(body.question)
+        def _kw_boost_score(c: dict) -> int:
+            txt = _strip_meta_line(c.get("chunk", "")).lower()
+            return sum(1 for k in kws if k.lower() in txt)
+
+        for c in cands:
+            c["kw_boost"] = _kw_boost_score(c)
+
+        # kw_boost 우선 → 동점 시 원래 score 유지
+        cands.sort(key=lambda x: (x.get("kw_boost", 0), x.get("score", 0.0)), reverse=True)
+
+        # 3) 리랭크 후 상위 K
         topk = rerank(body.question, cands, top_k=body.top_k)
         if not topk:
             return AskResp(answer="문서에서 확신할 수 있는 근거를 찾지 못했습니다.", used_chunks=0, sources=[])
 
-
-        # 3) 임계값 컷오프(리랭커 스코어 기준, 필요시 조정)
+        # 4) 임계값 컷오프(리랭커 스코어 기준)
         THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.2"))
         if "re_score" in topk[0] and topk[0]["re_score"] < THRESH:
             return AskResp(answer="문서에서 답을 확실히 찾기 어렵습니다.", used_chunks=0, sources=[])
 
-        # 4) 컨텍스트 + 출처 만들기
-        context = ""
+        # 5) 컨텍스트 + 출처 구성 (본문만, META 제거)
+        context_lines = []
         sources = []
         for i, c in enumerate(topk, 1):
-            context += f"[{i}] (doc:{c['doc_id']} p.{c['page']} {c['section']})\n{c['chunk']}\n\n"
-            sources.append({"id": i, "doc_id": c["doc_id"], "page": c["page"], "section": c["section"], "chunk": c["chunk"]})
+            body_only = _strip_meta_line(c.get("chunk", ""))
+            context_lines.append(f"[{i}] (doc:{c['doc_id']} p.{c['page']} {c.get('section','')})\n{body_only}")
+            sources.append({
+                "id": i,
+                "doc_id": c.get("doc_id"),
+                "page": c.get("page"),
+                "section": c.get("section"),
+                "chunk": c.get("chunk"),
+                "score": c.get("re_score", c.get("score")),
+            })
+        context = "\n\n".join(context_lines)
 
+        # 6) 프롬프트(정의/설명형 대응 지시 추가)
         prompt = f"""아래 문서를 참고해서 질문에 정확히 답하세요. 근거가 없으면 모른다고 답합니다.
+- 정의/설명형 질문이면 문서 원문의 해당 내용을 간결히 요약하세요.
+- 문서에 근거가 있으면 출처 번호로 인용하세요: [1]
 
 [문서 발췌]
 {context}
