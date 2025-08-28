@@ -52,6 +52,8 @@ def _get_schema_limits(col: Collection) -> dict:
         "chunk":   _vmax(f.get("chunk"))   or CHUNK_MAX,
     }
 
+def delete_by_doc_id(self, doc_id: str) -> int:
+    return self._delete_by_doc_id(doc_id)
 
 
 class MilvusStoreV2:

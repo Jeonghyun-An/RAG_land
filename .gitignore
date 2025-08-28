@@ -85,3 +85,5 @@ minio/
 milvus/
 
 models/
+data/
+.flag

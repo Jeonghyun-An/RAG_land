@@ -105,6 +105,14 @@ def index_pdf_to_milvus(
         job_state.update(job_id, status="parsing", step="parse_pdf:start")
         print(f"[INDEX] start: {file_path}")
 
+        # [ADDED] 업로더가 '중복 업로드'로 판단해 uploaded=False로 넘긴 경우,
+        #         환경변수로 색인 스킵(기본 1) 여부 결정
+        SKIP_IF_ALREADY_UPLOADED = os.getenv("RAG_SKIP_IF_UPLOADED", "1") == "1"
+        if not uploaded and SKIP_IF_ALREADY_UPLOADED:
+            job_state.update(job_id, status="done", step="skipped:already_uploaded", progress=100)
+            print(f"[INDEX] skip: uploaded=False (already uploaded), job_id={job_id}")
+            return
+
         # 1) PDF → 페이지 텍스트
         pages = parse_pdf(file_path, by_page=True)
         if not pages:
@@ -133,10 +141,9 @@ def index_pdf_to_milvus(
         target_tokens = int(os.getenv("RAG_CHUNK_TOKENS", str(default_target)))
         overlap_tokens = int(os.getenv("RAG_CHUNK_OVERLAP", str(default_overlap)))
 
-        # >>> CHUNKING START — 레이아웃 인지 청킹 시도 → 실패 시 기존 스마트 청킹 폴백
+        # >>> CHUNKING START
         chunks = None
         try:
-            # 지연 import: 레이아웃 청커 모듈이 없어도 라우터는 살아있게
             from app.services.layout_chunker import layout_aware_chunks  # type: ignore
             chunks = layout_aware_chunks(
                 pages, encode, target_tokens, overlap_tokens, slide_rows=4, layout_blocks=layout_map
@@ -157,7 +164,6 @@ def index_pdf_to_milvus(
                 )
         # <<< CHUNKING END
 
-        # Milvus 삽입 안전망(메타/빈문자/연속중복 정리)
         chunks = _coerce_chunks_for_milvus(chunks)
         if not chunks:
             raise RuntimeError("Chunking 결과가 비었습니다.")
@@ -169,12 +175,49 @@ def index_pdf_to_milvus(
             base_from_obj = os.path.splitext(os.path.basename(minio_object or ""))[0] if minio_object else None
             doc_id = base_from_obj or os.path.splitext(os.path.basename(file_path))[0]
 
-        # 4) Milvus upsert (삽입/스킵 결과 반영)
-        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-        job_state.update(job_id, status="embedding", step="embed:start", progress=60)
+        # [ADDED] 교체 정책(사전삭제/사후재시도) 플래그
+        REPLACE_BEFORE_INSERT = os.getenv("RAG_REPLACE_BEFORE_INSERT", "0") == "1"
+        RETRY_AFTER_DELETE_ON_DUP = os.getenv("RAG_RETRY_AFTER_DELETE", "1") == "1"
 
+        # [ADDED] job_state에 모드/중복 사유가 있으면 반영(있으면 쓰고, 없으면 env만 사용)
+        st = job_state.get(job_id) or {}
+        mode = st.get("mode")  # 'replace' | 'version' | 'skip' 등이 있다면 사용
+        duplicate_reason = st.get("duplicate_reason")
+
+        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+
+        # [ADDED] 모드가 replace면 삽입 전에 기존 doc_id 행들을 PK로 삭제
+        if mode == "replace" or REPLACE_BEFORE_INSERT:
+            try:
+                # public 메서드가 있으면 사용, 없으면 _delete_by_doc_id로 폴백
+                if hasattr(store, "delete_by_doc_id"):
+                    deleted = store.delete_by_doc_id(doc_id)  # type: ignore
+                else:
+                    deleted = store._delete_by_doc_id(doc_id)  # type: ignore  # pylint: disable=protected-access
+                print(f"[INDEX] pre-delete for replace: doc_id={doc_id}, deleted={deleted}")
+            except Exception as e:
+                print(f"[INDEX] pre-delete warn: {e}")
+
+        # 4) Milvus upsert
+        job_state.update(job_id, status="embedding", step="embed:start", progress=60)
         res = store.insert(doc_id, chunks, embed_fn=embed)  # {inserted, skipped, reason, doc_id}
         real_doc_id = res.get("doc_id", doc_id)
+
+        # [ADDED] 만약 '중복' 때문에 skipped가 떴고, 정책상 교체라면: 삭제 후 1회 재시도
+        if res.get("skipped") and (mode == "replace" or RETRY_AFTER_DELETE_ON_DUP):
+            reason = (res.get("reason") or "").lower()
+            if any(k in reason for k in ["duplicate", "exists", "doc_id"]):
+                try:
+                    if hasattr(store, "delete_by_doc_id"):
+                        deleted = store.delete_by_doc_id(real_doc_id)  # type: ignore
+                    else:
+                        deleted = store._delete_by_doc_id(real_doc_id)  # type: ignore
+                    print(f"[INDEX] retry-after-delete: deleted={deleted}, doc_id={real_doc_id}")
+                    # 재시도
+                    res = store.insert(doc_id, chunks, embed_fn=embed)
+                    real_doc_id = res.get("doc_id", doc_id)
+                except Exception as e:
+                    print(f"[INDEX] retry-after-delete failed: {e}")
 
         if res.get("skipped"):
             job_state.update(
