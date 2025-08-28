@@ -1,6 +1,7 @@
 # app/api/llama_router.py
 from __future__ import annotations
 
+import hashlib, tempfile
 import os, re
 import uuid
 from typing import List, Optional
@@ -287,6 +288,7 @@ def generate(body: GenerateReq):
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    mode: str = Query("version", regex="^(skip|version|replace)$"),  
 ):
     # 1) 로컬 저장
     safe_name = os.path.basename(file.filename)
@@ -304,15 +306,33 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(500, f"파일 변환 중 예외: {e}")
 
+    def _sha256_file(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as fp:
+            for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    pdf_sha = _sha256_file(pdf_path)
+    hash_flag_key = f"uploaded/__hash__/sha256/{pdf_sha}.flag"
+
     # 3) MinIO 업로드 (원본 + 변환본 둘 다 올리고 싶으면 선택)
     minio = MinIOStore()
 
     pdf_name = os.path.basename(pdf_path)               # 예: doc.pdf
     object_pdf = f"uploaded/{pdf_name}"                 # 예: uploaded/doc.pdf
     uploaded = True
+    duplicate_reason = None  
 
-    # 중복 체크: 이름 같고, 사이즈(바이트) 같으면 스킵
-    if minio.exists(object_pdf):
+    #  3.0) 해시 플래그가 이미 있으면 동일 콘텐츠가 과거에 업로드됨
+    if minio.exists(hash_flag_key):
+        uploaded = False
+        duplicate_reason = "same_content_hash"
+        print(f"[UPLOAD] dedup by hash: {hash_flag_key}")
+        # mode=skip 이면 여기서 바로 '스킵'으로 표시(색인 단계에서 참조)
+
+    # 기존: 이름 같고, 사이즈 같으면 스킵 
+    if uploaded and minio.exists(object_pdf):
         try:
             remote_size = minio.size(object_pdf)
         except Exception:
@@ -321,23 +341,59 @@ async def upload_document(
 
         if remote_size == local_size and remote_size > -1:
             uploaded = False
+            duplicate_reason = duplicate_reason or "same_name_and_size"
             print(f"[UPLOAD] dedup hit: {object_pdf} (same name & size)")
         else:
-            # 이름은 같지만 사이즈 다르면 충돌 회피용 새 키로 저장
-            object_pdf = f"uploaded/{uuid.uuid4().hex}_{pdf_name}"
-            minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
-            print(f"[UPLOAD] name match but size differs -> stored as: {object_pdf}")
-    else:
+            # 이름은 같지만 사이즈 다르면
+            if mode == "replace":  # 동일 키로 덮어쓰기 (=교체)
+                minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
+                print(f"[UPLOAD] replaced existing: {object_pdf}")
+            else:
+                # 기존 동작: 충돌 회피용 새 키로 저장(버전 관리)
+                object_pdf = f"uploaded/{uuid.uuid4().hex}_{pdf_name}"
+                minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
+                print(f"[UPLOAD] name match but size differs -> stored as: {object_pdf}")
+    elif uploaded:
+        # 최초 업로드
         minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
         print(f"[UPLOAD] stored: {object_pdf}")
 
-    # doc_id는 오브젝트 파일명(확장자 제외)로 통일하면 충돌 안 남
+    #  새로 업로드(또는 replace로 덮어쓰기)된 경우 해시 플래그를 기록
+    try:
+        if uploaded and not minio.exists(hash_flag_key):
+            # 간단한 flag 파일을 만들어 업로드
+            flag_local = os.path.join(UPLOAD_DIR, "__hashflags__", f"{pdf_sha}.flag")
+            os.makedirs(os.path.dirname(flag_local), exist_ok=True)
+            with open(flag_local, "wb") as ff:
+                ff.write(b"1")
+            minio.upload(flag_local, object_name=hash_flag_key, content_type="text/plain")
+            print(f"[UPLOAD] hash flag written: {hash_flag_key}")
+    except Exception as e:
+        # 플래그 실패는 치명적이지 않으므로 경고만
+        print(f"[UPLOAD] warn: failed to write hash flag: {e}")
+
+    # doc_id는 오브젝트 파일명(확장자 제외)로 통일하면 충돌 안 남 (기존 유지)
     doc_id = os.path.splitext(os.path.basename(object_pdf))[0]
 
-    # 인덱싱(백그라운드) - uploaded 플래그 전달
+    # 인덱싱(백그라운드)
     job_id = uuid.uuid4().hex
     job_state.start(job_id, doc_id=doc_id, minio_object=object_pdf)
-    job_state.update(job_id, status="uploaded", step="minio:ok", filename=safe_name, progress=10)
+    # [ADDED] 모드/해시/중복사유를 상태에 넣어 색인기에서 활용(교체/스킵 등)
+    job_state.update(
+        job_id,
+        status="uploaded",
+        step="minio:ok",
+        filename=safe_name,
+        progress=10,
+        mode=mode,
+        content_sha256=pdf_sha,
+        duplicate_reason=duplicate_reason,
+        uploaded=uploaded,
+    )
+
+    # index_pdf_to_milvus는 기존 시그니처 유지
+    #   uploaded: False면 색인쪽에서 스킵/경량 처리 가능
+    #   mode: replace인 경우 job_state에서 읽어 기존 벡터 삭제 후 재색인하도록 구현 권장
     background_tasks.add_task(index_pdf_to_milvus, job_id, pdf_path, object_pdf, uploaded, False, doc_id)
 
     return UploadResp(

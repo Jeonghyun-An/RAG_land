@@ -175,12 +175,11 @@ class MilvusStoreV2:
         """같은 doc_id 문서를 교체(삭제 후 재삽입)하고 싶을 때 사용.
            RAG_REPLACE_DOC=1 이면 활성화.
         """
-        if os.getenv("RAG_REPLACE_DOC", "0") != "1":
+        if os.getenv("RAG_REPLACE_DOC", "1") != "1":
             return
         try:
-            self.col.delete(expr=f'doc_id == "{doc_id}"')
-            self.col.flush()
-            print(f"ℹ️ replaced doc: {doc_id}")
+            deleted = self._delete_by_doc_id(doc_id)
+            print(f"replaced doc: {doc_id} (deleted {deleted})")
         except Exception as e:
             print(f"⚠️ replace_doc failed: {e}")
 
@@ -244,9 +243,8 @@ class MilvusStoreV2:
 
             if REPLACE_DOC:
                 try:
-                    self.col.delete(expr=f'doc_id == "{doc_id}"')
-                    self.col.flush()
-                    # 계속 진행해서 새로 삽입
+                    deleted = self._delete_by_doc_id(doc_id)
+                    print(f"replace existing doc_id={doc_id}: deleted {deleted} rows")
                 except Exception as e:
                     raise RuntimeError(f"failed to replace existing doc_id={doc_id}: {e}")
             else:
@@ -343,6 +341,35 @@ class MilvusStoreV2:
             return getattr(res, "delete_count", 0) or 0
         except Exception:
             return 0
+        
+    def _delete_by_doc_id(self, doc_id: str) -> int:
+        """doc_id로 해당 문서의 PK(id)들을 조회한 뒤, PK in [...] 방식으로 삭제"""
+        try:
+            self.col.load()
+        except Exception:
+            pass
+
+        # 1) doc_id로 PK(id) 조회
+        safe = str(doc_id).replace('"', r'\"')
+        rows = self.col.query(
+            expr=f'doc_id == "{safe}"',
+            output_fields=["id"],
+            # limit는 제거(모두 가져오기). 환경에 따라 한번에 너무 많으면 나눠서 조회 필요
+        ) or []
+
+        ids = [r["id"] for r in rows if "id" in r]
+        if not ids:
+            return 0
+
+        # 2) PK로 삭제 (Milvus는 긴 리스트 삭제가 비효율적일 수 있으니 배치)
+        BATCH = 16384  # 안전한 배치 크기
+        for i in range(0, len(ids), BATCH):
+            batch = ids[i : i + BATCH]
+            # 리스트를 그대로 포맷팅하면 [1,2,3] 형태가 되어 expr로 사용 가능
+            self.col.delete(expr=f"id in {batch}")
+
+        self.col.flush()
+        return len(ids)
     
     def search(self, query: str, embed_fn: Callable[[List[str]], List[List[float]]], topk: int = 20) -> List[Dict[str, Any]]:
         """IP metric + normalize 임베딩 기준으로 상위 topk 반환"""
