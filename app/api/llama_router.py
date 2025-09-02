@@ -450,6 +450,7 @@ async def upload_document(
             "pdf": object_pdf,
             "original": object_orig,
             "original_name": safe_name,
+            "original_mime": orig_ct,
             "sha256": pdf_sha,
             "uploaded_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "mode": mode,
