@@ -5,7 +5,11 @@ import mimetypes
 import hashlib, tempfile
 import os, re
 import uuid
+from urllib.parse import unquote, quote
 from typing import List, Optional
+from starlette.responses import FileResponse
+from starlette.background import BackgroundTask
+from starlette.responses import StreamingResponse
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
 from pydantic import BaseModel
@@ -278,6 +282,16 @@ def index_pdf_to_milvus(
     except Exception as e:
         job_state.fail(job_id, str(e))
         raise
+def _content_disposition(disposition: str, filename: str) -> str:
+    """
+    latin-1 제한을 피하기 위해:
+    - ASCII fallback: 파일명에서 비ASCII를 _ 로 대체
+    - filename*: UTF-8''<percent-encoded> 함께 제공
+    """
+    # fallback: ASCII만 남기기
+    ascii_fallback = re.sub(r'[^A-Za-z0-9._-]+', '_', filename) or 'file'
+    utf8_quoted = quote(filename)  # UTF-8 percent-encode
+    return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_quoted}"
 
 def _strip_meta_line(chunk_text: str) -> str:
     """청크 맨 위 META: 라인을 제거하고 본문만 반환"""
@@ -735,6 +749,68 @@ def delete_file(object_name: str):
         raise
     except Exception as e:
         raise HTTPException(500, f"파일 삭제 실패: {e}")
+    
+@router.get("/view/{object_name:path}")
+def view_object(object_name: str, name: Optional[str] = None):
+    key = unquote(object_name)
+    m = MinIOStore()
+    if not m.exists(key):
+        raise HTTPException(404, f"object not found: {key}")
+
+    disp_name = name or os.path.basename(key)
+    ext = os.path.splitext(key)[1].lower()
+    media = "application/pdf" if ext == ".pdf" else (mimetypes.guess_type(disp_name)[0] or "application/octet-stream")
+
+    try:
+        obj = m.client.get_object(m.bucket, key)
+    except Exception as e:
+        raise HTTPException(500, f"MinIO get_object failed: {e}")
+
+    headers = {
+        # 👇 latin-1 안전하게
+        "Content-Disposition": _content_disposition("inline", disp_name)
+    }
+
+    def _iter():
+        try:
+            for chunk in obj.stream(32 * 1024):
+                yield chunk
+        finally:
+            obj.close()
+            obj.release_conn()
+
+    return StreamingResponse(_iter(), media_type=media, headers=headers)
+
+
+@router.get("/download/{object_name:path}")
+def download_object(object_name: str, name: Optional[str] = None):
+    key = unquote(object_name)
+    m = MinIOStore()
+    if not m.exists(key):
+        raise HTTPException(404, f"object not found: {key}")
+
+    disp_name = name or os.path.basename(key)
+    media = mimetypes.guess_type(disp_name)[0] or "application/octet-stream"
+
+    try:
+        obj = m.client.get_object(m.bucket, key)
+    except Exception as e:
+        raise HTTPException(500, f"MinIO get_object failed: {e}")
+
+    headers = {
+        # 👇 latin-1 안전하게
+        "Content-Disposition": _content_disposition("attachment", disp_name)
+    }
+
+    def _iter():
+        try:
+            for chunk in obj.stream(32 * 1024):
+                yield chunk
+        finally:
+            obj.close()
+            obj.release_conn()
+
+    return StreamingResponse(_iter(), media_type=media, headers=headers)
 
 # ---------- Bulk delete MinIO files under a prefix ----------
 @router.delete("/files/purge", tags=["llama"])
