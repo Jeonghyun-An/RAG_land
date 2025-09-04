@@ -37,11 +37,11 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ---------- Schemas ----------
 class GenerateReq(BaseModel):
     prompt: str
-    model_name: str = "llama-1b"
+    model_name: str = "llama-3.2-3b"
 
 class AskReq(BaseModel):
     question: str
-    model_name: str = "llama-1b"
+    model_name: str = "llama-3.2-3b"
     top_k: int = 3
 
 class UploadResp(BaseModel):
@@ -480,6 +480,7 @@ async def upload_document(
     background_tasks.add_task(index_pdf_to_milvus, job_id, pdf_path, object_pdf, uploaded, False, doc_id)
 
     return UploadResp(filename=safe_name, minio_object=object_pdf, indexed="background", job_id=job_id)
+
 @router.post("/ask", response_model=AskResp)
 def ask_question(body: AskReq):
     try:
@@ -491,8 +492,14 @@ def ask_question(body: AskReq):
         query_for_search = normalize_query(body.question)
         raw_topk = max(20, body.top_k * 5)
         cands = store.search(query_for_search, embed_fn=embed, topk=raw_topk)
+        
+        # 검색 결과 없음 처리 개선
         if not cands:
-            raise HTTPException(404, "관련 문서를 찾지 못했습니다. 먼저 문서를 업로드/인덱싱 해주세요.")
+            return AskResp(
+                answer="업로드된 문서에서 관련 내용을 찾을 수 없습니다. 문서가 올바르게 인덱싱되었는지 확인해주세요.",
+                used_chunks=0,
+                sources=[]
+            )
 
         # 2) 키워드 부스트(간단 가산점) — rerank 전에 상위권으로 끌어올림
         kws = extract_keywords(body.question)
@@ -509,12 +516,20 @@ def ask_question(body: AskReq):
         # 3) 리랭크 후 상위 K
         topk = rerank(body.question, cands, top_k=body.top_k)
         if not topk:
-            return AskResp(answer="문서에서 확신할 수 있는 근거를 찾지 못했습니다.", used_chunks=0, sources=[])
+            return AskResp(
+                answer="문서에서 신뢰할 수 있는 관련 내용을 찾지 못했습니다.",
+                used_chunks=0,
+                sources=[]
+            )
 
-        # 4) 임계값 컷오프(리랭커 스코어 기준)
-        THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.2"))
+        # 4) 임계값 컷오프(리랭커 스코어 기준) - 더 엄격하게
+        THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))  # 0.2 → 0.3으로 상향
         if "re_score" in topk[0] and topk[0]["re_score"] < THRESH:
-            return AskResp(answer="문서에서 답을 확실히 찾기 어렵습니다.", used_chunks=0, sources=[])
+            return AskResp(
+                answer="문서에서 해당 질문에 대한 확실한 답변을 찾기 어렵습니다.",
+                used_chunks=0,
+                sources=[]
+            )
 
         # 5) 컨텍스트 + 출처 구성 (본문만, META 제거)
         context_lines = []
@@ -532,22 +547,30 @@ def ask_question(body: AskReq):
             })
         context = "\n\n".join(context_lines)
 
-        # 6) 프롬프트(정의/설명형 대응 지시 추가)
-        prompt = f"""아래 문서를 참고해서 질문에 정확히 답하세요. 근거가 없으면 모른다고 답합니다.
-- 정의/설명형 질문이면 문서 원문의 해당 내용을 간결히 요약하세요.
-- 문서에 근거가 있으면 출처 번호로 인용하세요: [1]
+        # 6) 개선된 프롬프트 (반복 방지 + 간결함 강조)
+        prompt = f"""다음 문서 내용을 바탕으로 질문에 답하세요.
 
-[문서 발췌]
+[중요 규칙]
+- 문서에 명확한 근거가 있는 경우에만 답변하세요
+- 추측이나 일반적인 지식으로 답하지 마세요  
+- 답변은 2-3문장으로 간결하게 작성하세요
+- 같은 내용을 반복하지 마세요
+- 문서에서 찾을 수 없으면 "문서에서 해당 내용을 찾을 수 없습니다"라고 답하세요
+
+[참고 문서]
 {context}
 
 [질문]
 {body.question}
 
-[형식]
-- 한 문장 핵심 답
-- 필요하면 근거 출처 번호로 인용: [1]
-"""
+[답변]"""
+
+        # 7) 모델 호출 시 추가 파라미터로 반복 방지
         answer = generate_answer_unified(prompt, body.model_name)
+        
+        # 8) 답변 후처리 - 반복되는 패턴 제거
+        answer = _clean_repetitive_answer(answer)
+        
         return AskResp(answer=answer, used_chunks=len(topk), sources=sources)
 
     except HTTPException:
@@ -556,6 +579,41 @@ def ask_question(body: AskReq):
         raise HTTPException(503, f"Milvus 연결 대기/검색 실패: {milvus_error}")
     except Exception as e:
         raise HTTPException(500, f"질의 처리 중 오류: {e}")
+
+
+def _clean_repetitive_answer(answer: str) -> str:
+    """반복되는 답변 패턴을 정리"""
+    if not answer:
+        return answer
+    
+    # 매우 긴 답변 잘라내기 (1000자 초과 시)
+    if len(answer) > 1000:
+        sentences = answer.split('.')
+        clean_sentences = []
+        for sentence in sentences[:5]:  # 최대 5문장만
+            if sentence.strip() and len(sentence.strip()) > 10:
+                clean_sentences.append(sentence.strip())
+        answer = '. '.join(clean_sentences) + '.'
+    
+    # 반복되는 구문 제거 (같은 구문이 3번 이상 반복되면 제거)
+    lines = answer.split('\n')
+    seen_lines = {}
+    filtered_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        if line in seen_lines:
+            seen_lines[line] += 1
+            if seen_lines[line] <= 2:  # 최대 2번까지만 허용
+                filtered_lines.append(line)
+        else:
+            seen_lines[line] = 1
+            filtered_lines.append(line)
+    
+    return '\n'.join(filtered_lines).strip()
 
 # ---------- Job State Management ----------
 @router.get("/job/{job_id}")

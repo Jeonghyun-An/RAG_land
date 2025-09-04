@@ -1,38 +1,43 @@
 # app/services/llm_client.py
+from __future__ import annotations
+
 import os
+from typing import List, Optional
 from openai import OpenAI
 
-_base = os.getenv("OPENAI_BASE_URL", "http://vllm:8000/v1")
-_key  = os.getenv("OPENAI_API_KEY", "not-used")
+DEFAULT_BASE = os.getenv("OPENAI_BASE_URL", "http://vllm-a4000:8000/v1")
+API_KEY = os.getenv("OPENAI_API_KEY", "not-used")
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "60"))  # 초
 
-client = OpenAI(base_url=_base, api_key=_key)
+def _client(base_url: Optional[str] = None) -> OpenAI:
+    return OpenAI(base_url=base_url or DEFAULT_BASE, api_key=API_KEY, timeout=OPENAI_TIMEOUT)
 
 def chat_complete(model_name: str, prompt: str, temperature: float = 0.2, max_tokens: int = 512) -> str:
-    resp = client.chat.completions.create(
+    c = _client()
+    r = c.chat.completions.create(
         model=model_name,
         messages=[{"role":"user","content":prompt}],
         temperature=temperature,
         max_tokens=max_tokens,
     )
-    return resp.choices[0].message.content
-
-def list_vllm_models() -> list[str]:
-    """vLLM가 띄운 모델 이름들(served name)을 반환. 실패하면 빈 리스트."""
-    try:
-        out = client.models.list()
-        return [m.id for m in out.data] if hasattr(out, "data") else []
-    except Exception:
-        return []
+    return r.choices[0].message.content
 
 def chat_complete_on(base_url: str, model_name: str, prompt: str,
                      temperature: float = 0.2, max_tokens: int = 512) -> str:
-    """alias별로 다른 vLLM 서버(base_url)로 보낼 때 사용"""
-    from openai import OpenAI
-    c = OpenAI(base_url=base_url, api_key=os.getenv("OPENAI_API_KEY", "not-used"))
+    c = _client(base_url)
     r = c.chat.completions.create(
         model=model_name,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role":"user","content":prompt}],
         temperature=temperature,
         max_tokens=max_tokens,
     )
     return r.choices[0].message.content
+
+def list_vllm_models(base_url: Optional[str] = None) -> List[str]:
+    """해당 base_url(vLLM 서버)의 served name 목록. 실패 시 빈 리스트."""
+    try:
+        c = _client(base_url)
+        out = c.models.list()
+        return [m.id for m in getattr(out, "data", [])]
+    except Exception:
+        return []
