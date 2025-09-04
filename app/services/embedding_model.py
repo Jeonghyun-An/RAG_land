@@ -54,6 +54,7 @@ def _load_embedding_impl() -> Tuple[object, str]:
     """
     device = _pick_device()
     _limit_threads()
+    st_err = None
 
     # 1) sentence-transformers
     try:
@@ -70,19 +71,21 @@ def _load_embedding_impl() -> Tuple[object, str]:
             except Exception:
                 pass
         return m, "st"
-    except Exception:
-        pass
-
+    except Exception as e:
+        st_err = e
     # 2) FlagEmbedding (BGEM3)
+    flag_err = None
     try:
         from FlagEmbedding import BGEM3FlagModel
         use_fp16 = (_pick_device() == "cuda")
         m = BGEM3FlagModel(DEFAULT_MODEL, use_fp16=use_fp16, device=_pick_device())
         return m, "flag"
     except Exception as e:
+        flag_err = e
         raise RuntimeError(
             "임베딩 모델 로드 실패: sentence-transformers 또는 FlagEmbedding 중 하나가 필요합니다. "
             "requirements 및 CUDA/드라이버를 확인하세요."
+            f"[ST 에러: {st_err!r}] [Flag 에러: {flag_err!r}]"
         ) from e
 
 
