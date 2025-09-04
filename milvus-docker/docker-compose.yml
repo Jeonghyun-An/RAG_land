@@ -166,7 +166,7 @@ services:
       MINIO_SECRET_KEY: "minioadmin"
       MILVUS_HOST: "milvus"
       MILVUS_PORT: "19530"
-      MILVUS_COLLECTION: "rag_chunks_v2"
+      MILVUS_COLLECTION: "rag_chunks_m3"
       RAG_JOB_STATE_PERSIST: "minio"
       MILVUS_SECTION_MAX: "512" # 섹션 최대 문자 수
       MILVUS_DOCID_MAX: "256" # doc_id 최대 문자 수
@@ -244,11 +244,11 @@ services:
       RAG_PARSE_DIRECT_XLSX: "1"
       RAG_CONVERT_NONPDF_TO_PDF: "1" # 기타 포맷 변환 허용
       # 임베딩
-      EMBEDDING_MODEL: "jhgan/ko-sbert-nli"
+      EMBEDDING_MODEL: "BAAI/bge-m3"
       EMBEDDING_DEVICE: "cpu" # cpu 또는 cuda
-      EMBED_MAX_TOKENS: "128"
+      EMBED_MAX_TOKENS: "256"
       EMBED_BATCH_SIZE: "64"
-      EMBED_NUM_THREADS: "2"
+      EMBED_NUM_THREADS: "4"
       TOKENIZER_PARALLELISM: "false" # 토크나이저 병렬화 (true/false)
       # reranker
       RERANKER_MODEL: "cross-encoder/ms-marco-MiniLM-L-6-v2"
