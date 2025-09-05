@@ -101,36 +101,62 @@ def _coerce_chunks_for_milvus(chs):
 
 def index_pdf_to_milvus(
     job_id: str,
-    file_path: str,
+    file_path: str | None = None,
     minio_object: str | None = None,
     uploaded: bool = True,
     remove_local: bool = True,
     doc_id: str | None = None,
 ) -> None:
     try:
-        # 0) 시작 로그
         job_state.update(job_id, status="parsing", step="parse_pdf:start")
         print(f"[INDEX] start: {file_path}")
 
-        # [ADDED] 업로더가 '중복 업로드'로 판단해 uploaded=False로 넘긴 경우,
-        #         환경변수로 색인 스킵(기본 1) 여부 결정
+        NO_LOCAL = os.getenv("RAG_NO_LOCAL", "0") == "1"
+
         SKIP_IF_ALREADY_UPLOADED = os.getenv("RAG_SKIP_IF_UPLOADED", "1") == "1"
         if not uploaded and SKIP_IF_ALREADY_UPLOADED:
             job_state.update(job_id, status="done", step="skipped:already_uploaded", progress=100)
             print(f"[INDEX] skip: uploaded=False (already uploaded), job_id={job_id}")
             return
 
-        # 1) PDF → 페이지 텍스트
-        pages = parse_pdf(file_path, by_page=True)
-        if not pages:
-            raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
-        job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
-        
-        # 레이아웃 블록(BBOX)
-        blocks_by_page_list = parse_pdf_blocks(file_path)  # [(page_no, [ {text,bbox} ])]
-        layout_map = {p: blks for p, blks in blocks_by_page_list}
+        # 1) PDF → 페이지 텍스트 (+ 레이아웃 블록)
+        pages = None
+        layout_map = {}
 
-        # 2) 토큰 기준 청킹
+        use_bytes_path = (NO_LOCAL or file_path is None) and bool(minio_object)
+        if use_bytes_path:
+            # MinIO → bytes → bytes 파서
+            from app.services.minio_store import MinIOStore
+            mstore = MinIOStore()
+            pdf_bytes = mstore.get_bytes(minio_object)
+
+            try:
+                from app.services.file_parser import parse_any_bytes, parse_pdf_blocks_from_bytes
+                parsed = parse_any_bytes(os.path.basename(minio_object), pdf_bytes)
+                if parsed.get("kind") != "pdf":
+                    raise RuntimeError("PDF 파이프라인만 인덱싱합니다. (변환 단계 확인)")
+                pages = parsed.get("pages") or []
+
+                # 핵심: BBox를 bytes 기반으로 생성
+                blocks_by_page_list = parsed.get("blocks")
+                if not blocks_by_page_list:
+                    # parse_any_bytes가 blocks를 안 채웠다면, 전용 함수로 보완
+                    blocks_by_page_list = parse_pdf_blocks_from_bytes(pdf_bytes)
+
+                layout_map = {p: blks for p, blks in (blocks_by_page_list or [])}
+            except Exception as ee:
+                raise RuntimeError(f"bytes parsing unavailable or failed: {ee}") from ee
+        else:
+            # 기존 로컬 경로 파서 유지
+            pages = parse_pdf(file_path, by_page=True)
+            if not pages:
+                raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
+            blocks_by_page_list = parse_pdf_blocks(file_path)
+            layout_map = {p: blks for p, blks in blocks_by_page_list}
+
+        job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
+
+        # 2) 청킹 (기존 흐름 그대로)
         job_state.update(job_id, status="chunking", step="chunk:start", progress=35)
 
         model = get_embedding_model()
@@ -141,14 +167,12 @@ def index_pdf_to_milvus(
             else (lambda s: s.split())
         )
 
-        # embedding 모델의 최대 길이에 맞춰 target/overlap 산정
         max_len = int(getattr(model, "max_seq_length", 128))
         default_target = max(64, max_len - 16)
         default_overlap = min(96, default_target // 3)
         target_tokens = int(os.getenv("RAG_CHUNK_TOKENS", str(default_target)))
         overlap_tokens = int(os.getenv("RAG_CHUNK_OVERLAP", str(default_overlap)))
 
-        # >>> CHUNKING START
         chunks = None
         try:
             from app.services.layout_chunker import layout_aware_chunks  # type: ignore
@@ -169,7 +193,6 @@ def index_pdf_to_milvus(
                 chunks = smart_chunk_pages(
                     pages, encode, target_tokens=target_tokens, overlap_tokens=overlap_tokens
                 )
-        # <<< CHUNKING END
 
         chunks = _coerce_chunks_for_milvus(chunks)
         if not chunks:
@@ -180,27 +203,25 @@ def index_pdf_to_milvus(
         # 3) doc_id 확정 (넘겨받은 값 > MinIO 객체명 > 파일명)
         if not doc_id:
             base_from_obj = os.path.splitext(os.path.basename(minio_object or ""))[0] if minio_object else None
-            doc_id = base_from_obj or os.path.splitext(os.path.basename(file_path))[0]
+            doc_id = base_from_obj or (os.path.splitext(os.path.basename(file_path))[0] if file_path else None)
+            if not doc_id:
+                import uuid
+                doc_id = uuid.uuid4().hex
 
-        # [ADDED] 교체 정책(사전삭제/사후재시도) 플래그
         REPLACE_BEFORE_INSERT = os.getenv("RAG_REPLACE_BEFORE_INSERT", "0") == "1"
         RETRY_AFTER_DELETE_ON_DUP = os.getenv("RAG_RETRY_AFTER_DELETE", "1") == "1"
 
-        # [ADDED] job_state에 모드/중복 사유가 있으면 반영(있으면 쓰고, 없으면 env만 사용)
         st = job_state.get(job_id) or {}
-        mode = st.get("mode")  # 'replace' | 'version' | 'skip' 등이 있다면 사용
-        duplicate_reason = st.get("duplicate_reason")
+        mode = st.get("mode")  # 'replace' | 'version' | 'skip' 등이 있으면 활용
 
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
 
-        # [ADDED] 모드가 replace면 삽입 전에 기존 doc_id 행들을 PK로 삭제
         if mode == "replace" or REPLACE_BEFORE_INSERT:
             try:
-                # public 메서드가 있으면 사용, 없으면 _delete_by_doc_id로 폴백
                 if hasattr(store, "delete_by_doc_id"):
                     deleted = store.delete_by_doc_id(doc_id)  # type: ignore
                 else:
-                    deleted = store._delete_by_doc_id(doc_id)  # type: ignore  # pylint: disable=protected-access
+                    deleted = store._delete_by_doc_id(doc_id)  # type: ignore
                 print(f"[INDEX] pre-delete for replace: doc_id={doc_id}, deleted={deleted}")
             except Exception as e:
                 print(f"[INDEX] pre-delete warn: {e}")
@@ -210,7 +231,6 @@ def index_pdf_to_milvus(
         res = store.insert(doc_id, chunks, embed_fn=embed)  # {inserted, skipped, reason, doc_id}
         real_doc_id = res.get("doc_id", doc_id)
 
-        # [ADDED] 만약 '중복' 때문에 skipped가 떴고, 정책상 교체라면: 삭제 후 1회 재시도
         if res.get("skipped") and (mode == "replace" or RETRY_AFTER_DELETE_ON_DUP):
             reason = (res.get("reason") or "").lower()
             if any(k in reason for k in ["duplicate", "exists", "doc_id"]):
@@ -220,49 +240,34 @@ def index_pdf_to_milvus(
                     else:
                         deleted = store._delete_by_doc_id(real_doc_id)  # type: ignore
                     print(f"[INDEX] retry-after-delete: deleted={deleted}, doc_id={real_doc_id}")
-                    # 재시도
                     res = store.insert(doc_id, chunks, embed_fn=embed)
                     real_doc_id = res.get("doc_id", doc_id)
                 except Exception as e:
                     print(f"[INDEX] retry-after-delete failed: {e}")
 
         if res.get("skipped"):
-            job_state.update(
-                job_id,
-                status="indexing",
-                step=f"milvus:skipped:{res.get('reason')}",
-                progress=90,
-                doc_id=real_doc_id,
-            )
+            job_state.update(job_id, status="indexing", step=f"milvus:skipped:{res.get('reason')}",
+                             progress=90, doc_id=real_doc_id)
             print(f"[INDEX] skipped: doc_id={real_doc_id}, reason={res.get('reason')}")
         else:
-            job_state.update(
-                job_id,
-                status="indexing",
-                step=f"milvus:inserted:{res.get('inserted',0)}",
-                progress=90,
-                doc_id=real_doc_id,
-            )
-            print(
-                f"[INDEX] done: {file_path} (doc_id={real_doc_id}, chunks={len(chunks)}, "
-                f"inserted={res.get('inserted',0)})"
-            )
+            job_state.update(job_id, status="indexing", step=f"milvus:inserted:{res.get('inserted',0)}",
+                             progress=90, doc_id=real_doc_id)
+            print(f"[INDEX] done: {file_path} (doc_id={real_doc_id}, chunks={len(chunks)}, "
+                  f"inserted={res.get('inserted',0)})")
 
-        # 5) MinIO 원본 삭제(옵션) — 이번 요청에서 새로 올린(uploaded=True) 건만 정리
+        # 5) MinIO 원본 삭제(옵션)
         if os.getenv("RAG_DELETE_AFTER_INDEX", "0") == "1" and minio_object and uploaded:
             try:
                 MinIOStore().delete(minio_object)
                 print(f"[CLEANUP] deleted from MinIO: {minio_object}")
-                job_state.update(
-                    job_id, status="cleanup", step="minio:deleted",
-                    minio_object=minio_object, progress=95
-                )
+                job_state.update(job_id, status="cleanup", step="minio:deleted",
+                                 minio_object=minio_object, progress=95)
             except Exception as e:
                 print(f"[CLEANUP] delete failed: {e}")
                 job_state.update(job_id, status="cleanup", step=f"minio:delete_failed:{e!s}")
 
-        # 6) 로컬 파일 정리(옵션)
-        if remove_local:
+        # 6) 로컬 파일 정리(옵션) — 무디스크면 아무것도 안 함
+        if remove_local and file_path and not use_bytes_path:
             try:
                 os.remove(file_path)
             except Exception:
@@ -271,8 +276,8 @@ def index_pdf_to_milvus(
         # 7) 완료
         job_state.complete(
             job_id,
-            pages=len(pages),
-            chunks=len(chunks),
+            pages=len(pages or []),
+            chunks=len(chunks or []),
             doc_id=real_doc_id,
             inserted=int(res.get("inserted", 0)),
             skipped=bool(res.get("skipped", False)),
@@ -292,6 +297,8 @@ def _content_disposition(disposition: str, filename: str) -> str:
     ascii_fallback = re.sub(r'[^A-Za-z0-9._-]+', '_', filename) or 'file'
     utf8_quoted = quote(filename)  # UTF-8 percent-encode
     return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_quoted}"
+
+
 
 def _strip_meta_line(chunk_text: str) -> str:
     """청크 맨 위 META: 라인을 제거하고 본문만 반환"""
