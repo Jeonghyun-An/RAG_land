@@ -517,6 +517,18 @@ def ask_question(body: AskReq):
         for c in cands:
             c["kw_boost"] = _kw_boost_score(c)
 
+        ARTICLE_BOOST = float(os.getenv("RAG_ARTICLE_BOOST", "2.5"))
+
+        m = re.search(r"제\s*(\d+)\s*조", body.question)
+        if m:
+            art = m.group(1)
+            patt = re.compile(rf"제\s*{art}\s*조")
+            for c in cands:
+                sec = c.get("section") or ""
+                txt = c.get("chunk") or ""
+                # META 줄 제거한 본문에 대해서도 체크하고 싶으면 _strip_meta_line(txt) 사용
+                if patt.search(sec) or patt.search(txt):
+                    c["kw_boost"] = c.get("kw_boost", 0.0) + ARTICLE_BOOST
         # kw_boost 우선 → 동점 시 원래 score 유지
         cands.sort(key=lambda x: (x.get("kw_boost", 0), x.get("score", 0.0)), reverse=True)
 
@@ -542,7 +554,9 @@ def ask_question(body: AskReq):
         context_lines = []
         sources = []
         for i, c in enumerate(topk, 1):
-            body_only = _strip_meta_line(c.get("chunk", ""))
+            sec = (c.get("section") or "").strip()
+            body = _strip_meta_line(c.get("chunk",""))
+            body_only = f"{sec}\n{body}" if sec and not body.startswith(sec) else body
             context_lines.append(f"[{i}] (doc:{c['doc_id']} p.{c['page']} {c.get('section','')})\n{body_only}")
             sources.append({
                 "id": i,
