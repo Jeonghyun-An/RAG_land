@@ -25,7 +25,34 @@ def _guess_secure(endpoint: str, secure_env: Optional[bool]) -> bool:
     parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
     return parsed.scheme == "https"
 
-
+def get_bytes(self, object_name: str) -> bytes:
+    """MinIO에서 객체를 받아 바로 bytes로 반환"""
+    try:
+        resp = self.client.get_object(self.bucket, object_name)
+        try:
+            bio = BytesIO()
+            for d in resp.stream(32 * 1024):
+                bio.write(d)
+            return bio.getvalue()
+        finally:
+            resp.close()
+            resp.release_conn()
+    except S3Error as e:
+        raise RuntimeError(f"MinIO get_bytes 실패: {e}") from e
+def upload_bytes(self, data: bytes, object_name: str, content_type: str | None = None):
+    """
+    로컬 파일 없이 bytes를 바로 MinIO에 업로드.
+    """
+    length = len(data)
+    bio = BytesIO(data)
+    self.client.put_object(
+        self.bucket,
+        object_name,
+        data=bio,
+        length=length,
+        content_type=content_type or "application/octet-stream",
+    )
+    return {"bucket": self.bucket, "object_name": object_name, "size": length}
 class MinIOStore:
     """
     MinIO 헬퍼 클래스
