@@ -3,6 +3,7 @@ from __future__ import annotations
 import os, subprocess
 from pathlib import Path
 from typing import Tuple, Dict
+from io import BytesIO
 
 OCR_MODE = os.getenv("OCR_MODE", "auto")  # off | auto | force
 OCR_LANGS = os.getenv("OCR_LANGS", "kor+eng")
@@ -67,3 +68,24 @@ def ocr_if_needed(pdf_path: str) -> Tuple[str, Dict]:
         return str(src), {"mode": "ocr_failed_empty", **stats}
     except Exception as e:
         return str(src), {"mode": f"ocr_error:{e}", **stats}
+
+def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str|None:
+    """
+    PDF 바이트를 이미지로 변환해 OCR. 엔진 미설치/비활성 시 None 반환.
+    """
+    if not enabled:
+        return None
+    try:
+        # 예시 의사코드: pdf2image + easyocr (또는 사내 OCR API)
+        from pdf2image import convert_from_bytes
+        import easyocr
+        images = convert_from_bytes(pdf_bytes, dpi=200)
+        reader = easyocr.Reader(['ko','en'], gpu=True)
+        txts = []
+        for img in images:
+            res = reader.readtext(np.array(img), detail=0, paragraph=True)
+            txts.append("\n".join(res))
+        return "\n".join(txts).strip() or None
+        return None
+    except Exception:
+        return None
