@@ -1,6 +1,7 @@
 from __future__ import annotations
-from typing import List, Tuple, Union, Optional
+from typing import Dict, List, Tuple, Union, Optional
 import os
+from io import BytesIO
 
 """
 PDF 텍스트 추출
@@ -306,3 +307,102 @@ def parse_any(path: str) -> List[Tuple[int, str]]:
     # 변환 불가 시 실패 처리
     raise RuntimeError(f"Unsupported file type without conversion: {ext}")
 
+def sniff_ext_from_name(name: str) -> str:
+    return (os.path.splitext(name)[1] or "").lower()
+
+def parse_pdf_pages_from_bytes(pdf_bytes: bytes) -> List[str]:
+    """
+    pdfminer.six 기반으로 bytes에서 페이지별 텍스트 추출.
+    기존 parse_pdf(file_path, by_page=True)와 호환되는 리스트를 반환.
+    """
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTTextContainer
+    bio = BytesIO(pdf_bytes)
+    pages: List[str] = []
+    for layout in extract_pages(bio):
+        lines = []
+        for elem in layout:
+            if isinstance(elem, LTTextContainer):
+                lines.append(elem.get_text())
+        pages.append(("".join(lines)).strip())
+    return pages
+
+# --- PDF bytes → (page_no, blocks[{text,bbox}]) ---
+def parse_pdf_blocks_from_bytes(pdf_bytes: bytes) -> List[Tuple[int, List[Dict]]]:
+    """
+    PDF bytes -> [(page_no, [ { "text": str, "bbox": [x0,y0,x1,y1] } ])]
+    - 좌표계: pdfminer 기본(user space), 원점 좌하단
+    """
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTTextContainer
+
+    out: List[Tuple[int, List[Dict]]] = []
+    bio = BytesIO(pdf_bytes)
+    for i, layout in enumerate(extract_pages(bio), start=1):
+        blocks: List[Dict] = []
+        for elem in layout:
+            if isinstance(elem, LTTextContainer):
+                txt = (elem.get_text() or "").strip()
+                if not txt:
+                    continue
+                x0, y0, x1, y1 = elem.bbox
+                blocks.append({"text": txt, "bbox": [float(x0), float(y0), float(x1), float(y1)]})
+        out.append((i, blocks))
+    return out
+
+# --- DOCX bytes → 라인 항목 ---
+def parse_docx_from_bytes(docx_bytes: bytes) -> List[Dict]:
+    try:
+        from docx import Document
+        doc = Document(BytesIO(docx_bytes))
+        out: List[Dict] = []
+        for p in doc.paragraphs:
+            t = (p.text or "").strip()
+            if t:
+                out.append({"text": t})
+        return out
+    except Exception:
+        # 폴백: 평문
+        return [{"text": docx_bytes.decode("utf-8", "ignore")}]
+
+# --- 평문 bytes ---
+def parse_plaintext_bytes(content: bytes) -> List[Dict]:
+    t = (content.decode("utf-8", "ignore") or "").strip()
+    return [{"text": t}] if t else []
+
+# --- 통합 진입점: 파일명 힌트 + bytes ---
+def parse_any_bytes(name_hint: str, content: bytes) -> Dict[str, object]:
+    """
+    반환 예:
+      {
+        "kind": "pdf|docx|plain",
+        "ext": ".pdf",
+        "pages": [...],                  # PDF면 문자열 리스트
+        "blocks": [(page_no, blocks)],   # PDF면 레이아웃 블록
+        "items": [{"text":..}, ...],     # DOCX/PLAIN 등 라인 단위
+      }
+    """
+    ext = sniff_ext_from_name(name_hint)
+
+    if ext == ".pdf":
+        pages = parse_pdf_pages_from_bytes(content)
+        blocks = parse_pdf_blocks_from_bytes(content)
+        return {"kind": "pdf", "ext": ext, "pages": pages, "blocks": blocks}
+
+    if ext == ".docx":
+        items = parse_docx_from_bytes(content)
+        return {"kind": "docx", "ext": ext, "items": items}
+
+    if ext in (".hwpx", ".hwp"):
+        # 변환기를 이용해 PDF bytes 만들기 → PDF 파이프 재사용
+        from app.services.pdf_converter import convert_stream_to_pdf_bytes
+        pdf_bytes = convert_stream_to_pdf_bytes(content, ext)
+        if pdf_bytes:
+            pages = parse_pdf_pages_from_bytes(pdf_bytes)
+            blocks = parse_pdf_blocks_from_bytes(pdf_bytes)
+            return {"kind": "pdf", "ext": ".pdf", "pages": pages, "blocks": blocks}
+        # 폴백: 평문
+        return {"kind": "plain", "ext": ext, "items": parse_plaintext_bytes(content)}
+
+    # 기타 확장자는 평문 취급
+    return {"kind": "plain", "ext": ext, "items": parse_plaintext_bytes(content)}
