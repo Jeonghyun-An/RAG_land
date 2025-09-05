@@ -16,6 +16,8 @@ PDF 텍스트 추출
     * OCR_TESSERACT_CMD: pytesseract 실행 파일 경로(Windows 등)
     * OCR_EASYOCR_GPU: "1"이면 GPU 사용 시도, 기본 "0"
     * OCR_MIN_CHARS: auto 모드에서 OCR 전환 기준(기본 40)
+    이 파일은 “문서를 읽어서 페이지 텍스트와 레이아웃 블록(BBox) 을 만들어 indexer/청커에 넘겨주는” 역할
+    임베딩 텍스트를 어떻게 구성할지는(섹션 합치기 등) 라우터/청커 단계에서 결정
 """
 
 # ---------------------- Text extract (no OCR) ---------------------- #
