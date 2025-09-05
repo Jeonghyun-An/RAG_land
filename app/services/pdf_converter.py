@@ -9,11 +9,33 @@ GOTENBERG_MAX_RETRIES = int(os.getenv("GOTENBERG_MAX_RETRIES", "3"))
 GOTENBERG_BACKOFF_BASE = float(os.getenv("GOTENBERG_BACKOFF_BASE", "0.6"))
 PDF_PAPER = os.getenv("PDF_PAPER", "auto")
 PDF_MARGIN_MM = int(os.getenv("PDF_MARGIN_MM", "10"))
+CONVERTER_ENDPOINT = os.getenv("DOC_CONVERTER_URL", "").strip()
 
 OFFICE_EXT = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".odt", ".odp", ".ods", ".rtf"}
 HTML_EXT   = {".html", ".htm"}
 IMG_EXT    = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
 TXT_EXT    = {".txt", ".csv", ".md"}
+
+class ConvertStreamError(Exception):
+    pass
+
+def convert_stream_to_pdf_bytes(content: bytes, src_ext: str) -> Optional[bytes]:
+    """
+    외부 변환기(예: ONLYOFFICE, 사내 컨버터)로 bytes를 보내 PDF bytes로 받는다.
+    - env DOC_CONVERTER_URL 필요 (POST multipart/form-data)
+    - 실패/미설정 시 None 반환(상위에서 폴백)
+    """
+    if not CONVERTER_ENDPOINT:
+        return None
+    try:
+        files = {"file": (f"upload{src_ext}", content)}
+        data = {"target": "pdf"}
+        r = requests.post(CONVERTER_ENDPOINT, files=files, data=data, timeout=120)
+        r.raise_for_status()
+        # 변환기가 application/pdf 바이너리를 바로 반환한다고 가정
+        return r.content
+    except Exception as e:
+        raise ConvertStreamError(f"stream->pdf 변환 실패: {e}")
 
 class ConvertError(RuntimeError): ...
 def _ensure_parent(p: Path): p.parent.mkdir(parents=True, exist_ok=True)
