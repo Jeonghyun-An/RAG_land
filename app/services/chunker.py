@@ -160,50 +160,134 @@ def _normalize_paras(paras: List[str], encode: Callable[[str], List[Any]], targe
     return out
 
 # ===================== 페이지 헤더/푸터 제거 =====================
+from collections import defaultdict
+import re
+from typing import List, Tuple, Set, Dict, Iterable, Any
 
-def _detect_repeating_lines(pages: List[Tuple[int, str]], head_n: int = 3, tail_n: int = 3, min_ratio: float = 0.6) -> Dict[str, int]:
+_WS_RE = re.compile(r"\s+")
+
+def _normalize_line(s: str) -> str:
+    return _WS_RE.sub(" ", (s or "").strip())
+
+def _iter_nonempty_lines(text: str) -> List[str]:
+    return [ln for ln in (text or "").splitlines() if ln.strip()]
+
+def _extract_page_texts(pages: Iterable[Any]) -> List[str]:
+    """pages가 str / (page_no, text) / {'page':..,'text':..} 등을 섞어도 텍스트만 뽑아냄."""
+    out: List[str] = []
+    for it in pages or []:
+        if isinstance(it, str):
+            out.append(it)
+        elif isinstance(it, (list, tuple)):
+            # (page_no, text, ...) 형태 지원
+            if len(it) >= 2:
+                out.append(str(it[1] or ""))
+            else:
+                out.append(str(it[0] or ""))
+        elif isinstance(it, dict):
+            out.append(str(it.get("text", "") or ""))
+        else:
+            out.append(str(it or ""))
+    return out
+
+def _detect_repeating_lines(
+    pages: List[Any],
+    *,
+    # 신 파라미터명
+    k_head: int = 3,
+    k_tail: int = 3,
+    min_len: int = 6,
+    max_len: int = 120,
+    min_support: float = 0.8,
+    # 구 파라미터명(호환용)
+    head_n: int | None = None,
+    tail_n: int | None = None,
+    min_ratio: float | None = None,
+) -> List[Tuple[str, int]]:
     """
-    여러 페이지에서 반복되는 상/하단 라인을 찾아낸다.
-    - 제목(HEADING_RE)은 절대 제거하지 않음
-    - 기본 임계치: env RAG_STRIP_REPEAT_MINRATIO (기본 0.6)
-    - 전체 비활성화: env RAG_STRIP_REPEAT_LINES=0
+    여러 페이지에 반복되는 헤더/푸터 라인을 감지.
+    반환: [(line, page_count), ...]
+    - pages: str 또는 (page_no, text) 또는 {'page':..,'text':..} 섞여 있어도 OK
+    - head_n/tail_n/min_ratio(구명)도 받으며, 있으면 우선 적용
     """
-    if os.getenv("RAG_STRIP_REPEAT_LINES", "1") != "1":
-        return {}
+    # 구 파라미터명 우선 적용
+    if head_n is not None:
+        k_head = int(head_n)
+    if tail_n is not None:
+        k_tail = int(tail_n)
+    if min_ratio is not None:
+        min_support = float(min_ratio)
 
-    try:
-        min_ratio = float(os.getenv("RAG_STRIP_REPEAT_MINRATIO", "0.6"))
-    except Exception:
-        min_ratio = 0.6
+    texts = _extract_page_texts(pages)
+    if not texts:
+        return []
 
-    freq: Dict[str, int] = {}
-    total = max(1, len(pages))
-    for _, txt in pages:
-        lines = [ln.strip() for ln in (txt or "").splitlines() if ln.strip()]
-        heads = lines[:head_n]
-        tails = lines[-tail_n:] if len(lines) >= tail_n else []
-        for ln in heads + tails:
-            # 제목/헤딩은 제거 후보에서 제외
-            if HEADING_RE.match(ln):
+    N = len(texts)
+    threshold = max(2, int(N * min_support))
+
+    page_appear: Dict[str, set[int]] = defaultdict(set)
+
+    for pi, pg_text in enumerate(texts):
+        lines = _iter_nonempty_lines(pg_text)
+        if not lines:
+            continue
+
+        head = lines[:k_head] if k_head > 0 else []
+        tail = lines[-k_tail:] if k_tail > 0 else []
+        candidates = head + tail
+
+        for raw in candidates:
+            line = _normalize_line(raw)
+            if not (min_len <= len(line) <= max_len):
                 continue
-            key = re.sub(r"\s*\|\s*\d+\s*$", "", ln)
-            if len(key) <= 2:
-                continue
-            freq[key] = freq.get(key, 0) + 1
-    cut = int(total * min_ratio)
-    return {k: v for k, v in freq.items() if v >= cut and len(k) > 2}
+            page_appear[line].add(pi)
+
+    repeating = [(line, len(idx_set)) for line, idx_set in page_appear.items() if len(idx_set) >= threshold]
+    repeating.sort(key=lambda x: (-x[1], x[0]))
+    return repeating
+
+def _repeating_to_set(repeating: Any) -> Set[str]:
+    """
+    repeating이 set[str] / dict[str,int] / list[tuple[str,int]] / list[str]
+    어느 것이든 정규화된 set[str]로 변환
+    """
+    if not repeating:
+        return set()
+    if isinstance(repeating, set):
+        return { _normalize_line(x) for x in repeating }
+    if isinstance(repeating, dict):
+        return { _normalize_line(k) for k in repeating.keys() }
+    if isinstance(repeating, (list, tuple)):
+        out: Set[str] = set()
+        for it in repeating:
+            if isinstance(it, (list, tuple)) and it:
+                out.add(_normalize_line(str(it[0])))
+            else:
+                out.add(_normalize_line(str(it)))
+        return out
+    # 기타 타입
+    return { _normalize_line(str(repeating)) }
 
 
-def _strip_repeating_lines(text: str, repeating: Dict[str, int]) -> str:
-    if not text or not repeating:
-        return text or ""
+def _strip_repeating_lines(text: str, repeating_any: Any) -> str:
+    """
+    text에서 반복 라인 제거. repeating_any는 set/dict/list[tuple]/list[str] 등 무엇이든 OK.
+    """
+    if not text:
+        return ""
+    repeating = _repeating_to_set(repeating_any)
+    if not repeating:
+        return text
+
     out: List[str] = []
     for ln in (text or "").splitlines():
+        # 페이지바 " | 12" 같은 꼬리 제거 후 비교
         key = re.sub(r"\s*\|\s*\d+\s*$", "", ln.strip())
-        if key in repeating:
+        if _normalize_line(key) in repeating:
             continue
         out.append(ln)
     return "\n".join(out)
+
 
 # ===================== 토큰 패킹(오버랩/중복 보호) =====================
 
@@ -354,7 +438,7 @@ def smart_chunk_pages(
     overlap_tokens = int(max(0, min(overlap_tokens, target_tokens // 2)))
 
     # 1) 반복 라인 감지
-    repeating = _detect_repeating_lines(pages, head_n=3, tail_n=3, min_ratio=0.2)
+    repeating = _detect_repeating_lines(pages)
 
     results: List[Tuple[str, dict]] = []
     seen_hashes: set[str] = set()
