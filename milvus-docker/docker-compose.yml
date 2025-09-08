@@ -136,9 +136,9 @@ services:
         "--dtype",
         "float16", # A4000은 fp16이 안전
         "--gpu-memory-utilization",
-        "0.85", # 여유 있게 85%
+        "0.90", # 여유 있게 85%
         "--max-num-seqs",
-        "16", # 동시 배치. 단일요청 위주면 8~16 적당
+        "12", # 동시 배치. 단일요청 위주면 8~16 적당
       ]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/models"]
@@ -151,43 +151,45 @@ services:
     build:
       context: ..
       dockerfile: milvus-docker/Dockerfile
+      # args:
+      #   INSTALL_TESSERACT: "0" # 1로 하면 tesseract-ocr-kor 포함 설치
     container_name: fastapi
     ports:
       - "8000:8000"
     volumes:
       - ..:/app
       - ../models/.hf-cache:/models
+    gpus: all
     environment:
       IS_DOCKER: "true"
-
       # MinIO/Milvus 접속 명시 (컨테이너 네트워크 이름으로)
       MINIO_ENDPOINT: "minio:9000"
       MINIO_ACCESS_KEY: "minioadmin"
       MINIO_SECRET_KEY: "minioadmin"
       MILVUS_HOST: "milvus"
       MILVUS_PORT: "19530"
-      MILVUS_COLLECTION: "rag_chunks_m3"
+      MILVUS_COLLECTION: "rag_chunks_m3_v2"
       RAG_JOB_STATE_PERSIST: "minio"
       MILVUS_SECTION_MAX: "512" # 섹션 최대 문자 수
       MILVUS_DOCID_MAX: "256" # doc_id 최대 문자 수
       MILVUS_CHUNK_MAX: "8192" # 청크 최대 문자 수
-      RAG_SECTION_MAX: "160" # 레이아웃 인지 청킹 섹션 최대 문자 수
+      RAG_SECTION_MAX: "200" # 레이아웃 인지 청킹 섹션 최대 문자 수
       SEC_CAP: "160" # 레이아웃 인지 청킹 섹션 최대 문자 수
       # 벡터 검색 파라미터
       MILVUS_INDEX_TYPE: "HNSW"
       MILVUS_METRIC_TYPE: "IP" # IP=cosine, L2=L2, HAMMING=해밍, JACCARD=자카드
       MILVUS_HNSW_M: "16"
       MILVUS_HNSW_EFCON: "200"
-      MILVUS_EF_SEARCH: "256"
+      MILVUS_EF_SEARCH: 384
       MILVUS_EF_PER_K: "8"
       MILVUS_EF_MAX: "2048"
       # 검색/하이브리드/리랭크
-      RAG_TOPK_INIT: "60" # 초기 후보폭 (top_k와 별개)
+      RAG_TOPK_INIT: "80" # 초기 후보폭 (top_k와 별개)
       RAG_HYBRID_ALPHA: "0.7" # 0~1 (벡터 가중)
       RAG_USE_HYBRID: 1
       RAG_HYBRID_WEIGHT_VEC: "0.8" # 벡터:키워드 = 0.8:0.2
       MILVUS_SEARCH_EF: 256 # topk가 커지면 더 키워도 됨 (512 등)
-      RAG_SCORE_THRESHOLD: 0.2 # 리랭커 스코어 컷오프
+      RAG_SCORE_THRESHOLD: 0.25 # 리랭커 스코어 컷오프
       RAG_CONTEXT_BUDGET_TOKENS: "1024" # 최대 컨텍스트 토큰 수
       # 컬렉션 초기화/업서트 옵션 (필요 시만 1로)
       RAG_RESET_COLLECTION: "0"
@@ -197,10 +199,15 @@ services:
       RAG_DEDUP_MANIFEST: "1" # MinIO docs/{doc_id}.json 해시 비교/저장
       RAG_UNIQUE_SUFFIX_ON_CONFLICT: "1" # REPLACE=0이고 충돌이면 doc_id__hash 로 새로 삽입
       RAG_DELETE_AFTER_INDEX: "0"
+      RAG_NO_LOCAL: "1"
+      RAG_SKIP_IF_UPLOADED: "1" # MinIO에 이미 업로드된 파일이면 스킵
+      RAG_REPLACE_BEFORE_INSERT: "0" # 업로드 전에 doc_id 중복 검사 후 교체
+      RAG_RETRY_AFTER_DELETE: "1" # 삭제 후 재삽입 시도
+      DOC_CONVERTER_URL:
       # RAG 청킹/인코딩 옵션
-      RAG_CHUNK_TOKENS: 256 # 청킹 토큰 수(256 최적, 지금은 임베딩 모델이 로컬용이라 구려서 낮춤)
-      RAG_CHUNK_OVERLAP: 48 # 청킹 오버랩 토큰 수(64 최적)
-      RAG_MIN_CHUNK_TOKENS: 64 # 너무 작은 청크는 병합
+      RAG_CHUNK_TOKENS: 320 # 청킹 토큰 수(256 최적, 지금은 임베딩 모델이 로컬용이라 구려서 낮춤)
+      RAG_CHUNK_OVERLAP: 64 # 청킹 오버랩 토큰 수(64 최적)
+      RAG_MIN_CHUNK_TOKENS: 80 # 너무 작은 청크는 병합
 
       RAG_PARSE_LAYOUT: 1 # 레이아웃 인지 청킹
       RAG_PARSE_LAYOUT_MIN_CHARS: 100 # 레이아웃 인지 청킹 최소 문자 수
@@ -209,6 +216,10 @@ services:
       RAG_PARSE_LAYOUT_MAX_WORDS: 100 # 레이아웃 인지 청킹 최대 단어 수
       RAG_CROSS_PAGE_CHUNK: "0" # 페이지 경계 넘는 청킹 허용
       RAG_STRIP_REPEAT_MINRATIO: "0.2" # 반복 라인 비율 컷오프 (0이면 끔)
+      RAG_FIX_TAIL_HEADING: "1" # 제목이 꼬리에만 있는 경우 다음 청크로 이관
+      RAG_IGNORE_RUNNING_HEADER: "1" # 러닝헤더/푸터 제거
+      RAG_PACK_BY_ARTICLE: "0" # 조문 단위로 묶고 싶을 때만 1
+      RAG_ARTICLE_TARGET_TOKENS: "800"
       # --- RAG 청킹/인코딩 옵션 ---
       RAG_PARSE_PDF: "1" # PDF 파싱 여부
       RAG_PARSE_DOCX: "1" # DOCX 파싱 여부
@@ -245,14 +256,16 @@ services:
       RAG_CONVERT_NONPDF_TO_PDF: "1" # 기타 포맷 변환 허용
       # 임베딩
       EMBEDDING_MODEL: "BAAI/bge-m3"
-      EMBEDDING_DEVICE: "cpu" # cpu 또는 cuda
-      EMBED_MAX_TOKENS: "256"
-      EMBED_BATCH_SIZE: "64"
-      EMBED_NUM_THREADS: "4"
+      EMBEDDING_DEVICE: "cuda" # cpu 또는 cuda
+      EMBED_MAX_TOKENS: "512"
+      EMBED_BATCH_SIZE: "128"
+      EMBED_NUM_THREADS: "2"
       TOKENIZER_PARALLELISM: "false" # 토크나이저 병렬화 (true/false)
+      EMBED_DTYPE: "auto" # auto, float16, float32
+      HF_TOKENIZER_NAME: "BAAI/bge-m3"
       # reranker
-      RERANKER_MODEL: "cross-encoder/ms-marco-MiniLM-L-6-v2"
-      RERANKER_DEVICE: "cpu" # cpu 또는 cuda
+      RERANKER_MODEL: "BAAI/bge-reranker-v2-m3"
+      RERANKER_DEVICE: "cuda" # cpu 또는 cuda
       RERANKER_BACKENDS: "ce,flag"
       RERANKER_BATCH_SIZE: "64"
       CE_FALLBACK_MODEL: "cross-encoder/ms-marco-MiniLM-L-6-v2"
