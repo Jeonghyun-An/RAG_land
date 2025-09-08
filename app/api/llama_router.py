@@ -32,12 +32,12 @@ from app.services.layout_chunker import layout_aware_chunks
 from app.services.milvus_store_v2 import MilvusStoreV2
 from app.services.embedding_model import get_embedding_model, embed, get_sentence_embedding_dimension
 from app.services.reranker import rerank
+from app.services.ocr_service import try_ocr_pdf_bytes  
 
 router = APIRouter(tags=["llama"])
 
 UPLOAD_DIR = "data"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
 # ---------- Schemas ----------
 class GenerateReq(BaseModel):
     prompt: str
@@ -173,43 +173,48 @@ def index_pdf_to_milvus(
     remove_local: bool = True,
     doc_id: str | None = None,
 ) -> None:
+    """
+    업로드된(또는 MinIO 상의) PDF를 파싱 → 청킹 → 임베딩 → Milvus upsert.
+    - bytes 경로(minio) 우선 사용 (RAG_NO_LOCAL=1 이거나 file_path가 None)
+    - 페이지 텍스트가 빈약하면 bytes-OCR 폴백 수행(ENV: OCR_MODE != off)
+    - 레이아웃 청킹 실패 시 smart/기본 청킹 순차 폴백
+    - 그래도 0청크면 최후 보호막: 통짜 텍스트로 1개 이상 청크 생성
+    """
     try:
         job_state.update(job_id, status="parsing", step="parse_pdf:start")
-        print(f"[INDEX] start: {file_path}")
+        print(f"[INDEX] start: {file_path or minio_object}")
 
         NO_LOCAL = os.getenv("RAG_NO_LOCAL", "0") == "1"
-
         SKIP_IF_ALREADY_UPLOADED = os.getenv("RAG_SKIP_IF_UPLOADED", "1") == "1"
+
         if not uploaded and SKIP_IF_ALREADY_UPLOADED:
             job_state.update(job_id, status="done", step="skipped:already_uploaded", progress=100)
             print(f"[INDEX] skip: uploaded=False (already uploaded), job_id={job_id}")
             return
 
-        # 1) PDF → 페이지 텍스트 (+ 레이아웃 블록)
-        pages = None
-        layout_map = {}
+        # ---------- 1) PDF → 텍스트/레이아웃 ----------
+        pages: list | None = None          # 페이지 텍스트 (문자열/튜플 혼재 가능 → 아래서 표준화)
+        layout_map: dict[int, list[dict]] = {}  # {page_no: [ {text, bbox}, ... ]}
+        pdf_bytes: bytes | None = None
 
         use_bytes_path = (NO_LOCAL or file_path is None) and bool(minio_object)
         if use_bytes_path:
-            # MinIO → bytes → bytes 파서
+            # MinIO → bytes
             from app.services.minio_store import MinIOStore
             mstore = MinIOStore()
             pdf_bytes = mstore.get_bytes(minio_object)
 
+            # bytes 파서
             try:
                 from app.services.file_parser import parse_any_bytes, parse_pdf_blocks_from_bytes
                 parsed = parse_any_bytes(os.path.basename(minio_object), pdf_bytes)
                 if parsed.get("kind") != "pdf":
                     raise RuntimeError("PDF 파이프라인만 인덱싱합니다. (변환 단계 확인)")
-                pages = parsed.get("pages") or []
 
-                # 핵심: BBox를 bytes 기반으로 생성
+                pages = parsed.get("pages") or []  # 리스트(문자열 리스트 또는 혼재)
                 blocks_by_page_list = parsed.get("blocks")
-                if not blocks_by_page_list:
-                    # parse_any_bytes가 blocks를 안 채웠다면, 전용 함수로 보완
-                    blocks_by_page_list = parse_pdf_blocks_from_bytes(pdf_bytes)
 
-                # blocks가 dict로 올 수도 있고(list of tuples로 올 수도 있음)
+                # blocks 표준화 → layout_map
                 if isinstance(blocks_by_page_list, dict):
                     layout_map = {int(k): v for k, v in blocks_by_page_list.items()}
                 else:
@@ -217,28 +222,62 @@ def index_pdf_to_milvus(
             except Exception as ee:
                 raise RuntimeError(f"bytes parsing unavailable or failed: {ee}") from ee
         else:
-            # 기존 로컬 경로 파서 유지
+            # 로컬 경로 파서
+            from app.services.file_parser import parse_pdf, parse_pdf_blocks
             pages = parse_pdf(file_path, by_page=True)
             if not pages:
                 raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
             blocks_by_page_list = parse_pdf_blocks(file_path)
-            layout_map = {int(p): blks for p, blks in blocks_by_page_list}  # 🔹int 캐스팅
+            layout_map = {int(p): blks for p, blks in (blocks_by_page_list or [])}
 
-        # 여기서 표준화: 이후 모든 청킹 함수는 이 변수만 사용
+        # ---------- 1-1) bytes-OCR 폴백 (페이지 텍스트 밀도 낮을 때) ----------
+        def _count_chars(pages_like) -> int:
+            total = 0
+            for it in (pages_like or []):
+                if isinstance(it, (list, tuple)) and len(it) >= 2:
+                    total += len(str(it[1] or ""))
+                elif isinstance(it, dict):
+                    total += len(str(it.get("text", "")))
+                elif isinstance(it, str):
+                    total += len(it)
+            return total
+
+        # OCR 활성 조건
+        OCR_BYTES_ENABLED = (os.getenv("OCR_MODE", "auto").lower() != "off")
+        MIN_TOTAL = int(os.getenv("OCR_MIN_CHARS_TOTAL", "60"))
+
+        if OCR_BYTES_ENABLED and use_bytes_path:
+            total_chars = _count_chars(pages)
+            if total_chars < MIN_TOTAL:
+                try:
+                    # 지연 임포트(이 파일 상단에 import 안 되어 있으면 NameError 방지)
+                    from app.services.ocr_service import try_ocr_pdf_bytes
+                    ocr_text = try_ocr_pdf_bytes(pdf_bytes, enabled=True)  # returns str|None
+                except Exception as _e:
+                    print(f"[OCR] bytes fallback failed: {getattr(_e, 'message', _e)}")
+                    ocr_text = None
+                if ocr_text:
+                    print(f"[OCR] bytes fallback used, chars={len(ocr_text)}")
+                    pages = [(1, ocr_text)]        # 단일 페이지 취급
+                    layout_map = {}                # OCR 텍스트엔 bbox 신뢰 불가 → 비움
+
+        # ---------- 1-2) 페이지 표준화 ----------
         pages_std = _normalize_pages_for_chunkers(pages)
-
         job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
 
-        # 2) 청킹
+        # ---------- 2) 청킹 ----------
         job_state.update(job_id, status="chunking", step="chunk:start", progress=35)
-        model = get_embedding_model()
+
+        # 인코더/길이
         enc, max_len = _make_encoder()
         default_target = max(64, max_len - 16)
         default_overlap = min(96, default_target // 3)
         target_tokens = int(os.getenv("RAG_CHUNK_TOKENS", str(default_target)))
         overlap_tokens = int(os.getenv("RAG_CHUNK_OVERLAP", str(default_overlap)))
 
-        chunks = None
+        chunks: list[tuple[str, dict]] | None = None
+
+        # 2-1) 레이아웃 인지 청킹
         try:
             from app.services.layout_chunker import layout_aware_chunks  # type: ignore
             chunks = layout_aware_chunks(
@@ -248,7 +287,9 @@ def index_pdf_to_milvus(
             if not chunks:
                 raise RuntimeError("layout-aware 결과 비어있음")
         except Exception as e1:
+            # 2-2) 플러스 청커
             try:
+                from app.services.chunker import smart_chunk_pages_plus, smart_chunk_pages
                 chunks = smart_chunk_pages_plus(
                     pages_std, enc,
                     target_tokens=target_tokens, overlap_tokens=overlap_tokens,
@@ -258,18 +299,80 @@ def index_pdf_to_milvus(
                     raise RuntimeError("plus 결과 비어있음")
             except Exception as e2:
                 print(f"[CHUNK] layout-aware/plus failed ({e1}); fallback to smart ({e2})")
+                # 2-3) 기본 청커
                 chunks = smart_chunk_pages(
                     pages_std, enc,
                     target_tokens=target_tokens, overlap_tokens=overlap_tokens
                 )
 
+        # ---------- 2-4) bytes-OCR 세컨드 찬스 + 기본 청커 ----------
+        if (not chunks or len(chunks) == 0) and use_bytes_path and OCR_BYTES_ENABLED:
+            if pdf_bytes:
+                try:
+                    from app.services.ocr_service import try_ocr_pdf_bytes
+                    ocr_text2 = try_ocr_pdf_bytes(pdf_bytes, enabled=True)
+                except Exception as _e:
+                    print(f"[CHUNK] second-chance OCR failed: {getattr(_e, 'message', _e)}")
+                    ocr_text2 = None
+
+                if ocr_text2:
+                    pages_std = _normalize_pages_for_chunkers([(1, ocr_text2)])
+                    from app.services.chunker import smart_chunk_pages
+                    chunks = smart_chunk_pages(
+                        pages_std, enc,
+                        target_tokens=target_tokens, overlap_tokens=overlap_tokens
+                    )
+                    print(f"[CHUNK] second-chance via OCR succeeded, chunks={len(chunks or [])})")
+
+        # ---------- 2-5) 최후 보호막: 통짜 텍스트라도 1개 청크 생성 ----------
+        if not chunks or len(chunks) == 0:
+            flat_texts = []
+            for _, t in pages_std or []:
+                tt = (t or "").strip()
+                if tt:
+                    flat_texts.append(tt)
+
+            # 텍스트가 전혀 없으면, 페이지 수만큼 placeholder라도 만들어 크래시 방지
+            fallback_text = "\n\n".join(flat_texts).strip()
+            if not fallback_text:
+                # bytes가 있고 페이지 수를 구할 수 있으면 이미지-플레이스홀더
+                try:
+                    if pdf_bytes:
+                        import fitz
+                        doc_dbg = fitz.open(stream=pdf_bytes, filetype="pdf")
+                        placeholders = [f"[page {i+1}: image-only]" for i in range(doc_dbg.page_count)]
+                        fallback_text = "\n".join(placeholders).strip()
+                except Exception:
+                    pass
+
+            # 그래도 비면, ENV로 동작 결정: 기본은 크래시 방지용 더미 텍스트 생성
+            if not fallback_text:
+                if os.getenv("RAG_ALLOW_EMPTY_FALLBACK", "1") == "1":
+                    fallback_text = "[empty document after parsing/OCR]"
+                else:
+                    raise RuntimeError("Chunking 결과가 비었습니다.")
+
+            # META 구성
+            import json
+            meta = {
+                "type": "text",
+                "section": "",
+                "pages": [int(p) for p, _ in (pages_std or [])] or [1],
+                "bboxes": {},
+            }
+            meta_line = "META: " + json.dumps(meta, ensure_ascii=False)
+            chunk_text = meta_line + "\n" + fallback_text
+            first_page = int(meta["pages"][0]) if meta["pages"] else 0
+            chunks = [(chunk_text, {"page": first_page, "section": "", "pages": meta["pages"], "bboxes": {}})]
+
+        # ---------- 2-6) 최종 검사 ----------
         chunks = _coerce_chunks_for_milvus(chunks)
         if not chunks:
             raise RuntimeError("Chunking 결과가 비었습니다.")
 
         job_state.update(job_id, status="chunking", step="chunk:done", chunks=len(chunks), progress=50)
 
-        # 3) doc_id 확정 (넘겨받은 값 > MinIO 객체명 > 파일명)
+        # ---------- 3) doc_id 확정 ----------
         if not doc_id:
             base_from_obj = os.path.splitext(os.path.basename(minio_object or ""))[0] if minio_object else None
             doc_id = base_from_obj or (os.path.splitext(os.path.basename(file_path))[0] if file_path else None)
@@ -281,8 +384,10 @@ def index_pdf_to_milvus(
         RETRY_AFTER_DELETE_ON_DUP = os.getenv("RAG_RETRY_AFTER_DELETE", "1") == "1"
 
         st = job_state.get(job_id) or {}
-        mode = st.get("mode")  # 'replace' | 'version' | 'skip' 등이 있으면 활용
+        mode = st.get("mode")  # 'replace' | 'version' | 'skip' 등
 
+        from app.services.milvus_store_v2 import MilvusStoreV2
+        from app.services.embedding_model import embed, get_sentence_embedding_dimension
         store = MilvusStoreV2(dim=get_sentence_embedding_dimension())
 
         if mode == "replace" or REPLACE_BEFORE_INSERT:
@@ -295,7 +400,7 @@ def index_pdf_to_milvus(
             except Exception as e:
                 print(f"[INDEX] pre-delete warn: {e}")
 
-        # 4) Milvus upsert
+        # ---------- 4) Milvus upsert ----------
         job_state.update(job_id, status="embedding", step="embed:start", progress=60)
         res = store.insert(doc_id, chunks, embed_fn=embed)  # {inserted, skipped, reason, doc_id}
         real_doc_id = res.get("doc_id", doc_id)
@@ -321,12 +426,13 @@ def index_pdf_to_milvus(
         else:
             job_state.update(job_id, status="indexing", step=f"milvus:inserted:{res.get('inserted',0)}",
                              progress=90, doc_id=real_doc_id)
-            print(f"[INDEX] done: {minio_object} (doc_id={real_doc_id}, chunks={len(chunks)}, "
+            print(f"[INDEX] done: {minio_object or file_path} (doc_id={real_doc_id}, chunks={len(chunks)}, "
                   f"inserted={res.get('inserted',0)})")
 
-        # 5) MinIO 원본 삭제(옵션)
+        # ---------- 5) MinIO 원본 삭제(옵션) ----------
         if os.getenv("RAG_DELETE_AFTER_INDEX", "0") == "1" and minio_object and uploaded:
             try:
+                from app.services.minio_store import MinIOStore
                 MinIOStore().delete(minio_object)
                 print(f"[CLEANUP] deleted from MinIO: {minio_object}")
                 job_state.update(job_id, status="cleanup", step="minio:deleted",
@@ -335,14 +441,14 @@ def index_pdf_to_milvus(
                 print(f"[CLEANUP] delete failed: {e}")
                 job_state.update(job_id, status="cleanup", step=f"minio:delete_failed:{e!s}")
 
-        # 6) 로컬 파일 정리(옵션) — 무디스크면 아무것도 안 함
+        # ---------- 6) 로컬 파일 정리 ----------
         if remove_local and file_path and not use_bytes_path:
             try:
                 os.remove(file_path)
             except Exception:
                 pass
 
-        # 7) 완료
+        # ---------- 7) 완료 ----------
         job_state.complete(
             job_id,
             pages=len(pages_std or []),
@@ -356,6 +462,7 @@ def index_pdf_to_milvus(
     except Exception as e:
         job_state.fail(job_id, str(e))
         raise
+
 def _content_disposition(disposition: str, filename: str) -> str:
     """
     latin-1 제한을 피하기 위해:
@@ -798,77 +905,74 @@ def get_file_presigned(
 
 
 @router.get("/docs")
-def list_docs(limit: int = 200):
+def list_docs():
+    """
+    변환 PDF와 원본 파일의 매핑을 반환.
+    - doc_id: PDF 파일명(확장자 제외)
+    - title: 사용자에게 보일 이름 (원본 이름이 있으면 원본명, 없으면 PDF 파일명)
+    - object_key: 변환 PDF의 MinIO 키 (uploaded/...)
+    - original_key: 원본의 MinIO 키 (uploaded/originals/...), 없으면 None
+    - original_name: 원본 파일명 (예: .docx)
+    - is_pdf_original: 원본도 pdf인지 여부
+    - uploaded_at: 메타에 기록된 업로드 시간
+    """
     m = MinIOStore()
     try:
-        keys = m.list_files("uploaded/")
+        # 업로드된 PDF 목록(내부키/원본 디렉토리 제외)
+        all_keys = m.list("uploaded/")
     except Exception as e:
         raise HTTPException(500, f"minio list failed: {e}")
 
     def is_internal(k: str) -> bool:
-        return k.endswith(".flag") or "/__hash__/" in k or "/__meta__/" in k
+        return (
+            k.endswith(".flag")
+            or "/__hash__/" in k
+            or "/__meta__/" in k
+            or k.startswith("uploaded/originals/")
+        )
 
-    pdf_keys = [k for k in keys if k.lower().endswith(".pdf") and not is_internal(k)]
-    out = []
+    pdf_keys = [k for k in all_keys if not is_internal(k) and k.lower().endswith(".pdf")]
 
+    items = []
     for k in pdf_keys:
-        base = os.path.splitext(os.path.basename(k))[0]
-        # 메타 JSON에서 원본 찾기
-        meta_key = f"uploaded/__meta__/{base}.json"
-        orig_key = None
-        title = os.path.basename(k)
-
-        try:
-            if m.exists(meta_key):
-                # 임시 파일로 받아서 로드
-                tmp = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.json")
-                m.download(meta_key, tmp)
-                with open(tmp, "r", encoding="utf-8") as fp:
-                    meta = json.load(fp)
-                os.remove(tmp)
-                orig_key = meta.get("original") or meta.get("orig_object")
-                title = meta.get("original_name") or title
-        except Exception:
-            pass
-
-        # 폴백: originals/ 에서 같은 base 이름을 가진 원본 탐색
-        if not orig_key:
-            for ext in (".pdf", ".docx", ".hwpx", ".hwp"):
-                cand = f"uploaded/originals/{base}{ext}"
-                if m.exists(cand):
-                    orig_key = cand
-                    break
-
-        # presigned URL 생성
-        try:
-            pdf_url = m.presigned_url(k, method="GET", expires=timedelta(minutes=60))
-        except Exception as e:
-            raise HTTPException(500, f"presign(pdf) failed: {e}")
-
-        if orig_key and m.exists(orig_key):
+        base = os.path.basename(k)             # foo.pdf
+        doc_id = os.path.splitext(base)[0]     # foo
+        meta_key = f"uploaded/__meta__/{doc_id}.json"
+        meta = None
+        if m.exists(meta_key):
             try:
-                download_url = m.presigned_url(
-                    orig_key, method="GET", expires=timedelta(minutes=60),
-                    response_headers={"response-content-disposition": f'attachment; filename="{title}"'}
-                )
+                meta = m.get_json(meta_key)
             except Exception:
-                download_url = pdf_url
-        else:
-            download_url = pdf_url  # 원본 없으면 PDF로 폴백
+                meta = None
 
-        out.append({
-            "doc_id": base,
+        original_key = None
+        original_name = None
+        uploaded_at = None
+        if meta:
+            original_key = meta.get("original")
+            original_name = meta.get("original_name")
+            uploaded_at = meta.get("uploaded_at")
+
+        # 원본 키가 실제로 존재하는지 한 번 더 확인
+        if original_key and not m.exists(original_key):
+            original_key = None
+
+        # 사용자 표시용 타이틀: 원본 이름이 있으면 그걸 우선
+        title = original_name or base
+
+        is_pdf_original = bool(original_key and original_key.lower().endswith(".pdf"))
+
+        items.append({
+            "doc_id": doc_id,
             "title": title,
-            "object_key": k,        # PDF object
-            "url": pdf_url,         # PDF 보기용
-            "download_url": download_url,  # 원본 다운로드용
-            "uploaded_at": None,
+            "object_key": k,                 # 변환 PDF
+            "original_key": original_key,    # 원본 (없을 수 있음)
+            "original_name": original_name,  # 원본 파일명
+            "is_pdf_original": is_pdf_original,
+            "uploaded_at": uploaded_at,
         })
 
-        if len(out) >= limit:
-            break
-
-    return out
+    return {"docs": items}
 
 @router.get("/status")
 def status():
