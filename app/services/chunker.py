@@ -52,7 +52,20 @@ def _clamp_bbox(bb: List[float]) -> List[float]:
     return [x0, y0, x1, y1]
 # ===================== 패턴 =====================
 
-HEADING_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*|[IVXLC]+\.|[A-Z]\))\s+\S|^\s*#{1,6}\s+\S", re.M)
+HEADING_RE = re.compile(
+    r"""^
+        \s*
+        (?:                               # 대표 케이스들
+            (?:제?\s*\d+(?:\.\d+)*\s*장?) |    # 제1장, 1.2, 1.2.3, 1 장
+            (?:[IVXLC]+\.?) |                 # 로마숫자 I. II. 등
+            (?:[■□◦\-*•·]\s*\d+) |            # 글머리표 + 숫자
+            (?:\d+\s*[)\]]\s*) |               # 1)  1]
+            (?:#{1,6}\s+)                      # markdown 헤딩
+        )
+        \s*\S+
+    """,
+    re.X | re.M
+)
 LIST_RE    = re.compile(r"^\s*[-*•·]\s+\S|^\s*\d+\.\s+\S", re.M)
 SENT_SPLIT_RE = re.compile(r"(?<=[\.!?])\s+|(?<=[。！？])|(?<=\n)")
 
@@ -540,31 +553,42 @@ def _guess_section_for_paragraph(paragraph: str, last_section: str) -> str:
         break
     return last_section
 
+def _clean(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[\s\p{P}]+", " ", s, flags=re.UNICODE)
+    return s.strip()
+
+def _token_set(s: str) -> set[str]:
+    return set(_clean(s).split())
+
+def _similar(a: str, b: str) -> float:
+    A, B = _token_set(a), _token_set(b)
+    if not A or not B: 
+        return 0.0
+    inter = len(A & B)
+    return inter / min(len(A), len(B))   # 부분일치에 관대
+
 def _attach_bboxes_to_paragraph(para: str, page_blocks: list[dict]) -> list[list[float]]:
-    """
-    간이 매칭: 블록 텍스트가 문단에 '부분 포함'되면 해당 블록의 bbox를 채택.
-    과하게 붙지 않도록 안전 필터 적용.
-    """
     if not para or not page_blocks:
         return []
     p = para.replace("\n", " ").strip()
     if not p:
         return []
     bboxes: list[list[float]] = []
-    # 매칭 강도: 블록 텍스트의 앞부분(최대 40자) 또는 전체 중 1개라도 포함되면 채택
+    # 임계치: 0.5 정도면 보수적, 0.3이면 관대
+    THRESH = 0.35
     for blk in page_blocks:
         t = (blk.get("text") or "").strip()
         if not t:
             continue
-        probe = t[:40] if len(t) > 40 else t
-        if probe and probe in p:
+        if _similar(p[:200], t[:200]) >= THRESH or _similar(p, t) >= THRESH:
             bb = blk.get("bbox")
             if isinstance(bb, (list, tuple)) and len(bb) == 4:
                 bboxes.append(_clamp_bbox([float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])]))
-    # 중복 bbox 제거(과한 붙임 방지)
+    # 중복 제거
     seen, uniq = set(), []
     for bb in bboxes:
-        key = tuple(round(v, 3) for v in bb)
+        key = tuple(round(v, 2) for v in bb)  # 좌표 반올림으로 근접 중복 제거
         if key not in seen:
             seen.add(key); uniq.append(bb)
     return uniq
