@@ -28,6 +28,8 @@ from app.services.chunker import smart_chunk_pages, smart_chunk_pages_plus
 from app.services.milvus_store_v2 import MilvusStoreV2
 from app.services.embedding_model import get_embedding_model, embed
 from app.services.reranker import rerank
+from app.services.layout_chunker import extract_layout_block
+from app.services.file_parser import pdf_to_pages_text
 
 router = APIRouter(tags=["llama"])
 
@@ -55,6 +57,59 @@ class AskResp(BaseModel):
     used_chunks: int
     sources: Optional[List[dict]] = None  # (선택) 출처 제공
 
+# --- 폴백 전용: pages 정규화 도우미 ---------------------------------
+def _normalize_pages_for_chunkers(pages):
+    """
+    pages를 [(page_no:int, text:str), ...] 로 강제 변환.
+    허용 입력:
+      - [(int, str)], [[int, str]]
+      - ["page text", ...]  -> enumerate 1-based
+      - [{"page":..,"text":..}], [{"page_no":..,"body":..}], [{"index":..,"lines":[..]}]
+    그 외는 문자열화해서 안전하게 수용.
+    """
+    out = []
+    if not pages:
+        return out
+
+    for i, item in enumerate(pages, start=1):
+        # (int,str) 튜플/리스트
+        if isinstance(item, (tuple, list)):
+            if len(item) >= 2:
+                pno, txt = item[0], item[1]
+            else:
+                pno, txt = i, (item[0] if item else "")
+            try:
+                pno = int(pno)
+            except Exception:
+                pno = i
+            out.append((pno, "" if txt is None else str(txt)))
+            continue
+
+        # dict
+        if isinstance(item, dict):
+            pno = item.get("page") or item.get("page_no") or item.get("index") or i
+            txt = (
+                item.get("text")
+                or item.get("body")
+                or ("\n".join(item.get("lines") or []) if item.get("lines") else "")
+                or ""
+            )
+            try:
+                pno = int(pno)
+            except Exception:
+                pno = i
+            out.append((pno, str(txt)))
+            continue
+
+        # 문자열
+        if isinstance(item, str):
+            out.append((i, item))
+            continue
+
+        # 기타: 문자열화
+        out.append((i, str(item)))
+
+    return out
 
 # ---------- Helpers ----------
 def _coerce_chunks_for_milvus(chs):
@@ -148,11 +203,15 @@ def index_pdf_to_milvus(
                 raise RuntimeError(f"bytes parsing unavailable or failed: {ee}") from ee
         else:
             # 기존 로컬 경로 파서 유지
+            from app.services.file_parser import parse_pdf, parse_pdf_blocks  # 🔹추가
             pages = parse_pdf(file_path, by_page=True)
             if not pages:
                 raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
             blocks_by_page_list = parse_pdf_blocks(file_path)
-            layout_map = {p: blks for p, blks in blocks_by_page_list}
+            layout_map = {int(p): blks for p, blks in blocks_by_page_list}  # 🔹int 캐스팅
+
+        # 여기서 표준화: 이후 모든 청킹 함수는 이 변수만 사용
+        pages_std = _normalize_pages_for_chunkers(pages)
 
         job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
 
@@ -177,21 +236,24 @@ def index_pdf_to_milvus(
         try:
             from app.services.layout_chunker import layout_aware_chunks  # type: ignore
             chunks = layout_aware_chunks(
-                pages, encode, target_tokens, overlap_tokens, slide_rows=4, layout_blocks=layout_map
+                pages_std, encode, target_tokens, overlap_tokens, slide_rows=4, layout_blocks=layout_map
             )
             if not chunks:
                 raise RuntimeError("layout-aware 결과 비어있음")
         except Exception as e1:
             try:
                 chunks = smart_chunk_pages_plus(
-                    pages, encode, target_tokens=target_tokens, overlap_tokens=overlap_tokens, layout_blocks=layout_map
+                    pages_std, encode,
+                    target_tokens=target_tokens, overlap_tokens=overlap_tokens,
+                    layout_blocks=layout_map
                 )
                 if not chunks:
                     raise RuntimeError("plus 결과 비어있음")
             except Exception as e2:
                 print(f"[CHUNK] layout-aware/plus failed ({e1}); fallback to smart")
                 chunks = smart_chunk_pages(
-                    pages, encode, target_tokens=target_tokens, overlap_tokens=overlap_tokens
+                    pages_std, encode,
+                    target_tokens=target_tokens, overlap_tokens=overlap_tokens
                 )
 
         chunks = _coerce_chunks_for_milvus(chunks)
@@ -276,7 +338,7 @@ def index_pdf_to_milvus(
         # 7) 완료
         job_state.complete(
             job_id,
-            pages=len(pages or []),
+            pages=len(pages_std or []),
             chunks=len(chunks or []),
             doc_id=real_doc_id,
             inserted=int(res.get("inserted", 0)),

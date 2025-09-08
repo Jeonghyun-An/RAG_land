@@ -40,7 +40,7 @@ htmlcov/
 
 # VSCode 설정 (개인 설정은 제외)
 .vscode/
-
+.git
 # 📦 Pipenv, Poetry 등 기타
 Pipfile.lock
 poetry.lock
