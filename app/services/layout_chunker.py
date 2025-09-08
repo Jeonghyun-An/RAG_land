@@ -18,16 +18,19 @@ BULLET_LINE = re.compile(
 )
 BULLET_CONT = re.compile(r"^\s{2,}\S")  # 들여쓰기된 불릿 연속 줄(설명 줄)
 GRID_HINT   = re.compile(r"[│┃┆┇┋┊\|]")  # 표의 세로선 문자 or 파이프
-HEADING_RE  = re.compile(                # 본문 첫 줄에서 표제 후보
+HEADING_RE  = re.compile(
     r'^\s*(?:'
-    r'제\s*\d+\s*(조|장|절)[\.\)]?\b'   # 제 7 조 / 제7조.
-    r'|[0-9]+[.)]\s+'                   # 1)  2.
-    r'|[IVXLCM]+[.)]\s+'                # I.  II)
-    r'|[A-Z][A-Za-z0-9\s\-]{0,40}:?\s*$' # 영문 캡션/섹션
-    r')'
+    r'제\s*\d+\s*(?:조|장|절)[\.\)]?\s*$'
+    r'|[0-9]+[.)]\s*[^\n]{0,80}\s*$'
+    r'|[IVXLCM]+[.)]\s*[^\n]{0,80}\s*$'
+    r'|[A-Z][A-Za-z0-9\s\-]{0,40}:?\s*$'
+    r')',
+    re.IGNORECASE
 )
 # 러닝헤더: "5.3 … | 168" 등 (가운뎃점, 점 모두 허용)
-RUNHDR_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s+.+\s[\.\·]\s*\d{1,4}\s*$")
+RUNHDR_RE = re.compile(
+    r"^\s*(?:[A-Z][A-Za-z0-9\.\s]{0,40}\s+)?\d+(?:\.\d+)*\s+[^\n]{1,60}\s[.\·]\s*\d{1,4}\s*$"
+)
 
 def _is_heading(line: str) -> bool:
     return bool(HEADING_RE.match(line.strip()))
@@ -36,9 +39,13 @@ def _is_bullet(line: str) -> bool:
     return bool(BULLET_LINE.match(line))
 
 def _is_tableish_block(lines: List[str]) -> bool:
-    # 라인에 세로선/구분기호가 반복되거나, 2칸 이상 공백 분할이 지속되면 표로 간주
+    # 라인 수가 너무 적으면 표로 보지 않음
+    if len(lines) < 4:
+        return False
+    # 세로선/파이프 또는 2칸 이상 공백이 '충분히' 반복
     marks = sum(1 for ln in lines if GRID_HINT.search(ln) or ("  " in ln))
-    return marks >= max(3, len(lines)//3)
+    return marks >= max(4, len(lines) // 2)
+
 
 # --- 조문 단위 패킹 옵션 ---
 ARTICLE_PACK   = os.getenv("RAG_PACK_BY_ARTICLE", "0") == "1"
@@ -338,8 +345,26 @@ def layout_aware_chunks(
             from app.services.chunker import token_safe_chunks
             is_article = ARTICLE_PACK and _HEAD_RE.match((b.get("title") or "") + "\n" + b.get("body", ""))
             limit = ARTICLE_TARGET if is_article else target_tokens
-            for ch in token_safe_chunks(b["body"], limit, overlap_tokens):
+
+            # ✅ encode 넘겨주기: token_safe_chunks가 encode 파라미터를 지원하지 않으면
+            # 내부에서 try/except로 처리해서 기존 시그니처와도 호환되게 만든다.
+            chunks_made = 0
+            try:
+                gen = token_safe_chunks(b["body"], limit, overlap_tokens, encode)  # 선호
+            except TypeError:
+                gen = token_safe_chunks(b["body"], limit, overlap_tokens)          # 구버전 호환
+
+            for ch in gen:
                 payload = ch
+                bmap = _collect_bboxes_for_pages(payload, pages_list, layout_blocks)
+                head = f"\n[{section}]\n" if section else "\n"
+                text = f"{meta_line(b, page, title)}{head}{payload}"
+                out.append((text, {"page": page, "section": section, "pages": pages_list, "bboxes": bmap}))
+                chunks_made += 1
+
+            # 비상 방출: 본문이 있는데도 아무 청크가 없으면 그대로 1개라도 만든다
+            if chunks_made == 0 and (b.get("body") or "").strip():
+                payload = (b.get("body") or "").strip()
                 bmap = _collect_bboxes_for_pages(payload, pages_list, layout_blocks)
                 head = f"\n[{section}]\n" if section else "\n"
                 text = f"{meta_line(b, page, title)}{head}{payload}"
