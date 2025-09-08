@@ -16,20 +16,22 @@ from pydantic import BaseModel
 import asyncio, json
 from sse_starlette.sse import EventSourceResponse  # ✅ 요구사항: sse-starlette
 from app.services import job_state
-from urllib.parse import unquote
 from datetime import datetime, timedelta
 
-from app.services.file_parser import parse_pdf, parse_pdf_blocks
+from app.services.file_parser import (
+    parse_pdf,                    # (local path) -> [(page_no, text)]
+    parse_pdf_blocks,             # (local path) -> [(page_no, [ {text,bbox}, ... ])]
+    parse_any_bytes,              # (filename, bytes) -> {"kind":"pdf", "pages":[...], "blocks":[...]}
+    parse_pdf_blocks_from_bytes,  # (bytes) -> [(page_no, [ {text,bbox}, ... ])]
+)
 from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
 from app.services.pdf_converter import convert_to_pdf, ConvertError
 from app.services.chunker import smart_chunk_pages, smart_chunk_pages_plus
-# (지연 import로 대체) from app.services.layout_chunker import layout_aware_chunks
+from app.services.layout_chunker import layout_aware_chunks
 from app.services.milvus_store_v2 import MilvusStoreV2
-from app.services.embedding_model import get_embedding_model, embed
+from app.services.embedding_model import get_embedding_model, embed, get_sentence_embedding_dimension
 from app.services.reranker import rerank
-from app.services.layout_chunker import extract_layout_block
-from app.services.file_parser import pdf_to_pages_text
 
 router = APIRouter(tags=["llama"])
 
@@ -153,6 +155,15 @@ def _coerce_chunks_for_milvus(chs):
             last = it
     return out
 
+def _make_encoder():
+    m = get_embedding_model()
+    tok = getattr(m, "tokenizer", None)
+    max_len = int(getattr(m, "max_seq_length", 128))
+    def enc(s: str):
+        if tok is None:
+            return []
+        return tok.encode(s, add_special_tokens=False) or []
+    return enc, max_len
 
 def index_pdf_to_milvus(
     job_id: str,
@@ -198,12 +209,15 @@ def index_pdf_to_milvus(
                     # parse_any_bytes가 blocks를 안 채웠다면, 전용 함수로 보완
                     blocks_by_page_list = parse_pdf_blocks_from_bytes(pdf_bytes)
 
-                layout_map = {p: blks for p, blks in (blocks_by_page_list or [])}
+                # blocks가 dict로 올 수도 있고(list of tuples로 올 수도 있음)
+                if isinstance(blocks_by_page_list, dict):
+                    layout_map = {int(k): v for k, v in blocks_by_page_list.items()}
+                else:
+                    layout_map = {int(p): blks for p, blks in (blocks_by_page_list or [])}
             except Exception as ee:
                 raise RuntimeError(f"bytes parsing unavailable or failed: {ee}") from ee
         else:
             # 기존 로컬 경로 파서 유지
-            from app.services.file_parser import parse_pdf, parse_pdf_blocks  # 🔹추가
             pages = parse_pdf(file_path, by_page=True)
             if not pages:
                 raise RuntimeError("PDF에서 텍스트를 추출하지 못했습니다.")
@@ -215,18 +229,10 @@ def index_pdf_to_milvus(
 
         job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
 
-        # 2) 청킹 (기존 흐름 그대로)
+        # 2) 청킹
         job_state.update(job_id, status="chunking", step="chunk:start", progress=35)
-
         model = get_embedding_model()
-        tokenizer = getattr(model, "tokenizer", None)
-        encode = (
-            (lambda s: tokenizer.encode(s, add_special_tokens=False))
-            if (tokenizer and hasattr(tokenizer, "encode"))
-            else (lambda s: s.split())
-        )
-
-        max_len = int(getattr(model, "max_seq_length", 128))
+        enc, max_len = _make_encoder()
         default_target = max(64, max_len - 16)
         default_overlap = min(96, default_target // 3)
         target_tokens = int(os.getenv("RAG_CHUNK_TOKENS", str(default_target)))
@@ -236,23 +242,24 @@ def index_pdf_to_milvus(
         try:
             from app.services.layout_chunker import layout_aware_chunks  # type: ignore
             chunks = layout_aware_chunks(
-                pages_std, encode, target_tokens, overlap_tokens, slide_rows=4, layout_blocks=layout_map
+                pages_std, enc, target_tokens, overlap_tokens,
+                slide_rows=4, layout_blocks=layout_map
             )
             if not chunks:
                 raise RuntimeError("layout-aware 결과 비어있음")
         except Exception as e1:
             try:
                 chunks = smart_chunk_pages_plus(
-                    pages_std, encode,
+                    pages_std, enc,
                     target_tokens=target_tokens, overlap_tokens=overlap_tokens,
                     layout_blocks=layout_map
                 )
                 if not chunks:
                     raise RuntimeError("plus 결과 비어있음")
             except Exception as e2:
-                print(f"[CHUNK] layout-aware/plus failed ({e1}); fallback to smart")
+                print(f"[CHUNK] layout-aware/plus failed ({e1}); fallback to smart ({e2})")
                 chunks = smart_chunk_pages(
-                    pages_std, encode,
+                    pages_std, enc,
                     target_tokens=target_tokens, overlap_tokens=overlap_tokens
                 )
 
@@ -276,7 +283,7 @@ def index_pdf_to_milvus(
         st = job_state.get(job_id) or {}
         mode = st.get("mode")  # 'replace' | 'version' | 'skip' 등이 있으면 활용
 
-        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        store = MilvusStoreV2(dim=get_sentence_embedding_dimension())
 
         if mode == "replace" or REPLACE_BEFORE_INSERT:
             try:
@@ -314,7 +321,7 @@ def index_pdf_to_milvus(
         else:
             job_state.update(job_id, status="indexing", step=f"milvus:inserted:{res.get('inserted',0)}",
                              progress=90, doc_id=real_doc_id)
-            print(f"[INDEX] done: {file_path} (doc_id={real_doc_id}, chunks={len(chunks)}, "
+            print(f"[INDEX] done: {minio_object} (doc_id={real_doc_id}, chunks={len(chunks)}, "
                   f"inserted={res.get('inserted',0)})")
 
         # 5) MinIO 원본 삭제(옵션)
@@ -746,29 +753,24 @@ async def stream_job(job_id: str):
     return EventSourceResponse(event_gen())
 
 # ---------- MinIO Utilities ----------
-@router.get("/files")
-def list_files(
-    prefix: str = Query("", description="prefix로 필터링 (예: 'uploaded/')"),
-):
-    try:
-        return {"files": MinIOStore().list_files(prefix=prefix)}
-    except Exception as e:
-        raise HTTPException(500, f"MinIO 파일 조회 실패: {e}")
+
     
 @router.get("/files")
-def list_files(prefix: str = "uploaded/"):
+def list_files(prefix: str = "uploaded/", include_internal: bool = False, only_pdf: bool = False):
     m = MinIOStore()
     try:
-        keys = m.list(prefix)  # ['uploaded/a.pdf', 'uploaded/__hash__/sha256/xxx.flag', ...]
+        keys = m.list_files(prefix=prefix) 
     except Exception as e:
-        raise HTTPException(500, f"minio list failed: {e}")
+        raise HTTPException(500, f"MinIO 파일 조회 실패: {e}")
 
-    def is_internal(k: str) -> bool:
-        return k.endswith(".flag") or k.startswith("uploaded/__hash__/")
+    # 내부 관리 오브젝트 숨기기 (원하면 include_internal=True로 노출)
+    if not include_internal:
+        keys = [k for k in keys if not (k.endswith(".flag") or "/__hash__/" in k or "/__meta__/" in k)]
 
-    visible = [k for k in keys if not is_internal(k)]
-    pdf_only = [k for k in visible if k.lower().endswith(".pdf")]
-    return {"files": pdf_only}
+    if only_pdf:
+        keys = [k for k in keys if k.lower().endswith(".pdf")]
+
+    return {"files": keys}
 
 
 @router.get("/file/{object_name:path}")
