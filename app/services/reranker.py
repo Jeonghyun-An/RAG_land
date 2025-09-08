@@ -1,31 +1,47 @@
-# reranker.py
+# app/services/reranker.py
 from __future__ import annotations
 
 import os
+import traceback
 from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 # -----------------------------
 # 환경 변수
 # -----------------------------
-# 우선순위: 기본은 CE 먼저(설치 지옥 회피), 필요 시 "flag,ce"로 바꾸면 FlagEmbedding 우선
-RERANKER_BACKENDS = os.getenv("RERANKER_BACKENDS", "ce,flag").lower()  # 예: "ce,flag" | "flag,ce"
-
-# FlagEmbedding 전용 모델(설치되어 있을 때만 사용)
+RERANKER_BACKENDS = os.getenv("RERANKER_BACKENDS", "ce,flag").lower()  # "ce,flag" | "flag,ce"
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
-
-# CrossEncoder(문자열) 전용 경량 모델(기본값 충분히 성능/속도 괜찮음)
 CE_FALLBACK_MODEL = os.getenv("CE_FALLBACK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-RERANKER_DEVICE = os.getenv("RERANKER_DEVICE", None)  # "cuda" | "cpu" | None(자동)
-RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "64"))
+# "cuda" | "cpu" | "auto"(기본)
+RERANKER_DEVICE_ENV = (os.getenv("RERANKER_DEVICE") or "auto").lower()
 
-
-def _pick_reranker_device() -> str:
-    if RERANKER_DEVICE:
-        return RERANKER_DEVICE
+def _get_batch_env() -> int:
+    # 둘 다 지원 (오탈자/기존값 호환)
+    v = os.getenv("RERANKER_BATCH_SIZE") or os.getenv("RERANK_BATCH_SIZE") or "64"
     try:
-        import torch  # noqa
+        return max(1, int(v))
+    except Exception:
+        return 64
+
+RERANKER_BATCH_SIZE = _get_batch_env()
+
+
+def _pick_device() -> str:
+    if RERANKER_DEVICE_ENV in ("cuda", "cpu"):
+        if RERANKER_DEVICE_ENV == "cuda":
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    return "cuda"
+            except Exception:
+                pass
+            print("[RERANK] Requested CUDA but not available → fallback to CPU")
+            return "cpu"
+        return "cpu"
+    # auto
+    try:
+        import torch
         return "cuda" if torch.cuda.is_available() else "cpu"
     except Exception:
         return "cpu"
@@ -36,40 +52,47 @@ def _pick_reranker_device() -> str:
 # -----------------------------
 @lru_cache
 def _load_ce() -> Tuple[Any, str]:
-    """CrossEncoder 우선 로드(가벼움/설치 쉬움)."""
-    device = _pick_reranker_device()
-    from sentence_transformers import CrossEncoder  # 가벼움
-    model_name = CE_FALLBACK_MODEL
-    ce = CrossEncoder(model_name, device=device, trust_remote_code=True)
+    """CrossEncoder 경량 리랭커 (설치 쉬움, 기본값 우선)."""
+    device = _pick_device()
+    from sentence_transformers import CrossEncoder
+    print(f"[RERANK] Loading CE model='{CE_FALLBACK_MODEL}' device='{device}'")
+    ce = CrossEncoder(CE_FALLBACK_MODEL, device=device, trust_remote_code=True)
     return ce, "ce"
 
 
 @lru_cache
 def _load_flag() -> Tuple[Any, str]:
-    """FlagEmbedding 리랭커 로드(설치되어 있을 때만)."""
-    device = _pick_reranker_device()
+    """FlagEmbedding 리랭커 (설치된 경우에만)."""
+    device = _pick_device()
     from FlagEmbedding import FlagReranker
     use_fp16 = (device == "cuda")
+    print(f"[RERANK] Loading FlagReranker model='{RERANKER_MODEL}' device='{device}' fp16={use_fp16}")
     r = FlagReranker(RERANKER_MODEL, use_fp16=use_fp16, device=device)
     return r, "flag"
 
 
 @lru_cache
 def _load_reranker_impl() -> Tuple[Any | None, str]:
-    """백엔드 우선순위에 따라 시도."""
-    order = [x.strip() for x in RERANKER_BACKENDS.split(",") if x.strip()]
-    if not order:
-        order = ["ce", "flag"]
+    order = [x.strip() for x in RERANKER_BACKENDS.split(",") if x.strip()] or ["ce", "flag"]
 
     for backend in order:
         try:
+            if backend == "flag":
+                try:
+                    import importlib
+                    if importlib.util.find_spec("FlagEmbedding") is None:
+                        raise ModuleNotFoundError("FlagEmbedding not installed")
+                except Exception as e:
+                    print(f"[RERANK] FlagEmbedding not available: {e}")
+                    continue
+                return _load_flag()
             if backend == "ce":
                 return _load_ce()
-            if backend == "flag":
-                return _load_flag()
-        except Exception:
+        except Exception as e:
+            print(f"[RERANK] backend '{backend}' load failed: {e}\n{traceback.format_exc()}")
             continue
 
+    print("[RERANK] No reranker available, using None")
     return None, "none"
 
 
@@ -80,7 +103,7 @@ def rerank(query: str, candidates: List[Dict[str, Any]], top_k: int = 3) -> List
     """
     candidates: [{"chunk": "...", ...}, ...]
     re_score 필드를 채워서 내림차순 정렬 후 top_k 반환.
-    로더 실패 시에는 안전 폴백으로 상위 일부 그대로 반환.
+    로더 실패/계산 실패 시에는 안전 폴백으로 상위 일부 그대로 반환.
     """
     if not candidates:
         return []
@@ -89,13 +112,11 @@ def rerank(query: str, candidates: List[Dict[str, Any]], top_k: int = 3) -> List
     if ranker is None or kind == "none":
         return candidates[:top_k]
 
-    # (query, chunk) 페어 만들기
     pairs = [(query, c.get("chunk", "") or "") for c in candidates]
 
-    # 점수 계산
     try:
         if kind == "flag":
-            scores = ranker.compute_score(pairs, batch_size=RERANK_BATCH_SIZE)
+            scores = ranker.compute_score(pairs, batch_size=RERANKER_BATCH_SIZE)
         else:  # "ce"
             try:
                 import torch
@@ -103,11 +124,10 @@ def rerank(query: str, candidates: List[Dict[str, Any]], top_k: int = 3) -> List
                     scores = ranker.predict(pairs, convert_to_numpy=True).tolist()
             except Exception:
                 scores = ranker.predict(pairs, convert_to_numpy=True).tolist()
-    except Exception:
-        # 계산 중 실패해도 전체 파이프라인은 살림
+    except Exception as e:
+        print(f"[RERANK] scoring failed: {e}\n{traceback.format_exc()}")
         return candidates[:top_k]
 
-    # 주입 & 정렬
     for c, s in zip(candidates, scores):
         try:
             c["re_score"] = float(s)
