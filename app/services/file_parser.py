@@ -3,6 +3,8 @@ from typing import Dict, List, Tuple, Union, Optional
 import os
 from io import BytesIO
 
+from app.services.ocr_service import _norm_easyocr_langs
+
 """
 PDF 텍스트 추출
 - OCR 모드: OCR_MODE in {"auto","always","never"} (default=auto)
@@ -23,16 +25,25 @@ PDF 텍스트 추출
 # ---------------------- Text extract (no OCR) ---------------------- #
 def _extract_text_pdfminer(path: str, by_page: bool) -> Union[str, List[Tuple[int, str]]]:
     import pdfminer.high_level
-    from pdfminer.layout import LAParams
+    from pdfminer.layout import LAParams, LTTextContainer
+
     laparams = LAParams()
     if not by_page:
+        # 전체 텍스트
         return (pdfminer.high_level.extract_text(path, laparams=laparams) or "").strip()
+
+    # 페이지별 텍스트
     pages: List[Tuple[int, str]] = []
-    for i, page in enumerate(pdfminer.high_level.extract_pages(path, laparams=laparams), start=1):
-        text = "".join([elem.get_text() for elem in page if hasattr(elem, "get_text")]).strip()
+    for i, layout in enumerate(pdfminer.high_level.extract_pages(path, laparams=laparams), start=1):
+        parts = []
+        for elem in layout:
+            if isinstance(elem, LTTextContainer):
+                parts.append(elem.get_text())
+        text = "".join(parts).strip()
         if text:
             pages.append((i, text))
     return pages
+
 
 def _extract_text_pypdf2(path: str, by_page: bool) -> Union[str, List[Tuple[int, str]]]:
     from PyPDF2 import PdfReader
@@ -49,18 +60,20 @@ def _extract_text_pypdf2(path: str, by_page: bool) -> Union[str, List[Tuple[int,
 
 # ---------------------- Common rendering (PyMuPDF) ---------------------- #
 def _render_pdf_pages_fitz(path: str, dpi: int):
-    """Yields (page_index_1based, np.ndarray[h,w,3] RGB)"""
     import fitz  # PyMuPDF
     import numpy as np
 
-    zoom = max(1.0, dpi / 72.0)  # 72dpi 기준
+    zoom = max(1.0, dpi / 72.0)
     mat = fitz.Matrix(zoom, zoom)
     doc = fitz.open(path)
+    try:
+        for i, page in enumerate(doc, start=1):
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            yield i, img
+    finally:
+        doc.close()
 
-    for i, page in enumerate(doc, start=1):
-        pix = page.get_pixmap(matrix=mat, alpha=False)  # RGB
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        yield i, img
 
 # ---------------------- OCR engines (via fitz images) ---------------------- #
 def _ocr_with_paddle(images_iter, by_page: bool, lang: str) -> Union[str, List[Tuple[int, str]]]:
@@ -98,7 +111,7 @@ def _ocr_with_tesseract(images_iter, by_page: bool, lang: str) -> Union[str, Lis
 def _ocr_with_easyocr(images_iter, by_page: bool, lang: str) -> Union[str, List[Tuple[int, str]]]:
     import easyocr
     # easyocr 언어코드: ['ko','en'] 형태
-    langs = [l.strip() for l in (lang or "ko,en").replace("+", ",").split(",")]
+    langs = _norm_easyocr_langs(lang)
     gpu = os.getenv("OCR_EASYOCR_GPU", "0").strip() == "1"
     reader = easyocr.Reader(langs, gpu=gpu)
 
@@ -200,7 +213,7 @@ def parse_xlsx_tables(path: str) -> List[Tuple[int, str]]:
 
 def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, str]]]:
     ocr_mode   = os.getenv("OCR_MODE", "auto").lower()          # auto | always | never
-    ocr_engine = os.getenv("OCR_ENGINE", "paddle").lower()      # paddle | tesseract | easyocr
+    ocr_engine = os.getenv("OCR_ENGINE", "easyocr").lower()      # paddle | tesseract | easyocr
     ocr_dpi    = int(os.getenv("OCR_DPI", "300"))
 
     # 언어 기본값
@@ -232,11 +245,17 @@ def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, st
     try:
         images_iter = _render_pdf_pages_fitz(path, ocr_dpi)
         if ocr_engine == "tesseract":
-            return _ocr_with_tesseract(images_iter, by_page, ocr_lang)
+            ocr_out = _ocr_with_tesseract(images_iter, by_page, ocr_lang)
         elif ocr_engine == "easyocr":
-            return _ocr_with_easyocr(images_iter, by_page, ocr_lang)
+            ocr_out = _ocr_with_easyocr(images_iter, by_page, ocr_lang)
         else:
-            return _ocr_with_paddle(images_iter, by_page, ocr_lang)
+            ocr_out = _ocr_with_paddle(images_iter, by_page, ocr_lang)
+
+        # 안전 폴백: OCR 결과가 비면(페이지별=[] 또는 공백 문자열) 텍스트 파서 결과로 대체
+        if (isinstance(ocr_out, list) and not ocr_out) or (isinstance(ocr_out, str) and not ocr_out.strip()):
+            if text_result and ((isinstance(text_result, str) and text_result.strip()) or (isinstance(text_result, list) and len(text_result) > 0)):
+                return text_result
+        return ocr_out
     except Exception as e:
         # OCR 실패 시: 텍스트 결과라도 반환
         if text_result and ((isinstance(text_result, str) and text_result.strip()) or (isinstance(text_result, list) and len(text_result) > 0)):
@@ -245,26 +264,21 @@ def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, st
 
 
 def parse_pdf_blocks(path: str) -> list[tuple[int, list[dict]]]:
-    """
-    PyMuPDF 기반: 각 페이지의 텍스트 블록을 [ {text, bbox:[x0,y0,x1,y1]} ] 형태로 반환.
-    반환: [(page_no, blocks), ...]
-    """
-    import fitz  # PyMuPDF
+    import fitz
     out = []
     doc = fitz.open(path)
-    for i, page in enumerate(doc, start=1):
-        blocks = []
-        # get_text("blocks"): (x0, y0, x1, y1, text, block_no, ...)
-        for b in page.get_text("blocks"):
-            if not b or len(b) < 5:
-                continue
-            x0, y0, x1, y1, txt = b[0], b[1], b[2], b[3], (b[4] or "").strip()
-            if txt:
-                blocks.append({
-                    "text": txt,
-                    "bbox": [float(x0), float(y0), float(x1), float(y1)]
-                })
-        out.append((i, blocks))
+    try:
+        for i, page in enumerate(doc, start=1):
+            blocks = []
+            for b in page.get_text("blocks"):
+                if not b or len(b) < 5:
+                    continue
+                x0, y0, x1, y1, txt = b[0], b[1], b[2], b[3], (b[4] or "").strip()
+                if txt:
+                    blocks.append({"text": txt, "bbox": [float(x0), float(y0), float(x1), float(y1)]})
+            out.append((i, blocks))
+    finally:
+        doc.close()
     return out
 
     
