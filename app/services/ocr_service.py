@@ -86,6 +86,5 @@ def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str|None:
             res = reader.readtext(np.array(img), detail=0, paragraph=True)
             txts.append("\n".join(res))
         return "\n".join(txts).strip() or None
-        return None
     except Exception:
         return None

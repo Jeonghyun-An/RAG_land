@@ -19,46 +19,33 @@ def _as_bool(v: Optional[str], default: bool = False) -> bool:
 
 
 def _guess_secure(endpoint: str, secure_env: Optional[bool]) -> bool:
+    """
+    endpoint에 스킴이 있으면 그걸로, 없으면 env/default로 HTTPS 여부 결정.
+    """
     if secure_env is not None:
         return secure_env
-    # endpoint가 스킴을 포함하면 그걸 따르고, 아니면 env 기본값 사용
     parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
     return parsed.scheme == "https"
 
-def get_bytes(self, object_name: str) -> bytes:
-    """MinIO에서 객체를 받아 바로 bytes로 반환"""
-    try:
-        resp = self.client.get_object(self.bucket, object_name)
-        try:
-            bio = BytesIO()
-            for d in resp.stream(32 * 1024):
-                bio.write(d)
-            return bio.getvalue()
-        finally:
-            resp.close()
-            resp.release_conn()
-    except S3Error as e:
-        raise RuntimeError(f"MinIO get_bytes 실패: {e}") from e
-def upload_bytes(self, data: bytes, object_name: str, content_type: str | None = None):
+
+def _strip_scheme(endpoint: str) -> str:
     """
-    로컬 파일 없이 bytes를 바로 MinIO에 업로드.
+    Minio() 생성자에 넘길 endpoint에서 스킴을 제거해 host:port 형태로 반환.
     """
-    length = len(data)
-    bio = BytesIO(data)
-    self.client.put_object(
-        self.bucket,
-        object_name,
-        data=bio,
-        length=length,
-        content_type=content_type or "application/octet-stream",
-    )
-    return {"bucket": self.bucket, "object_name": object_name, "size": length}
+    if "://" not in endpoint:
+        return endpoint
+    parsed = urlparse(endpoint)
+    # netloc이 비어있을 수 있어 path까지 고려
+    hostport = parsed.netloc or parsed.path
+    return hostport.lstrip("/")
+
+
 class MinIOStore:
     """
     MinIO 헬퍼 클래스
     - 도커: IS_DOCKER=true면 기본 endpoint를 minio:9000 으로
     - 버킷 이름: MINIO_BUCKET_NAME 또는 MINIO_BUCKET 를 우선순위로 사용
-    - 주요 기능: 업/다운로드, 목록, presigned URL, 존재 확인/삭제, 바이트 업로드
+    - 주요 기능: 업/다운로드, 목록, presigned URL, 존재 확인/삭제, 바이트 업/다운로드
     """
 
     def __init__(
@@ -92,9 +79,9 @@ class MinIOStore:
             or "rag-docs"
         )
 
-        # MinIO 클라이언트
+        # MinIO 클라이언트 (스킴 제거한 host:port 전달)
         self.client = Minio(
-            endpoint=endpoint,
+            endpoint=_strip_scheme(endpoint),
             access_key=access_key,
             secret_key=secret_key,
             secure=secure,
@@ -142,13 +129,14 @@ class MinIOStore:
         """
         바이트/스트림 업로드 (대용량 스트리밍도 가능)
         - data: bytes 또는 파일-like 객체
-        - length: 알면 지정(성능↑), 모르면 None (MinIO가 자동 처리 시도)
+        - length: 알면 지정(성능↑), 모르면 None (bytes라면 자동 산출)
         """
         try:
             if isinstance(data, (bytes, bytearray)):
                 length = length if length is not None else len(data)
+                bio = BytesIO(bytes(data))  # put_object는 file-like도 허용
                 self.client.put_object(
-                    self.bucket, object_name, data=data, length=length, content_type=content_type
+                    self.bucket, object_name, data=bio, length=length, content_type=content_type
                 )
             else:
                 # file-like object
@@ -168,6 +156,30 @@ class MinIOStore:
             return target_path
         except S3Error as e:
             raise RuntimeError(f"MinIO 다운로드 실패: {e}") from e
+
+    def get_bytes(self, object_name: str) -> bytes:
+        """MinIO 객체를 bytes로 반환. 반드시 close/release 처리."""
+        try:
+            resp = self.client.get_object(self.bucket, object_name)
+            try:
+                # 큰 객체도 안전하게 처리(스트리밍)
+                bio = BytesIO()
+                for chunk in resp.stream(32 * 1024):
+                    bio.write(chunk)
+                return bio.getvalue()
+            finally:
+                resp.close()
+                resp.release_conn()
+        except S3Error as e:
+            raise RuntimeError(f"MinIO 바이트 다운로드 실패: {e}") from e
+
+    def get_text(self, object_name: str, encoding: str = "utf-8") -> str:
+        """객체를 텍스트로 반환(편의 함수)."""
+        return self.get_bytes(object_name).decode(encoding, "ignore")
+
+    def get_json(self, object_name: str):
+        """객체(JSON)을 파싱해서 반환(편의 함수)."""
+        return json.loads(self.get_text(object_name))
 
     def exists(self, object_name: str) -> bool:
         """오브젝트 존재 여부"""
@@ -229,7 +241,7 @@ class MinIOStore:
             return bool(self.client.bucket_exists(self.bucket))
         except Exception:
             return False
-        
+
     def size(self, object_name: str) -> int:
         """객체 크기(바이트) 리턴. 없으면 예외."""
         stat = self.client.stat_object(self.bucket, object_name)
