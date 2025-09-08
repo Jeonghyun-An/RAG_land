@@ -10,6 +10,22 @@ OCR_LANGS = os.getenv("OCR_LANGS", "kor+eng")
 OCR_MIN_CHARS_PER_PAGE = int(os.getenv("OCR_MIN_CHARS_PER_PAGE", "50"))
 OCR_MAX_PAGES_FOR_OCR = int(os.getenv("OCR_MAX_PAGES_FOR_OCR", "500"))
 
+def _norm_easyocr_langs(lang: str) -> list[str]:
+    raw = [t.strip() for t in (lang or "ko,en").replace("+", ",").split(",") if t.strip()]
+    alias = {
+        "kor": "ko", "kr": "ko", "korean": "ko", "ko": "ko",
+        "eng": "en", "english": "en", "en": "en",
+        "jpn": "ja", "jp": "ja", "japanese": "ja", "ja": "ja",
+        # 필요시 더 추가
+    }
+    out = []
+    seen = set()
+    for t in raw:
+        v = alias.get(t.lower(), t.lower())
+        if v and v not in seen:
+            seen.add(v); out.append(v)
+    return out
+
 def _pdf_text_stats(pdf_path: str) -> Dict[str, int]:
     """가볍게 텍스트 레이어 유무만 체크 (PyPDF2). 실패해도 조용히 0으로."""
     pages, chars = 0, 0
@@ -69,22 +85,59 @@ def ocr_if_needed(pdf_path: str) -> Tuple[str, Dict]:
     except Exception as e:
         return str(src), {"mode": f"ocr_error:{e}", **stats}
 
-def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str|None:
+# app/services/ocr_service.py
+
+def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str | None:
     """
-    PDF 바이트를 이미지로 변환해 OCR. 엔진 미설치/비활성 시 None 반환.
+    PDF 바이트를 PyMuPDF로 렌더링 → 선택 엔진(easyocr|tesseract)로 OCR.
+    외부 poppler 의존성 없음. 실패/비활성 시 None.
+    ENV:
+      OCR_ENGINE: easyocr|tesseract (default easyocr)
+      OCR_LANG:   easyocr: "ko,en" / tesseract: "kor+eng"
+      OCR_EASYOCR_GPU: "1"이면 GPU 사용
+      OCR_DPI:    렌더 DPI (기본 300)
     """
     if not enabled:
         return None
     try:
-        # 예시 의사코드: pdf2image + easyocr (또는 사내 OCR API)
-        from pdf2image import convert_from_bytes
-        import easyocr
-        images = convert_from_bytes(pdf_bytes, dpi=200)
-        reader = easyocr.Reader(['ko','en'], gpu=True)
-        txts = []
-        for img in images:
-            res = reader.readtext(np.array(img), detail=0, paragraph=True)
-            txts.append("\n".join(res))
-        return "\n".join(txts).strip() or None
-    except Exception:
+        import fitz  # PyMuPDF
+        import numpy as np
+        dpi = int(os.getenv("OCR_DPI", "300"))
+        zoom = max(1.0, dpi / 72.0)
+        mat = fitz.Matrix(zoom, zoom)
+
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        engine = os.getenv("OCR_ENGINE", "easyocr").strip().lower()
+
+        texts: list[str] = []
+
+        if engine == "tesseract":
+            import pytesseract
+            from PIL import Image
+            tcmd = os.getenv("OCR_TESSERACT_CMD", "").strip()
+            if tcmd:
+                pytesseract.pytesseract.tesseract_cmd = tcmd
+            lang = os.getenv("OCR_LANGS", "kor+eng")
+            for page in doc:
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                t = pytesseract.image_to_string(img, lang=lang).strip()
+                if t:
+                    texts.append(t)
+        else:
+            import easyocr
+            langs = [s.strip() for s in os.getenv("OCR_LANG", "ko,en").replace("+", ",").split(",")]
+            gpu = os.getenv("OCR_EASYOCR_GPU", "0").strip() == "1"
+            reader = easyocr.Reader(langs, gpu=gpu)
+            for page in doc:
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                res = reader.readtext(img, detail=0, paragraph=True)  # list[str]
+                if res:
+                    texts.append("\n".join([r for r in res if r]))
+
+        out = "\n\n".join([t for t in texts if t and t.strip()])
+        return out.strip() or None
+    except Exception as e:
+        print(f"[OCR] try_ocr_pdf_bytes error: {e}")
         return None
