@@ -6,26 +6,25 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1
 
-# 1) 공통 런타임(빠짐없이 설치)
+# === 런타임 공통 + OCR 스택 ===
+# - ocrmypdf: 검색가능 PDF 생성 (ghostscript, qpdf 필요)
+# - tesseract-ocr + kor: 한글 OCR
+# - poppler-utils: pdf2image가 내부적으로 pdftocairo 호출
+ARG INSTALL_OCR_STACK=1
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt/lists \
     set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
       ca-certificates curl \
-      libglib2.0-0 libgl1 libsm6 libxext6; \
+      libglib2.0-0 libgl1 libsm6 libxext6 \
+      poppler-utils; \
+    if [ "$INSTALL_OCR_STACK" = "1" ]; then \
+      apt-get install -y --no-install-recommends \
+        tesseract-ocr tesseract-ocr-kor \
+        ghostscript qpdf; \
+    fi; \
     rm -rf /var/lib/apt/lists/*
-
-# # 2) (옵션) Tesseract + 한국어
-# RUN --mount=type=cache,target=/var/cache/apt \
-#     --mount=type=cache,target=/var/lib/apt/lists \
-#     set -eux; \
-#     if [ "${INSTALL_TESSERACT}" = "1" ]; then \
-#       apt-get update; \
-#       apt-get install -y --no-install-recommends \
-#         tesseract-ocr tesseract-ocr-kor; \
-#       rm -rf /var/lib/apt/lists/*; \
-#     fi
 
 # 작업 디렉토리
 WORKDIR /app

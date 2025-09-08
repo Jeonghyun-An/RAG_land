@@ -20,8 +20,7 @@ services:
       - "2380:2380"
     volumes:
       - milvus_etcd_data:/etcd
-    networks:
-      - ragnet
+    networks: [ragnet]
     healthcheck:
       # wget 대신 etcdctl로 헬스체크
       test:
@@ -64,8 +63,7 @@ services:
       - "9001:9001"
     volumes:
       - minio_data:/data
-    networks:
-      - ragnet
+    networks: [ragnet]
     healthcheck:
       # 이 이미지에 curl 있음(이미 Healthy 떴던 걸로 확인)
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
@@ -152,7 +150,7 @@ services:
       context: ..
       dockerfile: milvus-docker/Dockerfile
       # args:
-      #   INSTALL_TESSERACT: "0" # 1로 하면 tesseract-ocr-kor 포함 설치
+      # INSTALL_TESSERACT: "0" # 1로 하면 tesseract-ocr-kor 포함 설치
     container_name: fastapi
     ports:
       - "8000:8000"
@@ -207,7 +205,7 @@ services:
       # RAG 청킹/인코딩 옵션
       RAG_CHUNK_TOKENS: 320 # 청킹 토큰 수(256 최적, 지금은 임베딩 모델이 로컬용이라 구려서 낮춤)
       RAG_CHUNK_OVERLAP: 64 # 청킹 오버랩 토큰 수(64 최적)
-      RAG_MIN_CHUNK_TOKENS: 80 # 너무 작은 청크는 병합
+      RAG_MIN_CHUNK_TOKENS: 64 # 너무 작은 청크는 병합
 
       RAG_PARSE_LAYOUT: 1 # 레이아웃 인지 청킹
       RAG_PARSE_LAYOUT_MIN_CHARS: 100 # 레이아웃 인지 청킹 최소 문자 수
@@ -230,16 +228,17 @@ services:
       # --- DEBUG/로깅 ---
       DEBUG_PEEK_MAX_CHARS: 0 # 디버그용: 청크 미리보기 최대 문자 수
       # --- OCR/파서 ---
-      OCR_MODE: "auto" # auto | always | never
+      OCR_MODE: "force" # auto | always | never
       OCR_ENGINE: "easyocr" # paddle | tesseract | easyocr
-      OCR_LANG: "korean" # paddle: korean / tesseract: kor+eng / easyocr: ko,en
+      OCR_LANG: "ko,en" # paddle: korean / tesseract: kor+eng / easyocr: ko,en
+      OCR_LANGS: "kor+eng"
       OCR_DPI: "300"
       OCR_MIN_CHARS: "40"
       OCR_MIN_CHARS_PER_PAGE: "50"
-      OCR_MAX_PAGES_FOR_OCR: "500"
+      OCR_MAX_PAGES_FOR_OCR: "800"
       # tesseract 바이너리 경로가 필요하면(윈도우 베이스 아님) 비워둬도 OK
       OCR_TESSERACT_CMD: ""
-      OCR_EASYOCR_GPU: "0"
+      OCR_EASYOCR_GPU: "1"
 
       # --- 변환(pdf_converter) ---
       GOTENBERG_URL: "http://gotenberg:3000"
@@ -294,9 +293,7 @@ services:
       minio:
         condition: service_healthy
       gotenberg:
-        condition:
-          service_healthy
-          # ⚠ 로컬에서 vllm 프로필을 안 켜면 depends_on에 넣지 않음
+        condition: service_healthy
       vllm-a4000:
         condition: service_healthy
     restart: unless-stopped
