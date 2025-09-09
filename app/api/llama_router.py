@@ -244,7 +244,7 @@ def index_pdf_to_milvus(
 
         # OCR 활성 조건
         OCR_BYTES_ENABLED = (os.getenv("OCR_MODE", "auto").lower() != "off")
-        MIN_TOTAL = int(os.getenv("OCR_MIN_CHARS_TOTAL", "60"))
+        MIN_TOTAL = int(os.getenv("OCR_MIN_CHARS_TOTAL", "120"))
 
         if OCR_BYTES_ENABLED and use_bytes_path:
             total_chars = _count_chars(pages)
@@ -263,6 +263,8 @@ def index_pdf_to_milvus(
 
         # ---------- 1-2) 페이지 표준화 ----------
         pages_std = _normalize_pages_for_chunkers(pages)
+        if not any((t or "").strip() for _, t in pages_std):
+            print("[PARSE] no textual content after parsing/OCR; will use fallback if chunkers return empty")
         job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
 
         # ---------- 2) 청킹 ----------
@@ -665,18 +667,17 @@ async def upload_document(
     return UploadResp(filename=safe_name, minio_object=object_pdf, indexed="background", job_id=job_id)
 
 @router.post("/ask", response_model=AskResp)
-def ask_question(body: AskReq):
+def ask_question(req: AskReq):
     try:
         # 0) 모델/스토어 준비
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
 
         # 1) 질문 전처리(쿼리 보강) + 초기 넉넉히 검색
-        query_for_search = normalize_query(body.question)
-        raw_topk = max(20, body.top_k * 5)
+        query_for_search = normalize_query(req.question)
+        raw_topk = max(20, req.top_k * 5)
         cands = store.search(query_for_search, embed_fn=embed, topk=raw_topk)
-        
-        # 검색 결과 없음 처리 개선
+
         if not cands:
             return AskResp(
                 answer="업로드된 문서에서 관련 내용을 찾을 수 없습니다. 문서가 올바르게 인덱싱되었는지 확인해주세요.",
@@ -684,32 +685,29 @@ def ask_question(body: AskReq):
                 sources=[]
             )
 
-        # 2) 키워드 부스트(간단 가산점) — rerank 전에 상위권으로 끌어올림
-        kws = extract_keywords(body.question)
+        # 2) 키워드 부스트
+        kws = extract_keywords(req.question)
         def _kw_boost_score(c: dict) -> int:
             txt = _strip_meta_line(c.get("chunk", "")).lower()
             return sum(1 for k in kws if k.lower() in txt)
-
         for c in cands:
             c["kw_boost"] = _kw_boost_score(c)
 
         ARTICLE_BOOST = float(os.getenv("RAG_ARTICLE_BOOST", "2.5"))
-
-        m = re.search(r"제\s*(\d+)\s*조", body.question)
+        m = re.search(r"제\s*(\d+)\s*조", req.question)
         if m:
             art = m.group(1)
             patt = re.compile(rf"제\s*{art}\s*조")
             for c in cands:
                 sec = c.get("section") or ""
                 txt = c.get("chunk") or ""
-                # META 줄 제거한 본문에 대해서도 체크하고 싶으면 _strip_meta_line(txt) 사용
                 if patt.search(sec) or patt.search(txt):
                     c["kw_boost"] = c.get("kw_boost", 0.0) + ARTICLE_BOOST
-        # kw_boost 우선 → 동점 시 원래 score 유지
+
         cands.sort(key=lambda x: (x.get("kw_boost", 0), x.get("score", 0.0)), reverse=True)
 
-        # 3) 리랭크 후 상위 K
-        topk = rerank(body.question, cands, top_k=body.top_k)
+        # 3) 리랭크
+        topk = rerank(req.question, cands, top_k=req.top_k)
         if not topk:
             return AskResp(
                 answer="문서에서 신뢰할 수 있는 관련 내용을 찾지 못했습니다.",
@@ -717,8 +715,8 @@ def ask_question(body: AskReq):
                 sources=[]
             )
 
-        # 4) 임계값 컷오프(리랭커 스코어 기준) - 더 엄격하게
-        THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))  # 0.2 → 0.3으로 상향
+        # 4) 스코어 컷오프
+        THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
         if "re_score" in topk[0] and topk[0]["re_score"] < THRESH:
             return AskResp(
                 answer="문서에서 해당 질문에 대한 확실한 답변을 찾기 어렵습니다.",
@@ -726,13 +724,13 @@ def ask_question(body: AskReq):
                 sources=[]
             )
 
-        # 5) 컨텍스트 + 출처 구성 (본문만, META 제거)
+        # 5) 컨텍스트/출처 구성
         context_lines = []
         sources = []
         for i, c in enumerate(topk, 1):
             sec = (c.get("section") or "").strip()
-            body = _strip_meta_line(c.get("chunk",""))
-            body_only = f"{sec}\n{body}" if sec and not body.startswith(sec) else body
+            chunk_body = _strip_meta_line(c.get("chunk", ""))
+            body_only = f"{sec}\n{chunk_body}" if sec and not chunk_body.startswith(sec) else chunk_body
             context_lines.append(f"[{i}] (doc:{c['doc_id']} p.{c['page']} {c.get('section','')})\n{body_only}")
             sources.append({
                 "id": i,
@@ -744,12 +742,12 @@ def ask_question(body: AskReq):
             })
         context = "\n\n".join(context_lines)
 
-        # 6) 개선된 프롬프트 (반복 방지 + 간결함 강조)
+        # 6) 프롬프트
         prompt = f"""다음 문서 내용을 바탕으로 질문에 답하세요.
 
 [중요 규칙]
 - 문서에 명확한 근거가 있는 경우에만 답변하세요
-- 추측이나 일반적인 지식으로 답하지 마세요  
+- 추측이나 일반적인 지식으로 답하지 마세요
 - 답변은 2-3문장으로 간결하게 작성하세요
 - 같은 내용을 반복하지 마세요
 - 문서에서 찾을 수 없으면 "문서에서 해당 내용을 찾을 수 없습니다"라고 답하세요
@@ -758,16 +756,13 @@ def ask_question(body: AskReq):
 {context}
 
 [질문]
-{body.question}
+{req.question}
 
 [답변]"""
 
-        # 7) 모델 호출 시 추가 파라미터로 반복 방지
-        answer = generate_answer_unified(prompt, body.model_name)
-        
-        # 8) 답변 후처리 - 반복되는 패턴 제거
+        answer = generate_answer_unified(prompt, req.model_name)
         answer = _clean_repetitive_answer(answer)
-        
+
         return AskResp(answer=answer, used_chunks=len(topk), sources=sources)
 
     except HTTPException:
