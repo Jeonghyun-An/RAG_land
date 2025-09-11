@@ -1,0 +1,310 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.0
+    container_name: etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_RETENTION=1
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+      - ETCD_ENABLE_V2=true
+      - ETCD_LOG_LEVEL=info
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd:2380
+      - ETCD_INITIAL_CLUSTER=default=http://etcd:2380
+      - ETCD_NAME=default
+      - ETCDCTL_API=3
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    volumes:
+      - milvus_etcd_data:/etcd
+    networks: [ragnet]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "etcdctl",
+          "endpoint",
+          "health",
+          "--endpoints=http://127.0.0.1:2379",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    container_name: gotenberg
+    networks: [ragnet]
+    ports: []
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2023-01-20T02-05-44Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks: [ragnet]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.2.11
+    container_name: milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_USE_SSL=false
+      - MINIO_BUCKET_NAME=milvus-bucket
+      - MINIO_BUCKET=milvus-bucket
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    networks: [ragnet]
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9091/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  vllm-a4000:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-a4000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks: [ragnet]
+    ports:
+      - "8001:8000"
+    environment:
+      HUGGINGFACE_HUB_TOKEN: "${HUGGINGFACE_TOKEN}"
+      HF_TOKEN: "${HUGGINGFACE_TOKEN}"
+      HF_HOME: "/models"
+      TRANSFORMERS_OFFLINE: "0"
+      VLLM_USE_FLASHINFER: "0"
+    volumes:
+      - models_cache:/models:rw
+    command:
+      [
+        "--model",
+        "meta-llama/Llama-3.2-3B-Instruct",
+        "--served-model-name",
+        "llama-3.2-3b",
+        "--download-dir",
+        "/models",
+        "--max-model-len",
+        "4096",
+        "--dtype",
+        "float16",
+        "--gpu-memory-utilization",
+        "0.90",
+        "--max-num-seqs",
+        "12",
+      ]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  fastapi:
+    image: landsoft/rag-backend:latest # Docker Hub 이미지 사용
+    container_name: fastapi
+    ports:
+      - "8000:8000"
+    volumes:
+      - models_cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      IS_DOCKER: "true"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MILVUS_HOST: "milvus"
+      MILVUS_PORT: "19530"
+      MILVUS_COLLECTION: "rag_chunks_m3_v2"
+      RAG_JOB_STATE_PERSIST: "minio"
+      MILVUS_SECTION_MAX: "512"
+      MILVUS_DOCID_MAX: "256"
+      MILVUS_CHUNK_MAX: "8192"
+      RAG_SECTION_MAX: "200"
+      SEC_CAP: "160"
+      MILVUS_INDEX_TYPE: "HNSW"
+      MILVUS_METRIC_TYPE: "IP"
+      MILVUS_HNSW_M: "16"
+      MILVUS_HNSW_EFCON: "200"
+      MILVUS_EF_SEARCH: 384
+      MILVUS_EF_PER_K: "8"
+      MILVUS_EF_MAX: "2048"
+      RAG_TOPK_INIT: "80"
+      RAG_HYBRID_ALPHA: "0.7"
+      RAG_USE_HYBRID: 1
+      RAG_HYBRID_WEIGHT_VEC: "0.8"
+      MILVUS_SEARCH_EF: 256
+      RAG_SCORE_THRESHOLD: 0.25
+      RAG_CONTEXT_BUDGET_TOKENS: "1024"
+      RAG_RESET_COLLECTION: "0"
+      RAG_SKIP_IF_EXISTS: "0"
+      RAG_REPLACE_DOC: "1"
+      RAG_DEDUP_MANIFEST: "1"
+      RAG_UNIQUE_SUFFIX_ON_CONFLICT: "1"
+      RAG_DELETE_AFTER_INDEX: "0"
+      RAG_NO_LOCAL: "1"
+      RAG_SKIP_IF_UPLOADED: "1"
+      RAG_REPLACE_BEFORE_INSERT: "0"
+      RAG_RETRY_AFTER_DELETE: "1"
+      DOC_CONVERTER_URL:
+      RAG_CHUNK_TOKENS: 320
+      RAG_CHUNK_OVERLAP: 64
+      RAG_MIN_CHUNK_TOKENS: 64
+      RAG_PARSE_LAYOUT: 1
+      RAG_PARSE_LAYOUT_MIN_CHARS: 100
+      RAG_PARSE_LAYOUT_MAX_TOKENS: 512
+      RAG_PARSE_LAYOUT_MIN_WORDS: 8
+      RAG_PARSE_LAYOUT_MAX_WORDS: 100
+      RAG_CROSS_PAGE_CHUNK: "0"
+      RAG_STRIP_REPEAT_MINRATIO: "0.2"
+      RAG_FIX_TAIL_HEADING: "1"
+      RAG_IGNORE_RUNNING_HEADER: "1"
+      RAG_PACK_BY_ARTICLE: "0"
+      RAG_ARTICLE_TARGET_TOKENS: "800"
+      RAG_PARSE_PDF: "1"
+      RAG_PARSE_DOCX: "1"
+      RAG_PARSE_XLSX: "1"
+      RAG_PARSE_TXT: "1"
+      RAG_PARSE_HTML: "1"
+      RAG_PARSE_PPTX: "1"
+      DEBUG_PEEK_MAX_CHARS: 0
+      OCR_MODE: "force"
+      OCR_ENGINE: "easyocr"
+      OCR_LANG: "ko,en"
+      OCR_LANGS: "kor+eng"
+      OCR_DPI: "300"
+      OCR_MIN_CHARS: "40"
+      OCR_MIN_CHARS_PER_PAGE: "50"
+      OCR_MAX_PAGES_FOR_OCR: "800"
+      OCR_TESSERACT_CMD: ""
+      OCR_EASYOCR_GPU: "1"
+      GOTENBERG_URL: "http://gotenberg:3000"
+      CONVERT_BACKENDS: "gotenberg,soffice"
+      GOTENBERG_TIMEOUT: "120"
+      GOTENBERG_MAX_RETRIES: "3"
+      GOTENBERG_BACKOFF_BASE: "0.6"
+      PDF_PAPER: "A4"
+      PDF_MARGIN_MM: "10"
+      RAG_PARSE_DIRECT_DOCX: "1"
+      RAG_PARSE_DIRECT_XLSX: "1"
+      RAG_CONVERT_NONPDF_TO_PDF: "1"
+      EMBEDDING_MODEL: "BAAI/bge-m3"
+      EMBEDDING_DEVICE: "cuda"
+      EMBED_MAX_TOKENS: "512"
+      EMBED_BATCH_SIZE: "128"
+      EMBED_NUM_THREADS: "2"
+      TOKENIZER_PARALLELISM: "false"
+      EMBED_DTYPE: "auto"
+      HF_TOKENIZER_NAME: "BAAI/bge-m3"
+      RERANKER_MODEL: "BAAI/bge-reranker-v2-m3"
+      RERANKER_DEVICE: "cuda"
+      RERANKER_BACKENDS: "ce,flag"
+      RERANKER_BATCH_SIZE: "64"
+      CE_FALLBACK_MODEL: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+      MODEL_ID: "meta-llama/Llama-3.2-3B-Instruct"
+      HUGGINGFACE_TOKEN: "${HUGGINGFACE_TOKEN}"
+      PYTHONUNBUFFERED: "1"
+      OPENAI_BASE_URL: "http://vllm-a4000:8000/v1"
+      OPENAI_API_KEY: "not-used"
+      MODEL_ALIASES: >
+        {"llama-3.2-3b":"meta-llama/Llama-3.2-3B-Instruct",
+         "llama-3.2-1b":"meta-llama/Llama-3.2-1B-Instruct"}
+      USE_VLLM: "1"
+      HF_HOME: "/models"
+      OPENAI_ALIAS_URLS: >
+        {"llama-3.2-3b":"http://vllm-a4000:8000/v1"}
+      DEFAULT_MODEL_ALIAS: "llama-3.2-3b"
+    networks: [ragnet]
+    depends_on:
+      milvus:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      gotenberg:
+        condition: service_healthy
+      vllm-a4000:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nuxt:
+    image: landsoftdocker/rag-frontend:latest # Docker Hub 이미지 사용
+    container_name: nuxt
+    environment:
+      NUXT_PUBLIC_API_BASE: "/llama"
+      NITRO_HOST: "0.0.0.0"
+      NITRO_PORT: "3000"
+      PORT: "3000"
+    networks: [ragnet]
+    restart: unless-stopped
+
+  gateway:
+    image: nginx:alpine
+    container_name: gateway
+    ports:
+      - "90:80" # 팀장님 지시: 호스트 포트를 90번으로 변경
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - nuxt
+      - fastapi
+    networks: [ragnet]
+    restart: unless-stopped
+
+volumes:
+  milvus_etcd_data:
+  milvus_data:
+  minio_data:
+  models_cache:
+
+networks:
+  ragnet:
+    driver: bridge
