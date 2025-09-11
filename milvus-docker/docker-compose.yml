@@ -15,9 +15,6 @@ services:
       - ETCD_INITIAL_CLUSTER=default=http://etcd:2380
       - ETCD_NAME=default
       - ETCDCTL_API=3
-    ports:
-      - "2379:2379"
-      - "2380:2380"
     volumes:
       - milvus_etcd_data:/etcd
     networks: [ragnet]
@@ -58,9 +55,6 @@ services:
       # 최신 이미지로 바꾸면:
       # MINIO_ROOT_USER: minioadmin
       # MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
     volumes:
       - minio_data:/data
     networks: [ragnet]
@@ -86,9 +80,6 @@ services:
       - MINIO_BUCKET_NAME=milvus-bucket
       # 일부 버전에서는 이 키를 씁니다(겸사겸사 넣어도 무해)
       - MINIO_BUCKET=milvus-bucket
-    ports:
-      - "19530:19530"
-      - "9091:9091"
     volumes:
       - milvus_data:/var/lib/milvus
     networks:
@@ -110,8 +101,6 @@ services:
     container_name: vllm-a4000
     gpus: all
     networks: [ragnet]
-    ports:
-      - "8001:8000"
     environment:
       # 허깅페이스 토큰(게이팅 모델 쓸 때 필요)
       HUGGINGFACE_HUB_TOKEN: "${HUGGINGFACE_TOKEN}"
@@ -152,8 +141,6 @@ services:
       # args:
       # INSTALL_TESSERACT: "0" # 1로 하면 tesseract-ocr-kor 포함 설치
     container_name: fastapi
-    ports:
-      - "8000:8000"
     volumes:
       - ..:/app
       - ../models/.hf-cache:/models
@@ -164,10 +151,17 @@ services:
       MINIO_ENDPOINT: "minio:9000"
       MINIO_ACCESS_KEY: "minioadmin"
       MINIO_SECRET_KEY: "minioadmin"
+      MINIO_SECURE: "false" # true면 https, 내부라서 일단 false
+      # 프론트가 접근할 외부 게이트웨이
+      MINIO_PRESIGN_SCHEME: "https"
+      MINIO_PRESIGN_HOST: "gateway.example.com"
+      MINIO_PRESIGN_PATH_PREFIX: "/minio" # Nginx location /minio { proxy_pass http://minio:9000; } 같은 구조
+      # Milvus 접속 정보
       MILVUS_HOST: "milvus"
       MILVUS_PORT: "19530"
       MILVUS_COLLECTION: "rag_chunks_m3_v2"
       RAG_JOB_STATE_PERSIST: "minio"
+      # Milvus 스키마/인덱스/검색 파라미터
       MILVUS_SECTION_MAX: "512" # 섹션 최대 문자 수
       MILVUS_DOCID_MAX: "256" # doc_id 최대 문자 수
       MILVUS_CHUNK_MAX: "8192" # 청크 최대 문자 수
@@ -282,8 +276,6 @@ services:
       HF_HOME: "/models"
       OPENAI_ALIAS_URLS: >
         {"llama-3.2-3b":"http://vllm-a4000:8000/v1"}
-      # (선택) vllm 프로필을 켜면 아래 ENV도 설정
-      # (선택) 기본 별칭명도 ENV로
       DEFAULT_MODEL_ALIAS: "llama-3.2-3b"
     networks:
       - ragnet
@@ -305,3 +297,4 @@ volumes:
 
 networks:
   ragnet:
+    external: true
