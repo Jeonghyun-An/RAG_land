@@ -1,10 +1,29 @@
 # app/main.py
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from app.api.llama_router import router as llama_router
 
-app = FastAPI()
-app.include_router(llama_router, prefix="/llama")
+API_BASE = "/llama"
 
-@app.get("/")
+app = FastAPI(
+    title="RAG API",
+    docs_url=f"{API_BASE}/docs",
+    openapi_url=f"{API_BASE}/openapi.json",
+    redoc_url=None,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+app.include_router(llama_router, prefix=API_BASE)
+
+@app.get(f"{API_BASE}/healthz")
+def healthz():
+    return {"status": "ok"}
+
+@app.get("/")  # 선택
 def root():
-    return {"message": "LLaMA RAG Chatbot is running"}
+    return {"message": "ok", "docs": f"{API_BASE}/docs"}
