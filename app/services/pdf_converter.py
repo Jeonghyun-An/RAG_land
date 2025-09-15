@@ -107,6 +107,60 @@ def convert_to_pdf(src_path: str) -> str:
         raise ConvertError("변환된 PDF가 비어있습니다.")
     return str(out)
 
+import io
+
+# Gotenberg로 bytes를 직접 보내서 PDF bytes를 얻는다.
+# - 성공: PDF bytes 반환
+# - 미지원 확장자/실패: None
+def convert_bytes_to_pdf_bytes(content: bytes, src_ext: str) -> bytes | None:
+    ext = (src_ext or "").lower()
+
+    # 이미 PDF면 그대로
+    if ext == ".pdf":
+        return content
+
+    # 1) Office 류 → LibreOffice 변환
+    if ext in {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".odt", ".odp", ".ods", ".rtf"}:
+        if not _gotenberg_ok():
+            return None
+        url = f"{GOTENBERG_URL}/forms/libreoffice/convert"
+        files = {"files": (f"upload{ext}", io.BytesIO(content), "application/octet-stream")}
+        try:
+            return _post_retry(url, files)
+        except Exception:
+            return None
+
+    # 2) HTML → Chromium 변환
+    if ext in {".html", ".htm"}:
+        if not _gotenberg_ok():
+            return None
+        url = f"{GOTENBERG_URL}/forms/chromium/convert/html"
+        files = [("files", ("index.html", io.BytesIO(content), "text/html; charset=utf-8"))]
+        try:
+            return _post_retry(url, files, data=_chromium_opts())
+        except Exception:
+            return None
+
+    # 3) 단일 이미지 → 간단한 HTML로 감싸 Chromium 변환
+    if ext in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}:
+        if not _gotenberg_ok():
+            return None
+        url = f"{GOTENBERG_URL}/forms/chromium/convert/html"
+        html = (b'<!doctype html><meta charset="utf-8">'
+                b'<style>html,body{margin:0;padding:0}img{width:100%;height:auto}</style>'
+                b'<img src="file.bin">')
+        files = [
+            ("files", ("index.html", io.BytesIO(html), "text/html; charset=utf-8")),
+            ("files", ("file.bin", io.BytesIO(content), "application/octet-stream")),
+        ]
+        try:
+            return _post_retry(url, files, data=_chromium_opts(no_margins=True))
+        except Exception:
+            return None
+
+    # 4) 미지원 (예: .hwpx, .hwp 등) → None
+    return None
+
 # ---------- converters ----------
 def _libreoffice_to_pdf(src: Path, out: Path):
     if not _gotenberg_ok():
