@@ -7,8 +7,6 @@ import os, re
 import uuid
 from urllib.parse import unquote, quote
 from typing import List, Optional
-from starlette.responses import FileResponse
-from starlette.background import BackgroundTask
 from starlette.responses import StreamingResponse
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
@@ -26,13 +24,10 @@ from app.services.file_parser import (
 )
 from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
-from app.services.pdf_converter import convert_to_pdf, ConvertError
-from app.services.chunker import smart_chunk_pages, smart_chunk_pages_plus
-from app.services.layout_chunker import layout_aware_chunks
+from app.services.pdf_converter import convert_stream_to_pdf_bytes, convert_to_pdf,convert_bytes_to_pdf_bytes, ConvertError
 from app.services.milvus_store_v2 import MilvusStoreV2
-from app.services.embedding_model import get_embedding_model, embed, get_sentence_embedding_dimension
+from app.services.embedding_model import get_embedding_model, embed
 from app.services.reranker import rerank
-from app.services.ocr_service import try_ocr_pdf_bytes  
 
 router = APIRouter(tags=["llama"])
 
@@ -164,6 +159,11 @@ def _make_encoder():
             return []
         return tok.encode(s, add_special_tokens=False) or []
     return enc, max_len
+
+def _sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
 
 def index_pdf_to_milvus(
     job_id: str,
@@ -476,8 +476,6 @@ def _content_disposition(disposition: str, filename: str) -> str:
     utf8_quoted = quote(filename)  # UTF-8 percent-encode
     return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{utf8_quoted}"
 
-
-
 def _strip_meta_line(chunk_text: str) -> str:
     """청크 맨 위 META: 라인을 제거하고 본문만 반환"""
     t = chunk_text or ""
@@ -533,104 +531,95 @@ def generate(body: GenerateReq):
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    mode: str = Query("version", regex="^(skip|version|replace)$"),  
+    mode: str = Query("version", regex="^(skip|version|replace)$"),
 ):
-    # 1) 로컬 저장
-    safe_name = os.path.basename(file.filename)
-    local_path = os.path.join(UPLOAD_DIR, safe_name)
+    # 0) 업로드 원본을 메모리로 읽음
+    safe_name = os.path.basename(file.filename or "upload.bin")
+    orig_ct = file.content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
     content = await file.read()
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    with open(local_path, "wb") as f:
-        f.write(content)
+    if not content:
+        raise HTTPException(400, "빈 파일입니다.")
 
-    # 1-1) 원본 MinIO 업로드 (중복/충돌 처리)
-    minio = MinIOStore()
-    object_orig = f"uploaded/originals/{safe_name}"
-    if minio.exists(object_orig):
+    m = MinIOStore()
+
+    # 1) 비-PDF → PDF bytes 변환 (DOC_CONVERTER_URL 있으면 스트림 변환, 없으면 임시파일-폴백)
+    src_ext = os.path.splitext(safe_name)[1].lower()
+    # 1순위: Gotenberg 바이트 변환 (완전 무-디스크)
+    pdf_bytes: bytes | None = None
+    if src_ext == ".pdf":
+        pdf_bytes = content
+    else:
+        pdf_bytes = convert_bytes_to_pdf_bytes(content, src_ext)
+    
+    # 2순위: 사내/외부 컨버터 (DOC_CONVERTER_URL), 있으면 사용
+    if pdf_bytes is None and src_ext != ".pdf":
         try:
-            rsize = minio.size(object_orig)
+            pdf_bytes = convert_stream_to_pdf_bytes(content, src_ext)
         except Exception:
-            rsize = -1
-        lsize = os.path.getsize(local_path)
-        if rsize != lsize:
-            object_orig = f"uploaded/originals/{uuid.uuid4().hex}_{safe_name}"
-    orig_ct = file.content_type or mimetypes.guess_type(local_path)[0] or "application/octet-stream"
-    # 원본 업로드 (항상 보관)
-    minio.upload(local_path, object_name=object_orig, content_type=orig_ct)
-
-    # 2) 비-PDF면 PDF로 변환
-    try:
-        pdf_path = convert_to_pdf(local_path)
-    except ConvertError as e:
-        raise HTTPException(400, f"파일 변환 실패: {e}")
-    except Exception as e:
-        raise HTTPException(500, f"파일 변환 중 예외: {e}")
-
-    # 2-1) PDF 해시
-    def _sha256_file(path: str) -> str:
-        h = hashlib.sha256()
-        with open(path, "rb") as fp:
-            for chunk in iter(lambda: fp.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
-
-    pdf_sha = _sha256_file(pdf_path)
+            pdf_bytes = None
+    
+    # 3순위: 임시폴더 폴백 (convert_to_pdf) → 변환 후 즉시 삭제
+    if pdf_bytes is None:
+        with tempfile.TemporaryDirectory() as td:
+            src_path = os.path.join(td, safe_name)
+            with open(src_path, "wb") as f:
+                f.write(content)
+            out_path = convert_to_pdf(src_path)
+            with open(out_path, "rb") as f:
+                pdf_bytes = f.read()
+    # 2) 해시/중복판정
+    pdf_filename = safe_name if src_ext == ".pdf" else (os.path.splitext(safe_name)[0] + ".pdf")
+    pdf_sha = _sha256_bytes(pdf_bytes)
     hash_flag_key = f"uploaded/__hash__/sha256/{pdf_sha}.flag"
-
-    # 3) PDF 업로드 (기존 로직 유지 + 충돌 처리)
-    pdf_name = os.path.basename(pdf_path)
-    object_pdf = f"uploaded/{pdf_name}"
+    object_pdf = f"uploaded/{pdf_filename}"
     uploaded = True
     duplicate_reason = None
 
-    if minio.exists(hash_flag_key):
+    if m.exists(hash_flag_key):
         uploaded = False
         duplicate_reason = "same_content_hash"
-        print(f"[UPLOAD] dedup by hash: {hash_flag_key}")
-        # mode=skip 이면 여기서 바로 '스킵'으로 표시(색인 단계에서 참조)
 
-    # 기존: 이름 같고, 사이즈 같으면 스킵 
-    if uploaded and minio.exists(object_pdf):
+    if uploaded and m.exists(object_pdf):
         try:
-            remote_size = minio.size(object_pdf)
+            remote_size = m.size(object_pdf)
         except Exception:
             remote_size = -1
-        local_size = os.path.getsize(pdf_path)
-
+        local_size = len(pdf_bytes)
         if remote_size == local_size and remote_size > -1:
             uploaded = False
-            duplicate_reason = duplicate_reason or "same_name_and_size"
-            print(f"[UPLOAD] dedup hit: {object_pdf} (same name & size)")
+            duplicate_reason = (duplicate_reason or "same_name_and_size")
         else:
-            # 이름은 같지만 사이즈 다르면
-            if mode == "replace":  # 동일 키로 덮어쓰기 (=교체)
-                minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
-                print(f"[UPLOAD] replaced existing: {object_pdf}")
+            if mode == "replace":
+                m.upload_bytes(pdf_bytes, object_name=object_pdf, content_type="application/pdf", length=len(pdf_bytes))
             else:
-                # 기존 동작: 충돌 회피용 새 키로 저장(버전 관리)
-                object_pdf = f"uploaded/{uuid.uuid4().hex}_{pdf_name}"
-                minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
-                print(f"[UPLOAD] name match but size differs -> stored as: {object_pdf}")
+                object_pdf = f"uploaded/{uuid.uuid4().hex}_{pdf_filename}"
+                m.upload_bytes(pdf_bytes, object_name=object_pdf, content_type="application/pdf", length=len(pdf_bytes))
     elif uploaded:
-        # 최초 업로드
-        minio.upload(pdf_path, object_name=object_pdf, content_type="application/pdf")
-        print(f"[UPLOAD] stored: {object_pdf}")
+        m.upload_bytes(pdf_bytes, object_name=object_pdf, content_type="application/pdf", length=len(pdf_bytes))
 
-    # 3-1) 해시 플래그 기록 (기존 유지)
+    # 2-1) 해시 플래그(바이트 직업로드: 로컬 파일 사용하지 않음)
     try:
-        if uploaded and not minio.exists(hash_flag_key):
-            flag_local = os.path.join(UPLOAD_DIR, "__hashflags__", f"{pdf_sha}.flag")
-            os.makedirs(os.path.dirname(flag_local), exist_ok=True)
-            with open(flag_local, "wb") as ff:
-                ff.write(b"1")
-            minio.upload(flag_local, object_name=hash_flag_key, content_type="text/plain")
-            print(f"[UPLOAD] hash flag written: {hash_flag_key}")
+        if uploaded and not m.exists(hash_flag_key):
+            m.upload_bytes(b"1", object_name=hash_flag_key, content_type="text/plain", length=1)
     except Exception as e:
+        # 치명적 아님
         print(f"[UPLOAD] warn: failed to write hash flag: {e}")
 
-    # === NEW: PDF↔원본 매핑 메타 저장 (sidecar JSON) ===
+    # 3) doc_id 결정 및 ‘원본’ 바이트 업로드 (문서별 폴더로)
+    doc_id = os.path.splitext(os.path.basename(object_pdf))[0]
+    object_orig = f"uploaded/originals/{doc_id}/{safe_name}"
+    if m.exists(object_orig):
+        try:
+            rsize = m.size(object_orig)
+        except Exception:
+            rsize = -1
+        if rsize != len(content):
+            object_orig = f"uploaded/originals/{doc_id}/{uuid.uuid4().hex}_{safe_name}"
+
+    m.upload_bytes(content, object_name=object_orig, content_type=orig_ct, length=len(content))
+
+    # 4) 매핑 메타 JSON
     try:
-        doc_id = os.path.splitext(os.path.basename(object_pdf))[0]
         meta = {
             "pdf": object_pdf,
             "original": object_orig,
@@ -641,13 +630,11 @@ async def upload_document(
             "mode": mode,
         }
         meta_key = f"uploaded/__meta__/{doc_id}.json"
-        minio.put_json(meta_key, meta)
+        m.put_json(meta_key, meta)
     except Exception as e:
         print(f"[UPLOAD] warn: failed to write meta json: {e}")
-        # 메타 실패는 치명적 아님
 
-    # 인덱싱(백그라운드) 이하 기존 유지
-    doc_id = os.path.splitext(os.path.basename(object_pdf))[0]
+    # 5) 백그라운드 인덱싱 (MinIO bytes 경로만 넘김)
     job_id = uuid.uuid4().hex
     job_state.start(job_id, doc_id=doc_id, minio_object=object_pdf)
     job_state.update(
@@ -661,8 +648,7 @@ async def upload_document(
         duplicate_reason=duplicate_reason,
         uploaded=uploaded,
     )
-
-    background_tasks.add_task(index_pdf_to_milvus, job_id, pdf_path, object_pdf, uploaded, False, doc_id)
+    background_tasks.add_task(index_pdf_to_milvus, job_id, None, object_pdf, uploaded, False, doc_id)
 
     return UploadResp(filename=safe_name, minio_object=object_pdf, indexed="background", job_id=job_id)
 
@@ -887,19 +873,20 @@ def get_file_presigned(
     if not m.exists(key):
         raise HTTPException(404, f"object not found: {key}")
 
-    headers = None
-    if download_name:
-        disp = "inline" if inline else "attachment"
-        headers = {"response-content-disposition": f'{disp}; filename="{download_name}"'}
-
     try:
-        url = m.presigned_url(key, method="GET", expires=timedelta(minutes=minutes), response_headers=headers)
+        if inline:
+            url = m.presign_view(key, filename=download_name, ttl_seconds=minutes * 60)
+        else:
+            url = m.presign_download(key, filename=download_name, ttl_seconds=minutes * 60)
         return {"url": url}
     except Exception as e:
         raise HTTPException(500, f"presign failed: {e}")
 
+# 기존
+# @router.get("/docs")
+# def list_docs():
 
-@router.get("/docs")
+@router.get("/rag/docs")
 def list_docs():
     """
     변환 PDF와 원본 파일의 매핑을 반환.
@@ -913,8 +900,7 @@ def list_docs():
     """
     m = MinIOStore()
     try:
-        # 업로드된 PDF 목록(내부키/원본 디렉토리 제외)
-        all_keys = m.list("uploaded/")
+        all_keys = m.list_files("uploaded/")
     except Exception as e:
         raise HTTPException(500, f"minio list failed: {e}")
 
@@ -930,9 +916,10 @@ def list_docs():
 
     items = []
     for k in pdf_keys:
-        base = os.path.basename(k)             # foo.pdf
-        doc_id = os.path.splitext(base)[0]     # foo
+        base = os.path.basename(k)
+        doc_id = os.path.splitext(base)[0]
         meta_key = f"uploaded/__meta__/{doc_id}.json"
+
         meta = None
         if m.exists(meta_key):
             try:
@@ -940,34 +927,62 @@ def list_docs():
             except Exception:
                 meta = None
 
-        original_key = None
-        original_name = None
-        uploaded_at = None
-        if meta:
-            original_key = meta.get("original")
-            original_name = meta.get("original_name")
-            uploaded_at = meta.get("uploaded_at")
+        original_key = meta.get("original") if meta else None
+        original_name = meta.get("original_name") if meta else None
+        uploaded_at = meta.get("uploaded_at") if meta else None
 
-        # 원본 키가 실제로 존재하는지 한 번 더 확인
-        if original_key and not m.exists(original_key):
-            original_key = None
+        # ✅ original_key 보정: 메타 경로가 없거나 존재하지 않으면 패턴별로 재탐색
+        def _resolve_original() -> Optional[str]:
+            # 1) 메타에 있는 경로가 정상이면 그걸 사용
+            if original_key and m.exists(original_key):
+                return original_key
+            # 2) 표준 폴더 패턴: uploaded/originals/{doc_id}/{original_name}
+            if original_name:
+                cand1 = f"uploaded/originals/{doc_id}/{original_name}"
+                if m.exists(cand1):
+                    return cand1
+                # 3) 레거시 평면 패턴: uploaded/originals/{original_name}
+                cand2 = f"uploaded/originals/{original_name}"
+                if m.exists(cand2):
+                    return cand2
+            # 4) 폴더 스캔(혹시 이름이 바뀐 경우)
+            cands = m.list_files(f"uploaded/originals/{doc_id}/")
+            if cands:
+                return cands[0]
+            return None
 
-        # 사용자 표시용 타이틀: 원본 이름이 있으면 그걸 우선
+        resolved_orig = _resolve_original()
+        if resolved_orig:
+            original_key = resolved_orig
+            if not original_name:
+                original_name = os.path.basename(resolved_orig)
+
         title = original_name or base
-
         is_pdf_original = bool(original_key and original_key.lower().endswith(".pdf"))
 
         items.append({
             "doc_id": doc_id,
             "title": title,
-            "object_key": k,                 # 변환 PDF
-            "original_key": original_key,    # 원본 (없을 수 있음)
-            "original_name": original_name,  # 원본 파일명
+            "object_key": k,                  # 변환 PDF (뷰어용)
+            "original_key": original_key,     # 원본 (다운로드용)
+            "original_name": original_name,
             "is_pdf_original": is_pdf_original,
             "uploaded_at": uploaded_at,
         })
 
     return {"docs": items}
+
+# 메타 JSON 단건 조회 추가(디버그/점검용)
+@router.get("/rag/meta/{doc_id}")
+def get_meta(doc_id: str):
+    m = MinIOStore()
+    key = f"uploaded/__meta__/{doc_id}.json"
+    if not m.exists(key):
+        raise HTTPException(404, f"meta not found for {doc_id}")
+    try:
+        return m.get_json(key)
+    except Exception as e:
+        raise HTTPException(500, f"read meta failed: {e}")
 
 @router.get("/status")
 def status():
