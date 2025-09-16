@@ -13,8 +13,8 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks,
 from pydantic import BaseModel
 import asyncio, json
 from sse_starlette.sse import EventSourceResponse  # ✅ 요구사항: sse-starlette
-from app.services import job_state
-from datetime import datetime, timedelta
+from app.services import job_state, milvus_store
+from datetime import datetime, timedelta, timezone
 
 from app.services.file_parser import (
     parse_pdf,                    # (local path) -> [(page_no, text)]
@@ -164,6 +164,14 @@ def _sha256_bytes(b: bytes) -> str:
     h = hashlib.sha256()
     h.update(b)
     return h.hexdigest()
+
+def meta_key(doc_id: str) -> str:
+    # 폴더형 메타(권장)
+    return f"uploaded/__meta__/{doc_id}/meta.json"
+
+def legacy_meta_key(doc_id: str) -> str:
+    # 네가 기존에 쓰던 단일 파일형도 읽기 폴백
+    return f"uploaded/__meta__/{doc_id}.json"
 
 def index_pdf_to_milvus(
     job_id: str,
@@ -449,7 +457,32 @@ def index_pdf_to_milvus(
                 os.remove(file_path)
             except Exception:
                 pass
+        # TOTAL 청크 수 집계    
+        total = len(chunks) if isinstance(chunks, list) else None
 
+        if total is None:
+            try:
+                total = milvus_store.count_by_doc(doc_id)  # 네가 가진 카운트 함수
+            except Exception:
+                total = None
+    
+        # 메타 갱신
+        try:
+            store = MinIOStore()
+            meta = {}
+            try:
+                meta = store.get_json(meta_key(doc_id))
+            except Exception:
+                meta = {}
+    
+            meta = dict(meta or {})
+            if total is not None:
+                meta["chunk_count"] = int(total)
+    
+            store.put_json(meta_key(doc_id), meta)
+        except Exception as e:
+            print(f"[INDEXER] warn: failed to update meta chunk_count: {e}")
+    
         # ---------- 7) 완료 ----------
         job_state.complete(
             job_id,
@@ -617,20 +650,24 @@ async def upload_document(
             object_orig = f"uploaded/originals/{doc_id}/{uuid.uuid4().hex}_{safe_name}"
 
     m.upload_bytes(content, object_name=object_orig, content_type=orig_ct, length=len(content))
-
+    is_pdf_original = (src_ext == ".pdf")
     # 4) 매핑 메타 JSON
     try:
         meta = {
-            "pdf": object_pdf,
-            "original": object_orig,
+            "doc_id": doc_id,
+            "title": safe_name,                # 보기용
+            "pdf_key": object_pdf,             # ← 키 이름을 pdf_key로 통일
+            "original_key": object_orig,       # ← original_key 통일
             "original_name": safe_name,
-            "original_mime": orig_ct,
+            "is_pdf_original": is_pdf_original,
             "sha256": pdf_sha,
-            "uploaded_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            # 업로드 시간은 UTC로 저장(프런트에서 KST로 렌더 추천)
+            "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "mode": mode,
+            # 아직 모름 → 나중에 인덱서가 덮어씀
+            # "chunk_count": null
         }
-        meta_key = f"uploaded/__meta__/{doc_id}.json"
-        m.put_json(meta_key, meta)
+        m.put_json(meta_key(doc_id), meta)
     except Exception as e:
         print(f"[UPLOAD] warn: failed to write meta json: {e}")
 
@@ -807,14 +844,43 @@ def list_jobs(status: Optional[str] = Query(None), limit: int = Query(50, ge=1, 
 
 @router.get("/doc/{doc_id}")
 def doc_status(doc_id: str):
+    s = MinIOStore()
+
+    # 1) 메타 우선 (신규 경로)
+    try:
+        if s.exists(meta_key(doc_id)):
+            meta = s.get_json(meta_key(doc_id))
+        elif s.exists(legacy_meta_key(doc_id)):  # 구버전 파일형 폴백
+            meta = s.get_json(legacy_meta_key(doc_id))
+        else:
+            meta = None
+    except Exception:
+        meta = None
+
+    if isinstance(meta, dict):
+        # 키 호환(pdf/pdf_key, original/original_key 등) 처리
+        chunk_count = meta.get("chunk_count")
+        if isinstance(chunk_count, int):
+            return {"doc_id": doc_id, "chunks": chunk_count, "indexed": chunk_count > 0}
+
+    # 2) 폴백: Milvus에서 세고 메타에 캐시
     try:
         model = get_embedding_model()
-        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-        cnt = store.count_by_doc(doc_id)
-        return {"doc_id": doc_id, "chunks": cnt, "indexed": cnt > 0}
+        m = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
+        total = m.count_by_doc(doc_id)
+
+        # 메타에 캐시
+        try:
+            meta = (s.get_json(meta_key(doc_id)) if s.exists(meta_key(doc_id)) else {}) or {}
+            meta["doc_id"] = doc_id
+            meta["chunk_count"] = int(total)
+            s.put_json(meta_key(doc_id), meta)
+        except Exception:
+            pass
+
+        return {"doc_id": doc_id, "chunks": total, "indexed": total > 0}
     except Exception as e:
-        raise HTTPException(500, f"Milvus 조회 실패: {e}")
-    
+        raise HTTPException(500, f"doc status 실패: {e}")
 
 
 # ========== SSE Stream for Job Status =========
@@ -1136,16 +1202,44 @@ def debug_milvus_peek(limit: int = 100, full: bool = True, max_chars:int|None = 
         raise HTTPException(500, f"Milvus peek 실패: {e}")
 
 @router.get("/debug/milvus/by-doc")
-def debug_milvus_by_doc(doc_id: str, limit: int = 10, full: bool = False, max_chars:int|None = None):
+def debug_milvus_by_doc(
+    doc_id: str,
+    limit: int = 100,
+    full: bool = False,
+    max_chars: int | None = None
+):
+    items: list = []            # 미리 초기화 (UnboundLocalError 방지)
+    total: int | None = None
+
     try:
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-        if full:
+
+        # 길이 트렁케이션 제어
+        if full or max_chars == 0:
             os.environ["DEBUG_PEEK_MAX_CHARS"] = "0"
         elif max_chars is not None:
             os.environ["DEBUG_PEEK_MAX_CHARS"] = str(max_chars)
-        return {"items": store.query_by_doc(doc_id=doc_id, limit=limit)}
+
+        # 데이터 조회
+        items = store.query_by_doc(doc_id=doc_id, limit=limit)
+
+        # 총 개수(가능하면)
+        try:
+            total = store.count_by_doc(doc_id)
+        except Exception:
+            total = None
+
+        # 항상 동일한 스키마로 반환
+        return {
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "doc_id": doc_id,
+        }
+
     except Exception as e:
+        # 여기서는 로컬 변수 참조 금지!
         raise HTTPException(500, f"Milvus by-doc 실패: {e}")
 
 @router.get("/debug/search")
