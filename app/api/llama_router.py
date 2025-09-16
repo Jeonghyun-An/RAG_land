@@ -166,11 +166,9 @@ def _sha256_bytes(b: bytes) -> str:
     return h.hexdigest()
 
 def meta_key(doc_id: str) -> str:
-    # 폴더형 메타(권장)
     return f"uploaded/__meta__/{doc_id}/meta.json"
 
 def legacy_meta_key(doc_id: str) -> str:
-    # 네가 기존에 쓰던 단일 파일형도 읽기 폴백
     return f"uploaded/__meta__/{doc_id}.json"
 
 def index_pdf_to_milvus(
@@ -462,24 +460,29 @@ def index_pdf_to_milvus(
 
         if total is None:
             try:
-                total = milvus_store.count_by_doc(doc_id)  # 네가 가진 카운트 함수
+                total = milvus_store.count_by_doc(doc_id) 
             except Exception:
                 total = None
     
         # 메타 갱신
         try:
-            store = MinIOStore()
+            mstore = MinIOStore()
             meta = {}
             try:
-                meta = store.get_json(meta_key(doc_id))
+                if mstore.exists(meta_key(doc_id)):
+                    meta = mstore.get_json(meta_key(doc_id))
+                elif mstore.exists(legacy_meta_key(doc_id)):
+                    meta = mstore.get_json(legacy_meta_key(doc_id))
             except Exception:
                 meta = {}
-    
+
             meta = dict(meta or {})
             if total is not None:
                 meta["chunk_count"] = int(total)
-    
-            store.put_json(meta_key(doc_id), meta)
+            meta["indexed"] = True
+            meta["last_indexed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            mstore.put_json(meta_key(doc_id), meta)
         except Exception as e:
             print(f"[INDEXER] warn: failed to update meta chunk_count: {e}")
     
@@ -954,16 +957,6 @@ def get_file_presigned(
 
 @router.get("/rag/docs")
 def list_docs():
-    """
-    변환 PDF와 원본 파일의 매핑을 반환.
-    - doc_id: PDF 파일명(확장자 제외)
-    - title: 사용자에게 보일 이름 (원본 이름이 있으면 원본명, 없으면 PDF 파일명)
-    - object_key: 변환 PDF의 MinIO 키 (uploaded/...)
-    - original_key: 원본의 MinIO 키 (uploaded/originals/...), 없으면 None
-    - original_name: 원본 파일명 (예: .docx)
-    - is_pdf_original: 원본도 pdf인지 여부
-    - uploaded_at: 메타에 기록된 업로드 시간
-    """
     m = MinIOStore()
     try:
         all_keys = m.list_files("uploaded/")
@@ -984,34 +977,35 @@ def list_docs():
     for k in pdf_keys:
         base = os.path.basename(k)
         doc_id = os.path.splitext(base)[0]
-        meta_key = f"uploaded/__meta__/{doc_id}.json"
 
         meta = None
-        if m.exists(meta_key):
-            try:
-                meta = m.get_json(meta_key)
-            except Exception:
-                meta = None
+        try:
+            if m.exists(meta_key(doc_id)):
+                meta = m.get_json(meta_key(doc_id))
+            elif m.exists(legacy_meta_key(doc_id)):
+                meta = m.get_json(legacy_meta_key(doc_id))
+        except Exception:
+            meta = None
 
-        original_key = meta.get("original") if meta else None
-        original_name = meta.get("original_name") if meta else None
-        uploaded_at = meta.get("uploaded_at") if meta else None
+        # 메타에서 원본 정보 꺼낼 때 키 호환
+        original_key = None
+        original_name = None
+        uploaded_at = None
+        if isinstance(meta, dict):
+            original_key = meta.get("original_key") or meta.get("original")
+            original_name = meta.get("original_name")
+            uploaded_at = meta.get("uploaded_at")
 
-        # ✅ original_key 보정: 메타 경로가 없거나 존재하지 않으면 패턴별로 재탐색
         def _resolve_original() -> Optional[str]:
-            # 1) 메타에 있는 경로가 정상이면 그걸 사용
             if original_key and m.exists(original_key):
                 return original_key
-            # 2) 표준 폴더 패턴: uploaded/originals/{doc_id}/{original_name}
             if original_name:
                 cand1 = f"uploaded/originals/{doc_id}/{original_name}"
                 if m.exists(cand1):
                     return cand1
-                # 3) 레거시 평면 패턴: uploaded/originals/{original_name}
                 cand2 = f"uploaded/originals/{original_name}"
                 if m.exists(cand2):
                     return cand2
-            # 4) 폴더 스캔(혹시 이름이 바뀐 경우)
             cands = m.list_files(f"uploaded/originals/{doc_id}/")
             if cands:
                 return cands[0]
@@ -1023,14 +1017,14 @@ def list_docs():
             if not original_name:
                 original_name = os.path.basename(resolved_orig)
 
-        title = original_name or base
+        title = (isinstance(meta, dict) and meta.get("title")) or original_name or base
         is_pdf_original = bool(original_key and original_key.lower().endswith(".pdf"))
 
         items.append({
             "doc_id": doc_id,
             "title": title,
-            "object_key": k,                  # 변환 PDF (뷰어용)
-            "original_key": original_key,     # 원본 (다운로드용)
+            "object_key": k,                  # 변환 PDF
+            "original_key": original_key,     # 원본 (있으면)
             "original_name": original_name,
             "is_pdf_original": is_pdf_original,
             "uploaded_at": uploaded_at,
@@ -1038,17 +1032,14 @@ def list_docs():
 
     return {"docs": items}
 
-# 메타 JSON 단건 조회 추가(디버그/점검용)
 @router.get("/rag/meta/{doc_id}")
 def get_meta(doc_id: str):
     m = MinIOStore()
-    key = f"uploaded/__meta__/{doc_id}.json"
-    if not m.exists(key):
-        raise HTTPException(404, f"meta not found for {doc_id}")
-    try:
-        return m.get_json(key)
-    except Exception as e:
-        raise HTTPException(500, f"read meta failed: {e}")
+    if m.exists(meta_key(doc_id)):
+        return m.get_json(meta_key(doc_id))
+    if m.exists(legacy_meta_key(doc_id)):
+        return m.get_json(legacy_meta_key(doc_id))
+    raise HTTPException(404, f"meta not found for {doc_id}")
 
 @router.get("/status")
 def status():
