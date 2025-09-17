@@ -284,6 +284,21 @@ def index_pdf_to_milvus(
         overlap_tokens = int(os.getenv("RAG_CHUNK_OVERLAP", str(default_overlap)))
 
         chunks: list[tuple[str, dict]] | None = None
+        
+        # 2-0) 법령/규정 전용 청커 (최우선)
+        try:
+            from app.services.law_chunker import law_chunk_pages  # ← 새 파일
+            # 법령/규정 문서가 아닐 수도 있지만, 시도해서 빈 결과면 기존 흐름으로 자동 폴백
+            law_chunks = law_chunk_pages(
+                pages_std, enc,
+                target_tokens=target_tokens, overlap_tokens=overlap_tokens,
+                layout_blocks=layout_map,
+                min_chunk_tokens=int(os.getenv("RAG_MIN_CHUNK_TOKENS", "100")),
+            )
+            if law_chunks:
+                chunks = law_chunks
+        except Exception as e0:
+            print(f"[CHUNK] law_chunker failed: {e0}")
 
         # 2-1) 레이아웃 인지 청킹
         try:
