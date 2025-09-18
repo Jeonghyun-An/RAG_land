@@ -212,6 +212,14 @@ services:
       RAG_IGNORE_RUNNING_HEADER: "1" # 러닝헤더/푸터 제거
       RAG_PACK_BY_ARTICLE: "0" # 조문 단위로 묶고 싶을 때만 1
       RAG_ARTICLE_TARGET_TOKENS: "800"
+      # --- 법 조항 청커 옵션 ---
+      LAW_HEADER_DENY_KEYWORDS: ""
+      LAW_HEADER_TOP_K: "5"
+      LAW_HEADER_BOTTOM_K: "5"
+      LAW_MIN_HEADER_REPEAT: "2"
+      LAW_GLOBAL_MIN_REPEAT: "2"
+      LAW_GLOBAL_MINLEN: "3"
+      LAW_GLOBAL_MAXLEN: "140"
       # --- RAG 청킹/인코딩 옵션 ---
       RAG_PARSE_PDF: "1" # PDF 파싱 여부
       RAG_PARSE_DOCX: "1" # DOCX 파싱 여부
