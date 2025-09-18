@@ -197,9 +197,9 @@ services:
       RAG_RETRY_AFTER_DELETE: "1" # 삭제 후 재삽입 시도
       DOC_CONVERTER_URL:
       # RAG 청킹/인코딩 옵션
-      RAG_CHUNK_TOKENS: 512 # 청킹 토큰 수(256 최적, 지금은 임베딩 모델이 로컬용이라 구려서 낮춤)
-      RAG_CHUNK_OVERLAP: 96 # 청킹 오버랩 토큰 수(64 최적)
-      RAG_MIN_CHUNK_TOKENS: 100 # 너무 작은 청크는 병합
+      RAG_CHUNK_TOKENS: 600 # 청킹 토큰 수(256 최적, 지금은 임베딩 모델이 로컬용이라 구려서 낮춤)
+      RAG_CHUNK_OVERLAP: 120 # 청킹 오버랩 토큰 수(64 최적)
+      RAG_MIN_CHUNK_TOKENS: 150 # 너무 작은 청크는 병합
 
       RAG_PARSE_LAYOUT: 1 # 레이아웃 인지 청킹
       RAG_PARSE_LAYOUT_MIN_CHARS: 100 # 레이아웃 인지 청킹 최소 문자 수
@@ -214,8 +214,8 @@ services:
       RAG_ARTICLE_TARGET_TOKENS: "800"
       # --- 법 조항 청커 옵션 ---
       LAW_HEADER_DENY_KEYWORDS: ""
-      LAW_HEADER_TOP_K: "5"
-      LAW_HEADER_BOTTOM_K: "5"
+      LAW_HEADER_TOP_K: "3"
+      LAW_HEADER_BOTTOM_K: "3"
       LAW_MIN_HEADER_REPEAT: "2"
       LAW_GLOBAL_MIN_REPEAT: "2"
       LAW_GLOBAL_MINLEN: "3"

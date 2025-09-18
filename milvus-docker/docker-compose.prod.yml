@@ -144,7 +144,7 @@ services:
     restart: unless-stopped
 
   fastapi:
-    image: landsoft/rag-backend:latest # Docker Hub 이미지 사용
+    image: landsoftdocker/rag-backend:latest # Docker Hub 이미지 사용
     container_name: fastapi
     ports:
       - "8000:8000"
@@ -198,7 +198,7 @@ services:
       DOC_CONVERTER_URL:
       RAG_CHUNK_TOKENS: 320
       RAG_CHUNK_OVERLAP: 64
-      RAG_MIN_CHUNK_TOKENS: 64
+      RAG_MIN_CHUNK_TOKENS: 150
       RAG_PARSE_LAYOUT: 1
       RAG_PARSE_LAYOUT_MIN_CHARS: 100
       RAG_PARSE_LAYOUT_MAX_TOKENS: 512
