@@ -1,5 +1,7 @@
 # app/services/ocr_service.py
 from __future__ import annotations
+import math
+import re
 import os, subprocess
 from pathlib import Path
 from typing import Tuple, Dict
@@ -142,7 +144,6 @@ def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str | None:
         print(f"[OCR] try_ocr_pdf_bytes error: {e}")
         return None
     
-    import math, re
 from collections import Counter
 
 def _bbox_angle_deg(box):
