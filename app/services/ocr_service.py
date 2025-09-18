@@ -141,3 +141,54 @@ def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str | None:
     except Exception as e:
         print(f"[OCR] try_ocr_pdf_bytes error: {e}")
         return None
+    
+    import math, re
+from collections import Counter
+
+def _bbox_angle_deg(box):
+    # EasyOCR box: 4 points [(x1,y1),(x2,y2),(x3,y3),(x4,y4)]
+    (x1,y1),(x2,y2),(x3,y3),(x4,y4) = box
+    dx, dy = x2-x1, y2-y1
+    return abs(math.degrees(math.atan2(dy, dx)))
+
+def _bbox_area(box):
+    xs = [p[0] for p in box]; ys = [p[1] for p in box]
+    return (max(xs)-min(xs)) * (max(ys)-min(ys))
+
+def _normalize_watermark_text(s):
+    t = re.sub(r"\s+", "", s or "")
+    t = re.sub(r"[^\w가-힣]", "", t)
+    return t.lower()
+
+def filter_watermarks(easyocr_results_by_page, page_w, page_h):
+    """
+    easyocr_results_by_page: list[ list[(box, text, conf)] ]
+    반환: 동일 구조, 워터마크 후보 제거됨
+    """
+    # 1) 후보 수집: 각도 20~70°, 큰 박스(페이지 면적 대비 10%+)
+    cand = []
+    for pno, items in enumerate(easyocr_results_by_page, start=1):
+        for box, text, conf in items:
+            ang = _bbox_angle_deg(box)
+            if 20 <= ang <= 70:
+                area = _bbox_area(box)
+                if area >= 0.10 * (page_w * page_h):
+                    cand.append((_normalize_watermark_text(text), pno))
+
+    # 2) 전역 반복 텍스트만 워터마크로 확정(최소 3페이지 이상)
+    counts = Counter([t for t,_ in cand])
+    wm_texts = {t for t,c in counts.items() if c >= 3 and len(t) >= 4}
+
+    # 3) 제거
+    filtered = []
+    for items in easyocr_results_by_page:
+        kept = []
+        for box, text, conf in items:
+            tnorm = _normalize_watermark_text(text)
+            ang = _bbox_angle_deg(box)
+            area = _bbox_area(box)
+            if (tnorm in wm_texts) and (20 <= ang <= 70) and (area >= 0.08 * (page_w * page_h)):
+                continue  # drop watermark
+            kept.append((box, text, conf))
+        filtered.append(kept)
+    return filtered
