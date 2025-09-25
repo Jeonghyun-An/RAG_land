@@ -1,890 +1,900 @@
 # app/services/chunker.py
+"""
+스마트 청킹 모듈 - 개선된 버전
+- 의미론적 연속성 보장
+- 문단간 유기성 보존  
+- 다양한 문서 구조 대응
+- 토큰 기반 적응형 분할
+"""
 from __future__ import annotations
-import re, hashlib, os, itertools
-from typing import List, Tuple, Callable, Iterable, Any, Dict
-
-# ===================== 유틸 =====================
-
-def _ensure_encode(encode: Callable[[str], Iterable[Any]]) -> Callable[[str], List[Any]]:
-    def _enc(s: str) -> List[Any]:
-        try:
-            out = encode(s) or []
-        except Exception:
-            out = []
-        if not isinstance(out, list):
-            out = list(out)
-        return out
-    return _enc
-
-def _toklen(enc: Callable[[str], List[Any]], s: str) -> int:
-    return len(enc(s)) if s else 0
-
-def _norm_text(s: str) -> str:
-    """
-    전역 중복 판정을 위한 강한 정규화:
-    - 공백/개행 압축
-    - 페이지바(… | 12) 제거
-    - 연속 구두점/공백 정리
-    """
-    if not s:
-        return ""
-    t = s
-    # 양쪽 공백 정리
-    t = t.strip()
-    # 페이지 바 패턴 제거: "… | 12" 또는 "… | 6" 등
-    t = re.sub(r"\s*\|\s*\d+\s*$", "", t, flags=re.M)
-    # 연속 공백 압축
-    t = re.sub(r"[ \t]+", " ", t)
-    # 줄단위 트림 후 빈줄 1개로
-    lines = [ln.strip() for ln in t.splitlines()]
-    lines = [ln for ln in lines if ln]
-    t = "\n".join(lines)
-    return t
-
-def _hash_text(s: str) -> str:
-    return hashlib.sha1(_norm_text(s).encode("utf-8", errors="ignore")).hexdigest()
-
-# ---- bbox helper ----
-def _clamp_bbox(bb: List[float]) -> List[float]:
-    x0, y0, x1, y1 = map(float, bb[:4])
-    x0 = max(0.0, x0); y0 = max(0.0, y0)
-    x1 = max(x0, x1); y1 = max(y0, y1)
-    return [x0, y0, x1, y1]
-# ===================== 패턴 =====================
-
-# 제목/조문 헤딩 탐지: 한국어 보고서/매뉴얼에 흔한 패턴들을 폭넓게 허용
-HEADING_RE = re.compile(
-    r"^\s*(?:"
-    r"제?\s*\d+(?:\.\d+)*\s*장?"        # 제1장 / 1. / 1.2.3 / 1 장
-    r"|[IVXLC]+\.?"                    # I. / II / IV 등
-    r"|\d+\s*[)\]]"                    # 1) / 2] 등
-    r"|[A-Z]\)"                        # A) / B)
-    r"|#{1,6}\s+"                      # markdown 헤딩
-    r"|[■□▪◦•·\-\*]\s*\d*"             # 글머리표(옵션 숫자)
-    r")\s*\S.*$",
-    re.M,
-)
-LIST_RE    = re.compile(r"^\s*[-*•·]\s+\S|^\s*\d+\.\s+\S", re.M)
-SENT_SPLIT_RE = re.compile(r"(?<=[\.!?])\s+|(?<=[。！？])|(?<=\n)")
-
-# ===================== 문장/문단 분리 =====================
-
-def _split_sentences(text: str) -> List[str]:
-    if not text:
-        return []
-    parts = [s.strip() for s in SENT_SPLIT_RE.split(text) if s and s.strip()]
-    fused: List[str] = []
-    buf: List[str] = []
-    for p in parts:
-        buf.append(p)
-        if p.endswith(("다.", "요.", ".", "!", "?", "…")):
-            fused.append(" ".join(buf).strip()); buf = []
-    if buf:
-        fused.append(" ".join(buf).strip())
-    return fused
-
-def _split_to_paragraphs(text: str) -> List[str]:
-    """빈 줄로 크게 나누고, 블록 내부는 제목/리스트 시작줄 기준으로 쪼갬."""
-    if not text:
-        return []
-    blocks = re.split(r"\n{2,}", text.strip())
-    out: List[str] = []
-    for b in blocks:
-        b = (b or "").strip()
-        if not b:
-            continue
-        lines = b.splitlines()
-        piece: List[str] = []
-
-        def _emit():
-            if piece:
-                seg = "\n".join(piece).strip()
-                if seg:
-                    out.append(seg)
-
-        for ln in lines:
-            if HEADING_RE.match(ln) or LIST_RE.match(ln):
-                _emit()
-                piece = [ln]
-            else:
-                piece.append(ln)
-        _emit()
-    return out
-
-# ===================== 과대 문단 세분화 =====================
-
-def _split_oversize_to_tokens(text: str, encode: Callable[[str], List[Any]], target_tokens: int) -> List[str]:
-    out: List[str] = []
-    sents = _split_sentences(text)
-    cur = ""
-    for s in sents:
-        if _toklen(encode, s) > target_tokens:
-            if cur:
-                out.append(cur.strip()); cur = ""
-            words = re.split(r"(\s+)", s)  # 공백 보존
-            seg = ""
-            for w in words:
-                candidate = (seg + w) if seg else w
-                if _toklen(encode, candidate) > target_tokens:
-                    if seg.strip():
-                        out.append(seg.strip())
-                    # 단어 자체가 큰 경우 문자 단위로 강제 분절
-                    if _toklen(encode, w) > target_tokens:
-                        buf = ""
-                        for ch in list(w):
-                            cand = buf + ch
-                            if _toklen(encode, cand) > target_tokens:
-                                if buf.strip():
-                                    out.append(buf.strip())
-                                buf = ch
-                            else:
-                                buf = cand
-                        if buf.strip():
-                            out.append(buf.strip())
-                        seg = ""
-                    else:
-                        seg = w
-                else:
-                    seg = candidate
-            if seg.strip():
-                out.append(seg.strip())
-            continue
-        joined = (cur + " " + s).strip() if cur else s
-        if _toklen(encode, joined) <= target_tokens:
-            cur = joined
-        else:
-            if cur.strip():
-                out.append(cur.strip())
-            cur = s
-    if cur.strip():
-        out.append(cur.strip())
-    return out
-
-def _normalize_paras(paras: List[str], encode: Callable[[str], List[Any]], target_tokens: int) -> List[str]:
-    out: List[str] = []
-    for p in paras:
-        if _toklen(encode, p) <= target_tokens:
-            if p.strip():
-                out.append(p.strip())
-        else:
-            out.extend(_split_oversize_to_tokens(p, encode, target_tokens))
-    return out
-
-# ===================== 페이지 헤더/푸터 제거 =====================
-from collections import defaultdict
+import json
 import re
-from typing import List, Tuple, Set, Dict, Iterable, Any
-
-_WS_RE = re.compile(r"\s+")
-
-def _normalize_line(s: str) -> str:
-    return _WS_RE.sub(" ", (s or "").strip())
-
-def _iter_nonempty_lines(text: str) -> List[str]:
-    return [ln for ln in (text or "").splitlines() if ln.strip()]
-
-def _extract_page_texts(pages: Iterable[Any]) -> List[str]:
-    """pages가 str / (page_no, text) / {'page':..,'text':..} 등을 섞어도 텍스트만 뽑아냄."""
-    out: List[str] = []
-    for it in pages or []:
-        if isinstance(it, str):
-            out.append(it)
-        elif isinstance(it, (list, tuple)):
-            # (page_no, text, ...) 형태 지원
-            if len(it) >= 2:
-                out.append(str(it[1] or ""))
-            else:
-                out.append(str(it[0] or ""))
-        elif isinstance(it, dict):
-            out.append(str(it.get("text", "") or ""))
-        else:
-            out.append(str(it or ""))
-    return out
-
-def _detect_repeating_lines(
-    pages: List[Any],
-    *,
-    # 신 파라미터명
-    k_head: int = 3,
-    k_tail: int = 3,
-    min_len: int = 6,
-    max_len: int = 120,
-    min_support: float = 0.8,
-    # 구 파라미터명(호환용)
-    head_n: int | None = None,
-    tail_n: int | None = None,
-    min_ratio: float | None = None,
-) -> List[Tuple[str, int]]:
-    """
-    여러 페이지에 반복되는 헤더/푸터 라인을 감지.
-    반환: [(line, page_count), ...]
-    - pages: str 또는 (page_no, text) 또는 {'page':..,'text':..} 섞여 있어도 OK
-    - head_n/tail_n/min_ratio(구명)도 받으며, 있으면 우선 적용
-    """
-    # 구 파라미터명 우선 적용
-    if head_n is not None:
-        k_head = int(head_n)
-    if tail_n is not None:
-        k_tail = int(tail_n)
-    if min_ratio is not None:
-        min_support = float(min_ratio)
-
-    texts = _extract_page_texts(pages)
-    if not texts:
-        return []
-
-    N = len(texts)
-    threshold = max(2, int(N * min_support))
-
-    page_appear: Dict[str, set[int]] = defaultdict(set)
-
-    for pi, pg_text in enumerate(texts):
-        lines = _iter_nonempty_lines(pg_text)
-        if not lines:
-            continue
-
-        head = lines[:k_head] if k_head > 0 else []
-        tail = lines[-k_tail:] if k_tail > 0 else []
-        candidates = head + tail
-
-        for raw in candidates:
-            line = _normalize_line(raw)
-            if not (min_len <= len(line) <= max_len):
-                continue
-            page_appear[line].add(pi)
-
-    repeating = [(line, len(idx_set)) for line, idx_set in page_appear.items() if len(idx_set) >= threshold]
-    repeating.sort(key=lambda x: (-x[1], x[0]))
-    return repeating
-
-def _repeating_to_set(repeating: Any) -> Set[str]:
-    """
-    repeating이 set[str] / dict[str,int] / list[tuple[str,int]] / list[str]
-    어느 것이든 정규화된 set[str]로 변환
-    """
-    if not repeating:
-        return set()
-    if isinstance(repeating, set):
-        return { _normalize_line(x) for x in repeating }
-    if isinstance(repeating, dict):
-        return { _normalize_line(k) for k in repeating.keys() }
-    if isinstance(repeating, (list, tuple)):
-        out: Set[str] = set()
-        for it in repeating:
-            if isinstance(it, (list, tuple)) and it:
-                out.add(_normalize_line(str(it[0])))
-            else:
-                out.add(_normalize_line(str(it)))
-        return out
-    # 기타 타입
-    return { _normalize_line(str(repeating)) }
-
-
-def _strip_repeating_lines(text: str, repeating_any: Any) -> str:
-    """
-    text에서 반복 라인 제거. repeating_any는 set/dict/list[tuple]/list[str] 등 무엇이든 OK.
-    """
-    if not text:
-        return ""
-    repeating = _repeating_to_set(repeating_any)
-    if not repeating:
-        return text
-
-    out: List[str] = []
-    for ln in (text or "").splitlines():
-        # 페이지바 " | 12" 같은 꼬리 제거 후 비교
-        key = re.sub(r"\s*\|\s*\d+\s*$", "", ln.strip())
-        if _normalize_line(key) in repeating:
-            continue
-        out.append(ln)
-    return "\n".join(out)
-
-
-# ===================== 토큰 패킹(오버랩/중복 보호) =====================
-
-def _tail_paras_by_tokens(paras: List[str], encode: Callable[[str], List[Any]], max_tokens: int) -> tuple[List[str], List[Any]]:
-    tail: List[str] = []
-    tail_ids: List[Any] = []
-    for p in reversed(paras):
-        ids = encode(p)
-        if len(ids) + len(tail_ids) > max_tokens:
-            break
-        tail.insert(0, p)
-        tail_ids = ids + tail_ids
-    return tail, tail_ids
-
-def pack_by_tokens(
-    paras: List[str],
-    encode: Callable[[str], List[Any]],
-    target_tokens: int = 128,
-    overlap_tokens: int = 32,
-) -> List[str]:
-    """
-    오버랩은 유지하되, '완전히 동일한 문단'이 두 번 들어가면 방지.
-    너무 작은 청크(하한 미만)는 다음/이전과 자동 병합
-    """
-    MIN_TOK = int(os.getenv("RAG_MIN_CHUNK_TOKENS", "0") or 0)
-    chunks: List[str] = []
-    cur_paras: List[str] = []
-    cur_ids: List[Any] = []
-
-    def _emit(final: bool=False):
-        if not cur_paras:
-            return
-        piece = "\n\n".join(cur_paras).strip()
-        if not piece:
-            return
-        # 하한 미만인데 최종 emit이 아니면 일단 보류(다음 문단과 합치기 대기)
-        if MIN_TOK > 0 and _toklen(encode, piece) < MIN_TOK and not final:
-            return
-
-        # 최종 emit인데 하한 미만이면 직전 청크에 병합 시도
-        if MIN_TOK > 0 and _toklen(encode, piece) < MIN_TOK and final and chunks:
-            prev = chunks[-1]
-            merged = (prev + "\n\n" + piece).strip()
-            if _toklen(encode, merged) <= target_tokens and _norm_text(prev) != _norm_text(merged):
-                chunks[-1] = merged
-                cur_paras.clear(); cur_ids.clear()
-                return
-            # 병합 불가면 그냥 내보냄 (유실 방지)
-
-        # 바로 직전과 완전 동일하면 스킵
-        if chunks and _norm_text(chunks[-1]) == _norm_text(piece):
-            cur_paras.clear(); cur_ids.clear()
-            return
-        chunks.append(piece)
-        cur_paras.clear(); cur_ids.clear()
-
-    for p in paras:
-        if not p or not p.strip():
-            continue
-        ids = encode(p)
-        # 문단이 target보다 크면 단독 청크로(단, 직전과 동일시 스킵)
-        if len(ids) > target_tokens:
-            _emit()
-            candidate = p.strip()
-            if not (chunks and _norm_text(chunks[-1]) == _norm_text(candidate)):
-                chunks.append(candidate)
-            cur_paras, cur_ids = [], []
-            continue
-
-        if not cur_paras:
-            cur_paras, cur_ids = [p], ids
-            continue
-
-        if len(cur_ids) + len(ids) <= target_tokens:
-            cur_paras.append(p)
-            cur_ids += ids
-        else:
-            # ---- 하한 보호: 끊기 직전에 새 문단을 더 붙여도 target을 넘지 않으면 붙여서 자투리 방지 ----
-            if MIN_TOK > 0 and cur_paras:
-                tmp = "\n\n".join(cur_paras + [p]).strip()
-                if _toklen(encode, tmp) <= target_tokens:
-                    cur_paras.append(p)
-                    cur_ids += ids
-                    continue
-            _emit()
-            tail_paras, tail_ids = _tail_paras_by_tokens(cur_paras, encode, max(0, overlap_tokens))
-            # tail + p 가 target 초과하면 p를 단독으로
-            if len(tail_ids) + len(ids) > target_tokens:
-                candidate = p.strip()
-                if not (chunks and _norm_text(chunks[-1]) == _norm_text(candidate)):
-                    chunks.append(candidate)
-                cur_paras, cur_ids = [], []
-            else:
-                cur_paras, cur_ids = tail_paras + [p], tail_ids + ids
-    _emit(final=True)
-
-    # 인접 동일 제거(이미 했지만 2차 안전망)
-    dedup: List[str] = []
-    for c in chunks:
-        if not dedup or _norm_text(dedup[-1]) != _norm_text(c):
-            dedup.append(c)
-    return dedup
-
-# ===================== 퍼블릭 API =====================
-
-def chunk_text(text: str, max_length: int = 500) -> list[str]:
-    lines = (text or "").split("\n")
-    chunks, buf = [], ""
-    for line in lines:
-        if len(buf) + len(line) < max_length:
-            buf += line + "\n"
-        else:
-            if buf.strip():
-                chunks.append(buf.strip())
-            buf = line + "\n"
-    if buf.strip():
-        chunks.append(buf.strip())
-    return chunks
-
-def smart_chunk_pages(
-    pages: List[Tuple[int, str]],
-    encode,
-    target_tokens: int | None = None,
-    overlap_tokens: int | None = None,
-) -> List[Tuple[str, dict]]:
-    """
-    입력: [(page_no, text)]
-    출력: [(chunk_text, {"page":int, "section":str, "idx":int})]
-    - 페이지 헤더/푸터 자동 제거
-    - 전역 중복 제거(강한 정규화 해시)
-    """
-    enc = _ensure_encode(encode)
-
-    # 기본 길이
-    if target_tokens is None or overlap_tokens is None:
-        try:
-            from app.services.embedding_model import get_embedding_model
-            m = get_embedding_model()
-            max_len = int(getattr(m, "max_seq_length", 128))
-        except Exception:
-            max_len = 128
-        if target_tokens is None:
-            target_tokens = max(64, max_len - 16)
-        if overlap_tokens is None:
-            overlap_tokens = min(32, target_tokens // 4)
-
-    target_tokens = int(max(16, target_tokens))
-    overlap_tokens = int(max(0, min(overlap_tokens, target_tokens // 2)))
-
-    # 1) 반복 라인 감지
-    repeating = _detect_repeating_lines(pages)
-
-    results: List[Tuple[str, dict]] = []
-    seen_hashes: set[str] = set()
-
-    for item in pages:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            page_no, text = item[0], item[1]
-        elif isinstance(item, dict):
-            page_no, text = item.get("page", 1), item.get("text", "")
-        else:
-            continue
-
-        try:
-            page_no = int(page_no)
-        except Exception:
-            page_no = 1
-        text = str(text or "").strip()
-        if not text:
-            continue
-
-        # 2) 페이지 반복 상/하단 제거
-        text = _strip_repeating_lines(text, repeating)
-
-        # 3) 문단 → 과대 문단 세분화 → 토큰 패킹
-        paras = _split_to_paragraphs(text)
-        safe_paras: List[str] = []
-        for p in paras:
-            if _toklen(enc, p) <= target_tokens:
-                if p.strip():
-                    safe_paras.append(p.strip())
-            else:
-                safe_paras.extend(_split_oversize_to_tokens(p, enc, target_tokens))
-
-        chs = pack_by_tokens(safe_paras, enc, target_tokens=target_tokens, overlap_tokens=overlap_tokens)
-
-        # 4) 전역 중복 제거
-        for i, ch in enumerate(chs):
-            norm = _norm_text(ch)
-            if not norm:
-                continue
-            h = _hash_text(norm)
-            if h in seen_hashes:
-                continue
-            seen_hashes.add(h)
-
-            # section(제목) 추출
-            section = ""
-            for line in ch.splitlines():
-                if HEADING_RE.match(line):
-                    section = line.strip()
-                    break
-
-            results.append((ch, {"page": page_no, "section": section, "idx": i}))
-
-    return results
-
-def token_safe_chunks(text: str, target_tokens: int | None = None, overlap_tokens: int = 32) -> list[str]:
-    from app.services.embedding_model import get_embedding_model
-    try:
-        model = get_embedding_model()
-        tok = getattr(model, "tokenizer", None)
-        max_len = int(getattr(model, "max_seq_length", 128))
-    except Exception:
-        tok, max_len = None, 128
-
-    if tok is None or not hasattr(tok, "encode"):
-        return chunk_text(text, max_length=1000)
-
-    if target_tokens is None:
-        target_tokens = max(64, max_len - 16)
-    target_tokens = int(max(16, target_tokens))
-    overlap_tokens = int(max(0, min(overlap_tokens, target_tokens // 4)))
-
-    def _enc(s: str) -> List[int]:
-        return tok.encode(s, add_special_tokens=False) or []
-
-    paras = _split_to_paragraphs(text or "")
-    safe_paras = _normalize_paras(paras, _enc, target_tokens)
-    chs = pack_by_tokens(safe_paras, _enc, target_tokens=target_tokens, overlap_tokens=overlap_tokens)
-
-    # 전역 중복 한 번 더 방지(함수 단위)
-    dedup: List[str] = []
-    seen: set[str] = set()
-    for c in chs:
-        h = _hash_text(c)
-        if h in seen:
-            continue
-        seen.add(h)
-        if not dedup or _norm_text(dedup[-1]) != _norm_text(c):
-            dedup.append(c)
-    return dedup
-
-
-def _guess_section_for_paragraph(paragraph: str, last_section: str) -> str:
-    # 문단 맨 앞 라인이 제목 패턴이면 해당 라인을 섹션으로, 아니면 직전 섹션 계승
-    for ln in (paragraph or "").splitlines():
-        if HEADING_RE.match(ln):
-            return ln.strip()
-        break
-    return last_section
-
-def _clean(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"[\s\p{P}]+", " ", s, flags=re.UNICODE)
-    return s.strip()
-
-def _token_set(s: str) -> set[str]:
-    return set(_clean(s).split())
-
-def _similar(a: str, b: str) -> float:
-    A, B = _token_set(a), _token_set(b)
-    if not A or not B: 
-        return 0.0
-    inter = len(A & B)
-    return inter / min(len(A), len(B))   # 부분일치에 관대
-
-def _attach_bboxes_to_paragraph(para: str, page_blocks: list[dict]) -> list[list[float]]:
-    if not para or not page_blocks:
-        return []
-    p = para.replace("\n", " ").strip()
-    if not p:
-        return []
-    bboxes: list[list[float]] = []
-    # 임계치: 0.5 정도면 보수적, 0.3이면 관대
-    THRESH = 0.35
-    for blk in page_blocks:
-        t = (blk.get("text") or "").strip()
-        if not t:
-            continue
-        if _similar(p[:200], t[:200]) >= THRESH or _similar(p, t) >= THRESH:
-            bb = blk.get("bbox")
-            if isinstance(bb, (list, tuple)) and len(bb) == 4:
-                bboxes.append(_clamp_bbox([float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])]))
-    # 중복 제거
-    seen, uniq = set(), []
-    for bb in bboxes:
-        key = tuple(round(v, 2) for v in bb)  # 좌표 반올림으로 근접 중복 제거
-        if key not in seen:
-            seen.add(key); uniq.append(bb)
-    return uniq
-
-from typing import Any  # 🔸 파일 상단에 없으면 추가
-
-def smart_chunk_pages_plus(
-    pages: List[Tuple[int, str]],
-    encode,
-    target_tokens: int | None = None,
-    overlap_tokens: int | None = None,
-    layout_blocks: dict[int, list[dict]] | None = None,
-) -> List[Tuple[str, dict]]:
-    """
-    확장 청킹:
-      - 섹션(제목) 계승
-      - 페이지 경계 오버랩(옵션)
-      - 각 청크에 포함된 페이지 목록 + 페이지별 BBOX 리스트 포함
-    반환: [(chunk_text, {"page":int, "section":str, "pages":[int], "bboxes":{page:[bbox...]}})]
-    """
-    # 0) 토크나이저/기본 길이
-    enc = _ensure_encode(encode)
-    try:
-        if target_tokens is None or overlap_tokens is None:
-            from app.services.embedding_model import get_embedding_model
-            m = get_embedding_model()
-            max_len = int(getattr(m, "max_seq_length", 128))
-    except Exception:
-        max_len = 128
-
-    if target_tokens is None:
-        target_tokens = max(64, max_len - 16)
-    if overlap_tokens is None:
-        overlap_tokens = min(96, target_tokens // 3)
-
-    target_tokens = int(max(16, target_tokens))
-    # 문단 단위 오버랩(토큰 값은 상한으로만 사용)
-    overlap_tokens = int(max(0, min(overlap_tokens, target_tokens // 2)))
-    cross_page = os.getenv("RAG_CROSS_PAGE_CHUNK", "1") == "1"
-
-    # 1) 반복 라인(러닝헤더/푸터) 제거 후보 수집
-    repeating = _detect_repeating_lines(pages, head_n=3, tail_n=3, min_ratio=0.2)
-
-    # 2) 페이지→문단 전개 + 섹션 추정 + para별 bbox 부착
-    para_items: list[dict] = []
-    last_section = ""
-    for page_no, text in pages:
-        txt = _strip_repeating_lines(text, repeating)
-        paras = _split_to_paragraphs(txt)
-
-        # 과대 문단 세분화
-        safe_paras: List[str] = []
-        for p in paras:
-            if not p.strip():
-                continue
-            if _toklen(enc, p) <= target_tokens:
-                safe_paras.append(p.strip())
-            else:
-                safe_paras.extend(_split_oversize_to_tokens(p, enc, target_tokens))
-
-        # para each → attach section/bbox
-        blocks = (layout_blocks or {}).get(int(page_no), [])
-        for p in safe_paras:
-            sec = _guess_section_for_paragraph(p, last_section)
-            if sec and sec != last_section:
-                last_section = sec
-
-            # 새 페이지 첫 문단이 직전 섹션 제목과 같은 헤딩이면 제거
-            lines = p.splitlines()
-            if lines and HEADING_RE.match(lines[0] or "") and lines[0].strip() == last_section:
-                p = "\n".join(lines[1:]).strip()
-                if not p:
-                    continue
-
-            # bbox 부착(수신 값 문자열/리스트 혼재 방어)
-            bbs_raw = _attach_bboxes_to_paragraph(p, blocks) or []
-            bbs: list[list[float]] = []
-            seen_bb: set[tuple[float, float, float, float]] = set()
-            for bb in bbs_raw:
-                try:
-                    x0, y0, x1, y1 = bb
-                    key = (round(float(x0), 3), round(float(y0), 3),
-                           round(float(x1), 3), round(float(y1), 3))
-                except Exception:
-                    continue
-                if key not in seen_bb:
-                    seen_bb.add(key)
-                    bbs.append([key[0], key[1], key[2], key[3]])
-
-            para_items.append({
-                "page": int(page_no),
-                "section": last_section,
-                "text": p,
-                "bboxes": bbs,
-                "toklen": _toklen(enc, p),
-            })
-
-    # 3) 토큰 패킹(문단 단위), 페이지 경계 제어 + 오버랩
-    chunks: List[Tuple[str, dict]] = []
-    cur_texts: List[str] = []
-    cur_pages: List[int] = []
-    cur_bboxes: dict[int, list[list[float]]] = {}
-    cur_tokens: int = 0
-    cur_section: str = ""
-    SECTION_CAP = int(os.getenv("RAG_SECTION_MAX", "160"))
-    seen_text_hashes: set[str] = set()
-
-    def _dedup_page_bboxes(pb: dict[int, list[list[float]]]) -> dict[int, list[list[float]]]:
-        out: dict[int, list[list[float]]] = {}
-        for pg, lst in pb.items():
-            seen: set[tuple[float, float, float, float]] = set()
-            ulst: list[list[float]] = []
-            for bb in lst:
-                try:
-                    key = (round(float(bb[0]), 3), round(float(bb[1]), 3),
-                           round(float(bb[2]), 3), round(float(bb[3]), 3))
-                except Exception:
-                    continue
-                if key not in seen:
-                    seen.add(key)
-                    ulst.append([key[0], key[1], key[2], key[3]])
-            if ulst:
-                out[int(pg)] = ulst
-        return out
-
-    def _emit():
-        nonlocal cur_texts, cur_pages, cur_bboxes, cur_tokens, cur_section
-        if not cur_texts:
-            return
-        piece = "\n\n".join(cur_texts).strip()
-        if not piece:
-            # reset
-            cur_texts, cur_pages, cur_bboxes, cur_tokens, cur_section = [], [], {}, 0, ""
-            return
-
-        norm = _norm_text(piece)
-        h = _hash_text(norm)
-        if h in seen_text_hashes:
-            cur_texts, cur_pages, cur_bboxes, cur_tokens, cur_section = [], [], {}, 0, ""
-            return
-        seen_text_hashes.add(h)
-
-        meta = {
-            "type": "text",
-            "section": (cur_section or "")[:SECTION_CAP],
-            "pages": sorted(list(dict.fromkeys(cur_pages))),
-            "bboxes": _dedup_page_bboxes(cur_bboxes),
+from typing import List, Tuple, Dict, Optional, Callable, Any
+import math
+
+class SmartChunker:
+    """개선된 스마트 청킹 클래스"""
+    
+    def __init__(self, encoder_fn: Callable, target_tokens: int = 400, overlap_tokens: int = 100):
+        self.encoder = encoder_fn
+        self.target_tokens = target_tokens
+        self.overlap_tokens = overlap_tokens
+        self.min_chunk_tokens = 50
+        self.max_chunk_tokens = target_tokens * 2
+        
+        # 문서 구조 패턴
+        self.structure_patterns = {
+            'header': re.compile(r'^(?:제\s*\d+\s*[조절항장편]|[A-Z0-9]+\.\s|\d+\.\d+\s)', re.MULTILINE),
+            'list_item': re.compile(r'^[\s]*(?:\d+\.|[가나다라마바사아자차카타파하]\.|\([가나다라마바사아자차카타파하]\)|\d+\))', re.MULTILINE),
+            'quote': re.compile(r'^[\s]*(?:"|"|'|'|※|□|▪|▫)', re.MULTILINE),
+            'table_line': re.compile(r'[\|\+\-]{3,}|[┌┐└┘├┤┬┴┼─│]'),
         }
-        meta_line = "META: " + json.dumps(meta, ensure_ascii=False)
-        chunk_text = (meta_line + "\n" + piece) if piece else meta_line
-
-        comp_meta = {
-            "page": int(meta["pages"][0]) if meta["pages"] else (cur_pages[0] if cur_pages else 0),
-            "section": meta["section"],
-            "pages": meta["pages"],
-            "bboxes": meta["bboxes"],
+        
+        # 연결어 패턴
+        self.connective_words = [
+            '따라서', '그러므로', '그런데', '그러나', '하지만', '또한', '또한', '더욱이',
+            '즉', '다시 말해서', '예를 들어', '구체적으로', '특히', '반면에',
+            '이에 따라', '이와 같이', '이와 더불어', '이와 관련하여'
+        ]
+        
+    def chunk_pages(self, pages_std: List[Tuple[int, str]], 
+                   layout_blocks: Optional[Dict[int, List[Dict]]] = None) -> List[Tuple[str, Dict]]:
+        """페이지별 스마트 청킹"""
+        if not pages_std:
+            return []
+            
+        all_chunks = []
+        
+        for page_no, text in pages_std:
+            if not text or not text.strip():
+                continue
+                
+            # 문서 구조 분석
+            structure_info = self._analyze_document_structure(text)
+            
+            # 구조 기반 청킹
+            if structure_info['has_clear_structure']:
+                page_chunks = self._structure_based_chunking(text, page_no, structure_info)
+            else:
+                # 의미론적 청킹
+                page_chunks = self._semantic_chunking(text, page_no)
+            
+            all_chunks.extend(page_chunks)
+        
+        # 페이지 간 연속성 처리
+        connected_chunks = self._process_inter_page_continuity(all_chunks)
+        
+        # 최종 검증 및 정리
+        return self._finalize_chunks(connected_chunks)
+    
+    def _analyze_document_structure(self, text: str) -> Dict:
+        """문서 구조 분석"""
+        structure_info = {
+            'has_clear_structure': False,
+            'structure_type': 'unstructured',
+            'sections': [],
+            'list_density': 0,
+            'table_density': 0
         }
-        if not chunks or _norm_text(chunks[-1][0]) != _norm_text(chunk_text):
-            chunks.append((chunk_text, comp_meta))
-
-        # reset
-        cur_texts, cur_pages, cur_bboxes, cur_tokens, cur_section = [], [], {}, 0, ""
-
-    import json  # 한 번만 import
-
-    # 문단 오버랩을 위해 마지막 일부 문단을 보관
-    def _start_new_with_overlap(prev_texts: List[str], prev_pages: List[int],
-                                prev_bboxes: dict[int, list[list[float]]],
-                                section: str):
-        nonlocal cur_texts, cur_pages, cur_bboxes, cur_tokens, cur_section
-        if overlap_tokens <= 0 or not prev_texts:
-            cur_texts, cur_pages, cur_bboxes, cur_tokens, cur_section = [], [], {}, 0, section
-            return
-        # 뒤에서부터 문단을 모아 overlap_tokens 근사 만족
-        toks = 0
-        sel: List[str] = []
-        sel_pages: List[int] = []
-        sel_bboxes: dict[int, list[list[float]]] = {}
-        for t, pg in zip(reversed(prev_texts), reversed(prev_pages)):
-            tl = _toklen(enc, t)
-            if toks + tl > overlap_tokens and sel:
+        
+        lines = text.split('\n')
+        total_lines = len(lines)
+        
+        if total_lines == 0:
+            return structure_info
+        
+        # 구조적 요소 카운트
+        header_count = 0
+        list_count = 0
+        table_count = 0
+        
+        for line in lines:
+            if self.structure_patterns['header'].match(line.strip()):
+                header_count += 1
+            elif self.structure_patterns['list_item'].match(line.strip()):
+                list_count += 1
+            elif self.structure_patterns['table_line'].search(line):
+                table_count += 1
+        
+        # 밀도 계산
+        structure_info['list_density'] = list_count / total_lines
+        structure_info['table_density'] = table_count / total_lines
+        
+        # 구조 유형 판단
+        if header_count >= 3:  # 헤더가 3개 이상
+            structure_info['has_clear_structure'] = True
+            structure_info['structure_type'] = 'hierarchical'
+        elif structure_info['list_density'] > 0.3:  # 목록 비율 30% 이상
+            structure_info['has_clear_structure'] = True
+            structure_info['structure_type'] = 'list_heavy'
+        elif structure_info['table_density'] > 0.2:  # 표 비율 20% 이상
+            structure_info['has_clear_structure'] = True
+            structure_info['structure_type'] = 'table_heavy'
+        
+        return structure_info
+    
+    def _structure_based_chunking(self, text: str, page_no: int, structure_info: Dict) -> List[Tuple[str, Dict]]:
+        """구조 기반 청킹"""
+        chunks = []
+        
+        if structure_info['structure_type'] == 'hierarchical':
+            chunks = self._hierarchical_chunking(text, page_no)
+        elif structure_info['structure_type'] == 'list_heavy':
+            chunks = self._list_based_chunking(text, page_no)
+        elif structure_info['structure_type'] == 'table_heavy':
+            chunks = self._table_preserving_chunking(text, page_no)
+        else:
+            chunks = self._semantic_chunking(text, page_no)
+        
+        return chunks
+    
+    def _hierarchical_chunking(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
+        """계층적 구조 기반 청킹"""
+        chunks = []
+        sections = self._split_by_headers(text)
+        
+        for section in sections:
+            section_text = section['content']
+            section_header = section['header']
+            
+            if self._count_tokens(section_text) <= self.target_tokens:
+                # 섹션이 적당한 크기면 그대로 청크로
+                chunks.append(self._create_chunk(section_text, page_no, section_header))
+            else:
+                # 섹션이 크면 문단 단위로 세분화
+                sub_chunks = self._subdivide_section(section_text, page_no, section_header)
+                chunks.extend(sub_chunks)
+        
+        return chunks
+    
+    def _split_by_headers(self, text: str) -> List[Dict]:
+        """헤더 기준으로 섹션 분할"""
+        sections = []
+        lines = text.split('\n')
+        current_section = {'header': '', 'content': ''}
+        
+        for line in lines:
+            if self.structure_patterns['header'].match(line.strip()):
+                # 이전 섹션 저장
+                if current_section['content'].strip():
+                    sections.append(current_section)
+                
+                # 새 섹션 시작
+                current_section = {
+                    'header': line.strip(),
+                    'content': line
+                }
+            else:
+                current_section['content'] += '\n' + line
+        
+        # 마지막 섹션 처리
+        if current_section['content'].strip():
+            sections.append(current_section)
+        
+        return sections
+    
+    def _list_based_chunking(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
+        """목록 구조 기반 청킹"""
+        chunks = []
+        list_groups = self._group_list_items(text)
+        
+        for group in list_groups:
+            if group['type'] == 'list':
+                # 목록 항목들을 적절한 크기로 그룹핑
+                list_chunks = self._chunk_list_group(group['items'], page_no)
+                chunks.extend(list_chunks)
+            else:
+                # 일반 텍스트
+                if self._count_tokens(group['content']) <= self.target_tokens:
+                    chunks.append(self._create_chunk(group['content'], page_no))
+                else:
+                    sub_chunks = self._split_large_text(group['content'], page_no)
+                    chunks.extend(sub_chunks)
+        
+        return chunks
+    
+    def _group_list_items(self, text: str) -> List[Dict]:
+        """목록 항목들을 그룹핑"""
+        groups = []
+        lines = text.split('\n')
+        current_group = {'type': 'text', 'content': '', 'items': []}
+        
+        for line in lines:
+            if self.structure_patterns['list_item'].match(line.strip()):
+                # 목록 항목 발견
+                if current_group['type'] == 'text' and current_group['content'].strip():
+                    # 이전 텍스트 그룹 저장
+                    groups.append(current_group)
+                    current_group = {'type': 'list', 'content': '', 'items': []}
+                
+                current_group['type'] = 'list'
+                current_group['items'].append(line.strip())
+                current_group['content'] += line + '\n'
+            else:
+                # 일반 텍스트
+                if current_group['type'] == 'list' and current_group['items']:
+                    # 이전 목록 그룹 저장
+                    groups.append(current_group)
+                    current_group = {'type': 'text', 'content': '', 'items': []}
+                
+                current_group['type'] = 'text'
+                current_group['content'] += line + '\n'
+        
+        # 마지막 그룹 처리
+        if current_group['content'].strip() or current_group['items']:
+            groups.append(current_group)
+        
+        return groups
+    
+    def _chunk_list_group(self, items: List[str], page_no: int) -> List[Tuple[str, Dict]]:
+        """목록 그룹을 청킹"""
+        chunks = []
+        current_items = []
+        current_tokens = 0
+        
+        for item in items:
+            item_tokens = self._count_tokens(item)
+            
+            if current_tokens + item_tokens <= self.target_tokens:
+                current_items.append(item)
+                current_tokens += item_tokens
+            else:
+                # 현재 그룹 완료
+                if current_items:
+                    list_text = '\n'.join(current_items)
+                    chunks.append(self._create_chunk(list_text, page_no, "목록"))
+                
+                current_items = [item]
+                current_tokens = item_tokens
+        
+        # 마지막 그룹 처리
+        if current_items:
+            list_text = '\n'.join(current_items)
+            chunks.append(self._create_chunk(list_text, page_no, "목록"))
+        
+        return chunks
+    
+    def _table_preserving_chunking(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
+        """표 구조 보존 청킹"""
+        chunks = []
+        segments = self._separate_tables_and_text(text)
+        
+        for segment in segments:
+            if segment['type'] == 'table':
+                # 표는 가능한 한 통째로 보존
+                if self._count_tokens(segment['content']) <= self.max_chunk_tokens:
+                    chunks.append(self._create_chunk(segment['content'], page_no, "표"))
+                else:
+                    # 너무 크면 행 단위로 분할
+                    table_chunks = self._split_large_table(segment['content'], page_no)
+                    chunks.extend(table_chunks)
+            else:
+                # 일반 텍스트
+                if self._count_tokens(segment['content']) <= self.target_tokens:
+                    chunks.append(self._create_chunk(segment['content'], page_no))
+                else:
+                    sub_chunks = self._semantic_chunking(segment['content'], page_no)
+                    chunks.extend(sub_chunks)
+        
+        return chunks
+    
+    def _separate_tables_and_text(self, text: str) -> List[Dict]:
+        """표와 일반 텍스트 분리"""
+        segments = []
+        lines = text.split('\n')
+        current_segment = {'type': 'text', 'content': ''}
+        in_table = False
+        
+        for line in lines:
+            is_table_line = bool(self.structure_patterns['table_line'].search(line))
+            
+            if is_table_line and not in_table:
+                # 표 시작
+                if current_segment['content'].strip():
+                    segments.append(current_segment)
+                current_segment = {'type': 'table', 'content': line + '\n'}
+                in_table = True
+            elif is_table_line and in_table:
+                # 표 계속
+                current_segment['content'] += line + '\n'
+            elif not is_table_line and in_table:
+                # 표 끝? (빈 줄 확인)
+                if line.strip():
+                    current_segment['content'] += line + '\n'
+                else:
+                    # 표 종료
+                    segments.append(current_segment)
+                    current_segment = {'type': 'text', 'content': ''}
+                    in_table = False
+            else:
+                # 일반 텍스트
+                if in_table:
+                    # 표 종료
+                    segments.append(current_segment)
+                    current_segment = {'type': 'text', 'content': line + '\n'}
+                    in_table = False
+                else:
+                    current_segment['content'] += line + '\n'
+        
+        # 마지막 세그먼트 처리
+        if current_segment['content'].strip():
+            segments.append(current_segment)
+        
+        return segments
+    
+    def _split_large_table(self, table_text: str, page_no: int) -> List[Tuple[str, Dict]]:
+        """큰 표를 행 단위로 분할"""
+        chunks = []
+        lines = table_text.split('\n')
+        
+        # 표 헤더 찾기
+        header_lines = []
+        data_lines = []
+        
+        for i, line in enumerate(lines[:5]):  # 처음 5줄에서 헤더 찾기
+            if self.structure_patterns['table_line'].search(line) and '+' in line:
+                header_lines = lines[:i+3]  # 헤더 라인들
+                data_lines = lines[i+3:]
                 break
-            sel.insert(0, t)
-            if (not sel_pages) or pg != sel_pages[-1]:
-                sel_pages.append(pg)
-            if pg in (prev_bboxes or {}):
-                sel_bboxes.setdefault(pg, []).extend(prev_bboxes[pg])
-            toks += tl
-
-        cur_texts = sel
-        cur_pages = list(dict.fromkeys(sel_pages))
-        cur_bboxes = {k: v[:] for k, v in sel_bboxes.items()}
-        cur_tokens = sum(_toklen(enc, t) for t in cur_texts)
-        cur_section = section
-
-    for it in para_items:
-        ids_len = it["toklen"]
-
-        # 첫 문단
-        if not cur_texts:
-            cur_texts = [it["text"]]
-            cur_tokens = ids_len
-            cur_pages = [it["page"]]
-            if it["bboxes"]:
-                cur_bboxes[it["page"]] = list(it["bboxes"])
-            cur_section = it["section"]
-            continue
-
-        # 섹션 변경 시 끊고 새로 시작(+오버랩 없음: 섹션 경계 우선)
-        if it["section"] and it["section"] != cur_section:
-            _emit()
-            # 섹션 바뀌면 오버랩 없이 새로 시작
-            cur_texts = [it["text"]]
-            cur_tokens = ids_len
-            cur_pages = [it["page"]]
-            cur_bboxes = {it["page"]: list(it["bboxes"])} if it["bboxes"] else {}
-            cur_section = it["section"]
-            continue
-
-        # cross_page가 꺼져 있고 새 페이지면 끊기
-        if (not cross_page) and (it["page"] != cur_pages[-1]):
-            prev_texts, prev_pages, prev_bboxes, prev_sec = cur_texts[:], cur_pages[:], {k: v[:] for k, v in cur_bboxes.items()}, cur_section
-            _emit()
-            _start_new_with_overlap(prev_texts, prev_pages, prev_bboxes, prev_sec)
-            # 이어서 현재 문단을 넣어본다
-            if cur_tokens + ids_len > target_tokens and cur_texts:
-                _emit()
-                cur_texts = [it["text"]]
-                cur_tokens = ids_len
-                cur_pages = [it["page"]]
-                cur_bboxes = {it["page"]: list(it["bboxes"])} if it["bboxes"] else {}
-                cur_section = it["section"]
-            else:
-                cur_texts.append(it["text"])
-                cur_tokens += ids_len
-                if it["page"] not in cur_pages:
-                    cur_pages.append(it["page"])
-                if it["bboxes"]:
-                    cur_bboxes.setdefault(it["page"], []).extend(it["bboxes"])
-            continue
-
-        # 같은 섹션 안에서 용량 검사
-        if cur_tokens + ids_len <= target_tokens:
-            cur_texts.append(it["text"])
-            cur_tokens += ids_len
-            if it["page"] not in cur_pages:
-                cur_pages.append(it["page"])
-            if it["bboxes"]:
-                cur_bboxes.setdefault(it["page"], []).extend(it["bboxes"])
+        
+        if not header_lines:
+            # 헤더 구분이 안되면 임시로 분할
+            chunk_size = max(10, len(lines) // 3)
+            for i in range(0, len(lines), chunk_size):
+                chunk_lines = lines[i:i+chunk_size]
+                chunk_text = '\n'.join(chunk_lines)
+                if chunk_text.strip():
+                    chunks.append(self._create_chunk(chunk_text, page_no, "표 일부"))
         else:
-            # 넘치면 emit + 오버랩 후 새 chunk 시작
-            prev_texts, prev_pages, prev_bboxes, prev_sec = cur_texts[:], cur_pages[:], {k: v[:] for k, v in cur_bboxes.items()}, cur_section
-            _emit()
-            _start_new_with_overlap(prev_texts, prev_pages, prev_bboxes, prev_sec)
-            # 현재 문단 추가 시도
-            if cur_tokens + ids_len > target_tokens and cur_texts:
-                # 오버랩만으로도 꽉 찼다면 한 번 더 비우고 단독 시작
-                _emit()
-                cur_texts = [it["text"]]
-                cur_tokens = ids_len
-                cur_pages = [it["page"]]
-                cur_bboxes = {it["page"]: list(it["bboxes"])} if it["bboxes"] else {}
-                cur_section = it["section"]
+            # 헤더와 함께 데이터 행들을 적절히 분할
+            current_chunk = '\n'.join(header_lines) + '\n'
+            current_tokens = self._count_tokens(current_chunk)
+            
+            for line in data_lines:
+                line_tokens = self._count_tokens(line)
+                
+                if current_tokens + line_tokens <= self.target_tokens:
+                    current_chunk += line + '\n'
+                    current_tokens += line_tokens
+                else:
+                    # 현재 청크 완료
+                    if current_chunk.strip():
+                        chunks.append(self._create_chunk(current_chunk, page_no, "표 일부"))
+                    
+                    # 새 청크 시작 (헤더 포함)
+                    current_chunk = '\n'.join(header_lines) + '\n' + line + '\n'
+                    current_tokens = self._count_tokens(current_chunk)
+            
+            # 마지막 청크 처리
+            if current_chunk.strip():
+                chunks.append(self._create_chunk(current_chunk, page_no, "표 일부"))
+        
+        return chunks
+    
+    def _semantic_chunking(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
+        """의미론적 청킹"""
+        chunks = []
+        paragraphs = self._split_into_paragraphs(text)
+        
+        current_chunk = ""
+        current_tokens = 0
+        
+        for i, paragraph in enumerate(paragraphs):
+            para_tokens = self._count_tokens(paragraph)
+            
+            # 문맥 연결성 점수 계산
+            continuity_score = 0
+            if i > 0:
+                continuity_score = self._calculate_semantic_continuity(paragraph, paragraphs[i-1])
+            
+            # 연결 조건 확인
+            should_connect = (
+                current_tokens + para_tokens <= self.target_tokens or
+                (continuity_score > 0.7 and current_tokens + para_tokens <= self.max_chunk_tokens)
+            )
+            
+            if should_connect:
+                current_chunk += "\n\n" + paragraph if current_chunk else paragraph
+                current_tokens += para_tokens
             else:
-                cur_texts.append(it["text"])
-                cur_tokens += ids_len
-                if it["page"] not in cur_pages:
-                    cur_pages.append(it["page"])
-                if it["bboxes"]:
-                    cur_bboxes.setdefault(it["page"], []).extend(it["bboxes"])
-
-    _emit()
-
-    # 4) 최후 폴백: 문단 단계에서 아무것도 못 만들었으면 raw 페이지 텍스트로 고정길이 청킹
-    if not chunks:
-        raw_text = "\n\n".join([t for _, t in pages if (t or "").strip()])
-        if raw_text.strip():
-            ids = enc(raw_text)
-            if not ids:
-                # 토크나이저가 빈 리스트를 주면 통짜로 1개라도
-                meta = {"type": "text", "section": "", "pages": [p for p, _ in pages], "bboxes": {}}
-                chunks = [("META: " + json.dumps(meta, ensure_ascii=False) + "\n" + raw_text,
-                           {"page": pages[0][0] if pages else 0, "section": "", "pages": meta["pages"], "bboxes": {}})]
+                # 현재 청크 완료
+                if current_chunk:
+                    chunks.append(self._create_chunk(current_chunk, page_no))
+                
+                # 문단이 너무 크면 문장 단위로 분할
+                if para_tokens > self.max_chunk_tokens:
+                    sub_chunks = self._split_large_paragraph(paragraph, page_no)
+                    chunks.extend(sub_chunks)
+                    current_chunk = ""
+                    current_tokens = 0
+                else:
+                    current_chunk = paragraph
+                    current_tokens = para_tokens
+        
+        # 마지막 청크 처리
+        if current_chunk:
+            chunks.append(self._create_chunk(current_chunk, page_no))
+        
+        return chunks
+    
+    def _split_into_paragraphs(self, text: str) -> List[str]:
+        """텍스트를 문단으로 분할"""
+        # 이중 개행을 기준으로 분할
+        paragraphs = re.split(r'\n\s*\n', text)
+        
+        # 빈 문단 제거 및 정리
+        clean_paragraphs = []
+        for para in paragraphs:
+            para = para.strip()
+            if para:
+                clean_paragraphs.append(para)
+        
+        return clean_paragraphs
+    
+    def _calculate_semantic_continuity(self, current: str, previous: str) -> float:
+        """두 문단 간의 의미론적 연속성 점수 계산"""
+        score = 0.0
+        
+        # 1. 연결어 확인
+        current_lower = current.lower()
+        for connective in self.connective_words:
+            if current.startswith(connective) or current_lower.startswith(connective):
+                score += 0.4
+                break
+        
+        # 2. 키워드 연속성
+        current_words = set(re.findall(r'[가-힣]{2,}|[A-Za-z]{3,}', current))
+        previous_words = set(re.findall(r'[가-힣]{2,}|[A-Za-z]{3,}', previous))
+        
+        if current_words and previous_words:
+            common_words = current_words & previous_words
+            similarity = len(common_words) / max(len(current_words), len(previous_words))
+            score += similarity * 0.3
+        
+        # 3. 번호/순서 연속성
+        current_numbers = re.findall(r'\d+', current)
+        previous_numbers = re.findall(r'\d+', previous)
+        
+        if current_numbers and previous_numbers:
+            try:
+                if int(current_numbers[0]) == int(previous_numbers[-1]) + 1:
+                    score += 0.3
+            except (ValueError, IndexError):
+                pass
+        
+        # 4. 구조적 연속성 (같은 들여쓰기, 목록 구조 등)
+        current_indent = len(current) - len(current.lstrip())
+        previous_indent = len(previous) - len(previous.lstrip())
+        
+        if abs(current_indent - previous_indent) <= 2:  # 들여쓰기 차이 2 이하
+            score += 0.2
+        
+        return min(score, 1.0)
+    
+    def _split_large_paragraph(self, paragraph: str, page_no: int) -> List[Tuple[str, Dict]]:
+        """큰 문단을 문장 단위로 분할"""
+        chunks = []
+        sentences = self._split_into_sentences(paragraph)
+        
+        current_chunk = ""
+        current_tokens = 0
+        
+        for sentence in sentences:
+            sentence_tokens = self._count_tokens(sentence)
+            
+            if current_tokens + sentence_tokens <= self.target_tokens:
+                current_chunk += " " + sentence if current_chunk else sentence
+                current_tokens += sentence_tokens
             else:
-                # 토큰 슬라이딩 윈도우
-                def detok_slice(start_ids, end_ids):
-                    # 간단: 텍스트를 문단 경계가 아닌 토큰 개수 기준으로만 잘라낸다(안전)
-                    # 실제 복원은 어려우니 ids 길이로만 근사, 실전에서 충분
-                    return raw_text  # 실사용 토크나이저가 없으면 불가 → 통짜 처리
-                i = 0
-                while i < len(ids):
-                    j = min(len(ids), i + target_tokens)
-                    piece = raw_text if i == 0 and j == len(ids) else raw_text  # 근사
-                    meta = {"type": "text", "section": "", "pages": [p for p, _ in pages], "bboxes": {}}
-                    chunk_text = "META: " + json.dumps(meta, ensure_ascii=False) + "\n" + piece
-                    chunks.append((chunk_text, {"page": pages[0][0] if pages else 0, "section": "", "pages": meta["pages"], "bboxes": {}}))
-                    if j >= len(ids):
-                        break
-                    i = j - overlap_tokens if overlap_tokens > 0 else j
+                if current_chunk:
+                    chunks.append(self._create_chunk(current_chunk, page_no))
+                current_chunk = sentence
+                current_tokens = sentence_tokens
+        
+        if current_chunk:
+            chunks.append(self._create_chunk(current_chunk, page_no))
+        
+        return chunks
+    
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """텍스트를 문장으로 분할"""
+        # 한국어 문장 종결 패턴
+        sentence_endings = re.compile(r'[.!?]+\s*(?=[A-Z가-힣]|$)')
+        sentences = sentence_endings.split(text)
+        
+        return [s.strip() for s in sentences if s.strip()]
+    
+    def _subdivide_section(self, section_text: str, page_no: int, section_header: str) -> List[Tuple[str, Dict]]:
+        """섹션을 세분화"""
+        chunks = []
+        paragraphs = self._split_into_paragraphs(section_text)
+        
+        current_chunk = ""
+        current_tokens = 0
+        
+        for paragraph in paragraphs:
+            para_tokens = self._count_tokens(paragraph)
+            
+            if current_tokens + para_tokens <= self.target_tokens:
+                current_chunk += "\n\n" + paragraph if current_chunk else paragraph
+                current_tokens += para_tokens
+            else:
+                if current_chunk:
+                    chunks.append(self._create_chunk(current_chunk, page_no, section_header))
+                current_chunk = paragraph
+                current_tokens = para_tokens
+        
+        if current_chunk:
+            chunks.append(self._create_chunk(current_chunk, page_no, section_header))
+        
+        return chunks
+    
+    def _split_large_text(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
+        """큰 텍스트를 적절히 분할"""
+        return self._semantic_chunking(text, page_no)
+    
+    def _process_inter_page_continuity(self, chunks: List[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:
+        """페이지 간 연속성 처리"""
+        if len(chunks) < 2:
+            return chunks
+        
+        processed = []
+        i = 0
+        
+        while i < len(chunks):
+            current_text, current_meta = chunks[i]
+            
+            # 다음 청크와 연결 가능한지 확인
+            if (i + 1 < len(chunks) and 
+                self._should_merge_chunks(current_meta, chunks[i + 1][1])):
+                
+                next_text, next_meta = chunks[i + 1]
+                
+                # 두 청크 병합
+                merged_text = self._merge_chunk_texts(current_text, next_text)
+                merged_meta = self._merge_chunk_metadata(current_meta, next_meta)
+                
+                processed.append((merged_text, merged_meta))
+                i += 2
+            else:
+                processed.append((current_text, current_meta))
+                i += 1
+        
+        return processed
+    
+    def _should_merge_chunks(self, meta1: Dict, meta2: Dict) -> bool:
+        """두 청크 병합 여부 판단"""
+        # 연속 페이지 확인
+        if abs(meta1.get('page', 0) - meta2.get('page', 0)) != 1:
+            return False
+        
+        # 토큰 수 제한
+        total_tokens = meta1.get('token_count', 0) + meta2.get('token_count', 0)
+        if total_tokens > self.max_chunk_tokens:
+            return False
+        
+        # 같은 섹션 확인
+        section1 = meta1.get('section', '')
+        section2 = meta2.get('section', '')
+        
+        if section1 and section2 and section1 == section2:
+            return True
+        
+        # 구조적 연속성 확인
+        type1 = meta1.get('type', '')
+        type2 = meta2.get('type', '')
+        
+        # 같은 타입의 청크들은 연결 가능성 높음
+        if type1 == type2 and 'table' not in type1:  # 표는 제외
+            return True
+        
+        return False
+    
+    def _merge_chunk_texts(self, text1: str, text2: str) -> str:
+        """두 청크 텍스트 병합"""
+        clean_text1 = self._strip_meta_line(text1)
+        clean_text2 = self._strip_meta_line(text2)
+        
+        return clean_text1 + "\n\n" + clean_text2
+    
+    def _merge_chunk_metadata(self, meta1: Dict, meta2: Dict) -> Dict:
+        """두 청크 메타데이터 병합"""
+        merged = meta1.copy()
+        
+        # 페이지 범위 확장
+        pages1 = meta1.get('pages', [meta1.get('page', 0)])
+        pages2 = meta2.get('pages', [meta2.get('page', 0)])
+        merged['pages'] = sorted(set(pages1 + pages2))
+        merged['page'] = merged['pages'][0]
+        
+        # 토큰 수 합계
+        merged['token_count'] = meta1.get('token_count', 0) + meta2.get('token_count', 0)
+        
+        return merged
+    
+    def _finalize_chunks(self, chunks: List[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:
+        """최종 청크 검증 및 정리"""
+        finalized = []
+        
+        for text, meta in chunks:
+            # 최소 토큰 수 확인
+            if meta.get('token_count', 0) < self.min_chunk_tokens:
+                continue
+            
+            # 텍스트 정리
+            clean_text = self._clean_chunk_text(text)
+            if not clean_text.strip():
+                continue
+            
+            # 메타데이터 정규화
+            clean_meta = self._normalize_chunk_metadata(meta, clean_text)
+            
+            # META 라인 추가
+            meta_line = "META: " + json.dumps(clean_meta, ensure_ascii=False)
+            final_text = meta_line + "\n" + self._strip_meta_line(clean_text)
+            
+            finalized.append((final_text, clean_meta))
+        
+        return finalized
+    
+    def _clean_chunk_text(self, text: str) -> str:
+        """청크 텍스트 정리"""
+        # 이상한 라벨 제거 ("인접행 묶음" 등)
+        text = re.sub(r'\b인접행\s*묶음\b', '', text)
+        text = re.sub(r'\b[가-힣]*\s*묶음\b', '', text)
+        text = re.sub(r'\b\w*\s*묶음\b', '', text)
+        
+        # 과도한 공백/개행 정리
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'^\s+|\s+$', '', text, flags=re.MULTILINE)
+        
+        return text.strip()
+    
+    def _normalize_chunk_metadata(self, meta: Dict, text: str) -> Dict:
+        """청크 메타데이터 정규화"""
+        normalized = {
+            "type": meta.get('type', 'smart_chunk'),
+            "section": str(meta.get('section', ''))[:512],  # 길이 제한
+            "page": meta.get('page', 0),
+            "pages": meta.get('pages', [meta.get('page', 0)]),
+            "token_count": self._count_tokens(text),
+            "bboxes": meta.get('bboxes', {}),
+        }
+        
+        return normalized
+    
+    def _create_chunk(self, text: str, page_no: int, section: str = "") -> Tuple[str, Dict]:
+        """청크 생성 헬퍼 함수"""
+        meta = {
+            "type": "smart_chunk",
+            "section": section,
+            "page": page_no,
+            "pages": [page_no],
+            "token_count": self._count_tokens(text),
+            "bboxes": {},
+        }
+        
+        return (text, meta)
+    
+    def _strip_meta_line(self, text: str) -> str:
+        """META 라인 제거"""
+        if text.startswith("META:"):
+            nl_pos = text.find("\n")
+            return text[nl_pos + 1:] if nl_pos != -1 else ""
+        return text
+    
+    def _count_tokens(self, text: str) -> int:
+        """토큰 수 계산"""
+        if not text:
+            return 0
+        try:
+            return len(self.encoder(text))
+        except:
+            # 폴백: 대략적 추정 (한국어 특성 반영)
+            korean_chars = len(re.findall(r'[가-힣]', text))
+            english_words = len(re.findall(r'[A-Za-z]+', text))
+            numbers = len(re.findall(r'\d+', text))
+            
+            return int(korean_chars * 0.8 + english_words * 1.2 + numbers * 0.5)
 
-    return chunks
+
+class SmartChunkerPlus(SmartChunker):
+    """스마트 청커 플러스 버전 - 레이아웃 정보 활용 기능 추가"""
+    
+    def __init__(self, encoder_fn: Callable, target_tokens: int = 400, overlap_tokens: int = 100):
+        super().__init__(encoder_fn, target_tokens, overlap_tokens)
+        
+    def chunk_pages_plus(self, pages_std: List[Tuple[int, str]], 
+                        layout_blocks: Optional[Dict[int, List[Dict]]] = None) -> List[Tuple[str, Dict]]:
+        """레이아웃 정보를 활용한 스마트 청킹"""
+        if not pages_std:
+            return []
+        
+        if not layout_blocks:
+            # 레이아웃 정보 없으면 기본 스마트 청킹
+            return self.chunk_pages(pages_std)
+        
+        all_chunks = []
+        
+        for page_no, text in pages_std:
+            if not text or not text.strip():
+                continue
+            
+            # 레이아웃 정보 활용
+            page_blocks = layout_blocks.get(page_no, [])
+            if page_blocks:
+                page_chunks = self._layout_enhanced_chunking(text, page_no, page_blocks)
+            else:
+                page_chunks = self._semantic_chunking(text, page_no)
+            
+            all_chunks.extend(page_chunks)
+        
+        return self._finalize_chunks(all_chunks)
+    
+    def _layout_enhanced_chunking(self, text: str, page_no: int, blocks: List[Dict]) -> List[Tuple[str, Dict]]:
+        """레이아웃 정보를 활용한 향상된 청킹"""
+        chunks = []
+        
+        # 블록 정보에서 텍스트와 위치 추출
+        text_blocks = []
+        for block in blocks:
+            block_text = block.get('text', '').strip()
+            if block_text:
+                text_blocks.append({
+                    'text': block_text,
+                    'bbox': block.get('bbox', {}),
+                    'y': block.get('bbox', {}).get('y0', 0)
+                })
+        
+        # Y 좌표 기준 정렬 (위에서 아래로)
+        text_blocks.sort(key=lambda b: b['y'])
+        
+        # 블록들을 의미론적으로 그룹핑
+        semantic_groups = self._group_blocks_semantically(text_blocks)
+        
+        # 그룹별 청킹
+        for group in semantic_groups:
+            group_text = '\n\n'.join(block['text'] for block in group['blocks'])
+            
+            if self._count_tokens(group_text) <= self.target_tokens:
+                chunks.append(self._create_chunk(group_text, page_no, group.get('section', '')))
+            else:
+                # 큰 그룹은 세분화
+                sub_chunks = self._subdivide_block_group(group, page_no)
+                chunks.extend(sub_chunks)
+        
+        return chunks
+    
+    def _group_blocks_semantically(self, blocks: List[Dict]) -> List[Dict]:
+        """블록들을 의미론적으로 그룹핑"""
+        if not blocks:
+            return []
+        
+        groups = []
+        current_group = {'blocks': [blocks[0]], 'section': ''}
+        
+        for i in range(1, len(blocks)):
+            current_block = blocks[i]
+            prev_block = blocks[i-1]
+            
+            # 수직 거리 계산
+            y_distance = current_block['y'] - prev_block.get('bbox', {}).get('y1', prev_block['y'])
+            
+            # 그룹 연속성 판단
+            should_continue_group = (
+                y_distance < 30 and  # 30pt 미만의 간격
+                self._blocks_are_semantically_related(current_block, prev_block)
+            )
+            
+            if should_continue_group:
+                current_group['blocks'].append(current_block)
+            else:
+                # 새 그룹 시작
+                groups.append(current_group)
+                current_group = {'blocks': [current_block], 'section': ''}
+        
+        # 마지막 그룹 추가
+        groups.append(current_group)
+        
+        return groups
+    
+    def _blocks_are_semantically_related(self, block1: Dict, block2: Dict) -> bool:
+        """두 블록이 의미론적으로 연관되어 있는지 확인"""
+        text1 = block1['text'].lower()
+        text2 = block2['text'].lower()
+        
+        # 키워드 유사성
+        words1 = set(re.findall(r'[가-힣]{2,}|[A-Za-z]{3,}', text1))
+        words2 = set(re.findall(r'[가-힣]{2,}|[A-Za-z]{3,}', text2))
+        
+        if words1 and words2:
+            overlap = len(words1 & words2)
+            similarity = overlap / min(len(words1), len(words2))
+            if similarity > 0.3:
+                return True
+        
+        # 구조적 연속성
+        if any(connector in text1 for connector in self.connective_words):
+            return True
+        
+        return False
+    
+    def _subdivide_block_group(self, group: Dict, page_no: int) -> List[Tuple[str, Dict]]:
+        """큰 블록 그룹을 세분화"""
+        chunks = []
+        blocks = group['blocks']
+        
+        current_chunk_blocks = []
+        current_tokens = 0
+        
+        for block in blocks:
+            block_tokens = self._count_tokens(block['text'])
+            
+            if current_tokens + block_tokens <= self.target_tokens:
+                current_chunk_blocks.append(block)
+                current_tokens += block_tokens
+            else:
+                # 현재 청크 완료
+                if current_chunk_blocks:
+                    chunk_text = '\n\n'.join(b['text'] for b in current_chunk_blocks)
+                    chunks.append(self._create_chunk(chunk_text, page_no, group.get('section', '')))
+                
+                current_chunk_blocks = [block]
+                current_tokens = block_tokens
+        
+        # 마지막 청크 처리
+        if current_chunk_blocks:
+            chunk_text = '\n\n'.join(b['text'] for b in current_chunk_blocks)
+            chunks.append(self._create_chunk(chunk_text, page_no, group.get('section', '')))
+        
+        return chunks
+
+
+# 기존 인터페이스 호환 함수들
+def smart_chunk_pages(pages_std: List[Tuple[int, str]], 
+                     encoder_fn: Callable,
+                     target_tokens: int = 400,
+                     overlap_tokens: int = 100) -> List[Tuple[str, Dict]]:
+    """
+    스마트 청킹 함수 (기본 버전)
+    
+    Args:
+        pages_std: [(page_no, text), ...] 형태의 페이지 데이터
+        encoder_fn: 토큰 인코딩 함수
+        target_tokens: 목표 토큰 수
+        overlap_tokens: 오버랩 토큰 수
+    
+    Returns:
+        [(chunk_text, metadata), ...] 형태의 청크 리스트
+    """
+    if not pages_std:
+        return []
+    
+    chunker = SmartChunker(encoder_fn, target_tokens, overlap_tokens)
+    return chunker.chunk_pages(pages_std)
+
+
+def smart_chunk_pages_plus(pages_std: List[Tuple[int, str]], 
+                          encoder_fn: Callable,
+                          target_tokens: int = 400,
+                          overlap_tokens: int = 100,
+                          layout_blocks: Optional[Dict[int, List[Dict]]] = None) -> List[Tuple[str, Dict]]:
+    """
+    스마트 청킹 함수 (플러스 버전 - 레이아웃 정보 활용)
+    
+    Args:
+        pages_std: [(page_no, text), ...] 형태의 페이지 데이터
+        encoder_fn: 토큰 인코딩 함수
+        target_tokens: 목표 토큰 수
+        overlap_tokens: 오버랩 토큰 수
+        layout_blocks: 레이아웃 블록 정보
+    
+    Returns:
+        [(chunk_text, metadata), ...] 형태의 청크 리스트
+    """
+    if not pages_std:
+        return []
+    
+    chunker = SmartChunkerPlus(encoder_fn, target_tokens, overlap_tokens)
+    return chunker.chunk_pages_plus(pages_std, layout_blocks)
