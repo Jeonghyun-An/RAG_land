@@ -28,6 +28,7 @@ from app.services.pdf_converter import convert_stream_to_pdf_bytes, convert_to_p
 from app.services.milvus_store_v2 import MilvusStoreV2
 from app.services.embedding_model import get_embedding_model, embed
 from app.services.reranker import rerank
+from app.services.eval.eval_logger import log_qa_event
 
 router = APIRouter(tags=["llama"])
 
@@ -258,7 +259,7 @@ def index_pdf_to_milvus(
                 try:
                     # 지연 임포트(이 파일 상단에 import 안 되어 있으면 NameError 방지)
                     from app.services.ocr_service import try_ocr_pdf_bytes
-                    ocr_text = try_ocr_pdf_bytes(pdf_bytes, enabled=True)  # returns str|None
+                    ocr_text = _get_clean_ocr_text(pdf_bytes)
                 except Exception as _e:
                     print(f"[OCR] bytes fallback failed: {getattr(_e, 'message', _e)}")
                     ocr_text = None
@@ -273,7 +274,7 @@ def index_pdf_to_milvus(
             print("[PARSE] no textual content after parsing/OCR; will use fallback if chunkers return empty")
         job_state.update(job_id, status="parsing", step="parse_pdf:done", progress=25)
 
-        # ---------- 2) 청킹 ----------
+        # ---------- 2) 고도화된 청킹 시스템 ----------
         job_state.update(job_id, status="chunking", step="chunk:start", progress=35)
 
         # 인코더/길이
@@ -282,57 +283,104 @@ def index_pdf_to_milvus(
         default_overlap = min(96, default_target // 3)
         target_tokens = int(os.getenv("RAG_CHUNK_TOKENS", str(default_target)))
         overlap_tokens = int(os.getenv("RAG_CHUNK_OVERLAP", str(default_overlap)))
+        min_chunk_tokens = int(os.getenv("RAG_MIN_CHUNK_TOKENS", "100"))
 
         chunks: list[tuple[str, dict]] | None = None
         
-        # 2-0) 법령/규정 전용 청커 (최우선)
+        print(f"[CHUNK] Starting advanced chunking - target_tokens={target_tokens}, pages={len(pages_std)}")
+        
+        # 2-0) 원자력 법령/매뉴얼 전용 청커 (최우선) 새로운 고도화 청커
         try:
-            from app.services.law_chunker import law_chunk_pages  # ← 새 파일
-            # 법령/규정 문서가 아닐 수도 있지만, 시도해서 빈 결과면 기존 흐름으로 자동 폴백
+            from app.services.law_chunker import law_chunk_pages
+            print("[CHUNK] Trying nuclear legal chunker...")
+            
             law_chunks = law_chunk_pages(
                 pages_std, enc,
-                target_tokens=target_tokens, overlap_tokens=overlap_tokens,
+                target_tokens=target_tokens, 
+                overlap_tokens=overlap_tokens,
                 layout_blocks=layout_map,
-                min_chunk_tokens=int(os.getenv("RAG_MIN_CHUNK_TOKENS", "100")),
+                min_chunk_tokens=min_chunk_tokens,
             )
+            
             if law_chunks:
                 chunks = law_chunks
+                print(f"[CHUNK] Nuclear legal chunker succeeded: {len(law_chunks)} chunks")
+            else:
+                print("[CHUNK] Nuclear legal chunker returned empty - not legal document")
+                
+        except ImportError as ie:
+            print(f"[CHUNK] law_chunker not available: {ie}")
         except Exception as e0:
             print(f"[CHUNK] law_chunker failed: {e0}")
 
-        # 2-1) 레이아웃 인지 청킹
-        try:
-            from app.services.layout_chunker import layout_aware_chunks  # type: ignore
-            chunks = layout_aware_chunks(
-                pages_std, enc, target_tokens, overlap_tokens,
-                slide_rows=4, layout_blocks=layout_map
-            )
-            if not chunks:
-                raise RuntimeError("layout-aware 결과 비어있음")
-        except Exception as e1:
-            # 2-2) 플러스 청커
+        # 2-1) 레이아웃 인지 청킹 (고도화된 버전) 
+        if not chunks:
             try:
-                from app.services.chunker import smart_chunk_pages_plus, smart_chunk_pages
+                from app.services.layout_chunker import layout_aware_chunks
+                print("[CHUNK] Trying advanced layout-aware chunker...")
+                
+                chunks = layout_aware_chunks(
+                    pages_std, enc, target_tokens, overlap_tokens,
+                    slide_rows=4, layout_blocks=layout_map
+                )
+                
+                if chunks:
+                    print(f"[CHUNK] Layout-aware chunker succeeded: {len(chunks)} chunks")
+                else:
+                    print("[CHUNK] Layout-aware chunker returned empty")
+                    
+            except ImportError as ie:
+                print(f"[CHUNK] layout_chunker not available: {ie}")
+            except Exception as e1:
+                print(f"[CHUNK] layout_aware_chunks failed: {e1}")
+
+        # 2-2) 스마트 청커 플러스 (레이아웃 정보 활용) 
+        if not chunks:
+            try:
+                from app.services.chunker import smart_chunk_pages_plus
+                print("[CHUNK] Trying smart chunker plus...")
+                
                 chunks = smart_chunk_pages_plus(
                     pages_std, enc,
-                    target_tokens=target_tokens, overlap_tokens=overlap_tokens,
+                    target_tokens=target_tokens, 
+                    overlap_tokens=overlap_tokens,
                     layout_blocks=layout_map
                 )
-                if not chunks:
-                    raise RuntimeError("plus 결과 비어있음")
+                
+                if chunks:
+                    print(f"[CHUNK] Smart chunker plus succeeded: {len(chunks)} chunks")
+                else:
+                    print("[CHUNK] Smart chunker plus returned empty")
+                    
             except Exception as e2:
-                print(f"[CHUNK] layout-aware/plus failed ({e1}); fallback to smart ({e2})")
-                # 2-3) 기본 청커
+                print(f"[CHUNK] smart_chunk_pages_plus failed: {e2}")
+
+        # 2-3) 기본 스마트 청커 (폴백)
+        if not chunks:
+            try:
+                from app.services.chunker import smart_chunk_pages
+                print("[CHUNK] Falling back to basic smart chunker...")
+                
                 chunks = smart_chunk_pages(
                     pages_std, enc,
-                    target_tokens=target_tokens, overlap_tokens=overlap_tokens
+                    target_tokens=target_tokens, 
+                    overlap_tokens=overlap_tokens
                 )
+                
+                if chunks:
+                    print(f"[CHUNK] Basic smart chunker succeeded: {len(chunks)} chunks")
+                else:
+                    print("[CHUNK] All chunkers failed - will use fallback protection")
+                    
+            except Exception as e3:
+                print(f"[CHUNK] smart_chunk_pages failed: {e3}")
 
-        # ---------- 2-4) bytes-OCR 세컨드 찬스 + 기본 청커 ----------
+        # 2-4) bytes-OCR 세컨드 찬스 (기존 코드 유지)
         if (not chunks or len(chunks) == 0) and use_bytes_path and OCR_BYTES_ENABLED:
             if pdf_bytes:
                 try:
                     from app.services.ocr_service import try_ocr_pdf_bytes
+                    print("[CHUNK] Trying OCR second chance...")
                     ocr_text2 = try_ocr_pdf_bytes(pdf_bytes, enabled=True)
                 except Exception as _e:
                     print(f"[CHUNK] second-chance OCR failed: {getattr(_e, 'message', _e)}")
@@ -343,56 +391,98 @@ def index_pdf_to_milvus(
                     from app.services.chunker import smart_chunk_pages
                     chunks = smart_chunk_pages(
                         pages_std, enc,
-                        target_tokens=target_tokens, overlap_tokens=overlap_tokens
+                        target_tokens=target_tokens, 
+                        overlap_tokens=overlap_tokens
                     )
-                    print(f"[CHUNK] second-chance via OCR succeeded, chunks={len(chunks or [])})")
+                    print(f"[CHUNK] OCR second-chance succeeded: {len(chunks or [])} chunks")
 
-        # ---------- 2-5) 최후 보호막: 통짜 텍스트라도 1개 청크 생성 ----------
+        # 2-5) 최후 보호막 (기존 코드 유지하되 텍스트 정리 강화)
         if not chunks or len(chunks) == 0:
+            print("[CHUNK] All chunkers failed - using fallback protection")
+            
             flat_texts = []
             for _, t in pages_std or []:
                 tt = (t or "").strip()
                 if tt:
-                    flat_texts.append(tt)
+                    # 이상한 라벨 제거
+                    tt = re.sub(r'\b인접행\s*묶음\b', '', tt)
+                    tt = re.sub(r'\b[가-힣]*\s*묶음\b', '', tt)  
+                    tt = re.sub(r'[\r\n\s]+', ' ', tt)  # 과도한 공백 정리
+                    if tt.strip():
+                        flat_texts.append(tt.strip())
 
-            # 텍스트가 전혀 없으면, 페이지 수만큼 placeholder라도 만들어 크래시 방지
             fallback_text = "\n\n".join(flat_texts).strip()
+            
             if not fallback_text:
-                # bytes가 있고 페이지 수를 구할 수 있으면 이미지-플레이스홀더
+                # 이미지 플레이스홀더 생성
                 try:
                     if pdf_bytes:
                         import fitz
                         doc_dbg = fitz.open(stream=pdf_bytes, filetype="pdf")
-                        placeholders = [f"[page {i+1}: image-only]" for i in range(doc_dbg.page_count)]
+                        placeholders = [f"[page {i+1}: image or low-text content]" for i in range(doc_dbg.page_count)]
                         fallback_text = "\n".join(placeholders).strip()
                 except Exception:
                     pass
 
-            # 그래도 비면, ENV로 동작 결정: 기본은 크래시 방지용 더미 텍스트 생성
+            # 최종 폴백
             if not fallback_text:
                 if os.getenv("RAG_ALLOW_EMPTY_FALLBACK", "1") == "1":
-                    fallback_text = "[empty document after parsing/OCR]"
+                    fallback_text = "[Document processed but no readable text content found]"
                 else:
-                    raise RuntimeError("Chunking 결과가 비었습니다.")
+                    raise RuntimeError("모든 청킹 방법이 실패했습니다.")
 
-            # META 구성
+            # 메타 구성 (개선된 버전)
             import json
             meta = {
-                "type": "text",
-                "section": "",
+                "type": "emergency_fallback",
+                "section": "문서 전체 (비상 모드)",
                 "pages": [int(p) for p, _ in (pages_std or [])] or [1],
+                "token_count": len(enc(fallback_text)) if fallback_text else 0,
                 "bboxes": {},
+                "note": "Advanced chunking failed, using emergency fallback"
             }
+            
             meta_line = "META: " + json.dumps(meta, ensure_ascii=False)
             chunk_text = meta_line + "\n" + fallback_text
             first_page = int(meta["pages"][0]) if meta["pages"] else 0
-            chunks = [(chunk_text, {"page": first_page, "section": "", "pages": meta["pages"], "bboxes": {}})]
+            
+            chunks = [(chunk_text, {
+                "page": first_page, 
+                "section": meta["section"], 
+                "pages": meta["pages"], 
+                "bboxes": meta["bboxes"],
+                "token_count": meta["token_count"],
+                "type": meta["type"]
+            })]
 
-        # ---------- 2-6) 최종 검사 ----------
+        # 2-6) 최종 검사 및 정리 (강화된 버전)
+        if chunks:
+            print(f"[CHUNK] Pre-cleanup: {len(chunks)} chunks")
+            
+            # 텍스트 정리 강화
+            cleaned_chunks = []
+            for chunk_text, chunk_meta in chunks:
+                # "인접행 묶음" 등 이상한 라벨 제거
+                clean_text = re.sub(r'\b인접행\s*묶음\b', '', chunk_text)
+                clean_text = re.sub(r'\b[가-힣]*행\s*묶음\b', '', clean_text)  
+                clean_text = re.sub(r'\b\w*\s*묶음\b', '', clean_text)
+                
+                # 과도한 공백 정리
+                clean_text = re.sub(r'\n\s*\n\s*\n+', '\n\n', clean_text)
+                clean_text = re.sub(r'[ \t]+', ' ', clean_text)
+                
+                # 빈 청크 건너뛰기
+                if clean_text.strip() and len(clean_text.strip()) > 10:
+                    cleaned_chunks.append((clean_text.strip(), chunk_meta))
+            
+            chunks = cleaned_chunks
+            print(f"[CHUNK] Post-cleanup: {len(chunks)} chunks")
+
         chunks = _coerce_chunks_for_milvus(chunks)
         if not chunks:
-            raise RuntimeError("Chunking 결과가 비었습니다.")
+            raise RuntimeError("최종 청킹 결과가 비었습니다.")
 
+        print(f"[CHUNK] Final result: {len(chunks)} chunks ready for embedding")
         job_state.update(job_id, status="chunking", step="chunk:done", chunks=len(chunks), progress=50)
 
         # ---------- 3) doc_id 확정 ----------
@@ -515,6 +605,52 @@ def index_pdf_to_milvus(
     except Exception as e:
         job_state.fail(job_id, str(e))
         raise
+def _get_clean_ocr_text(pdf_bytes: bytes) -> str:
+    """OCR + 워터마크 제거"""
+    try:
+        import fitz
+        import easyocr
+        from app.services.ocr_service import filter_watermarks
+        
+        # PyMuPDF로 렌더링
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if doc.page_count == 0:
+            return None
+            
+        # 첫 페이지에서 크기 정보 획득
+        page = doc[0]
+        page_w, page_h = page.rect.width, page.rect.height
+        
+        # EasyOCR 실행
+        reader = easyocr.Reader(['ko', 'en'], gpu=False)
+        all_results = []
+        
+        for page_num in range(doc.page_count):
+            page = doc[page_num]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+            
+            results = reader.readtext(img, detail=1)  # bbox, text, confidence
+            all_results.append(results)
+        
+        # 워터마크 필터링
+        filtered_results = filter_watermarks(all_results, page_w, page_h)
+        
+        # 필터링된 텍스트만 추출
+        clean_texts = []
+        for page_results in filtered_results:
+            page_text = []
+            for bbox, text, conf in page_results:
+                if conf > 0.5:  # 신뢰도 필터
+                    page_text.append(text)
+            if page_text:
+                clean_texts.append('\n'.join(page_text))
+        
+        return '\n\n'.join(clean_texts)
+        
+    except Exception as e:
+        print(f"[OCR] Clean OCR failed: {e}")
+        return None
 
 def _content_disposition(disposition: str, filename: str) -> str:
     """
@@ -772,7 +908,7 @@ def ask_question(req: AskReq):
             sec = (c.get("section") or "").strip()
             chunk_body = _strip_meta_line(c.get("chunk", ""))
             body_only = f"{sec}\n{chunk_body}" if sec and not chunk_body.startswith(sec) else chunk_body
-            context_lines.append(f"[{i}] (doc:{c['doc_id']} p.{c['page']} {c.get('section','')})\n{body_only}")
+            context_lines.append(f"[{i}] (doc:{c['doc_id']} p.{c['page']})\n{chunk_body}")
             sources.append({
                 "id": i,
                 "doc_id": c.get("doc_id"),
@@ -789,7 +925,6 @@ def ask_question(req: AskReq):
 [중요 규칙]
 - 문서에 명확한 근거가 있는 경우에만 답변하세요
 - 추측이나 일반적인 지식으로 답하지 마세요
-- 답변은 2-3문장으로 간결하게 작성하세요
 - 같은 내용을 반복하지 마세요
 - 문서에서 찾을 수 없으면 "문서에서 해당 내용을 찾을 수 없습니다"라고 답하세요
 
@@ -803,7 +938,17 @@ def ask_question(req: AskReq):
 
         answer = generate_answer_unified(prompt, req.model_name)
         answer = _clean_repetitive_answer(answer)
-
+        try:
+            log_qa_event(
+                question=req.question,
+                answer=answer,
+                sources=sources,  # 위에서 만든 sources 리스트 그대로
+                meta={"model": req.model_name, "top_k": req.top_k}
+            )
+        except Exception as _e:
+            print(f"[EVAL_LOG] skip: {getattr(_e,'message',_e)}")
+        print(f"[PROMPT]\n{prompt}\n[END PROMPT]")
+        print(f"[ASK] Q: {req.question} => A: {answer} (chunks={len(topk)})")
         return AskResp(answer=answer, used_chunks=len(topk), sources=sources)
 
     except HTTPException:
