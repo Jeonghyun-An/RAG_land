@@ -200,7 +200,6 @@ services:
       RAG_CHUNK_TOKENS: 600 # 청킹 토큰 수(256 최적, 지금은 임베딩 모델이 로컬용이라 구려서 낮춤)
       RAG_CHUNK_OVERLAP: 120 # 청킹 오버랩 토큰 수(64 최적)
       RAG_MIN_CHUNK_TOKENS: 150 # 너무 작은 청크는 병합
-
       RAG_PARSE_LAYOUT: 1 # 레이아웃 인지 청킹
       RAG_PARSE_LAYOUT_MIN_CHARS: 100 # 레이아웃 인지 청킹 최소 문자 수
       RAG_PARSE_LAYOUT_MAX_TOKENS: 512 # 레이아웃 인지 청킹 최대 토큰 수
@@ -220,6 +219,9 @@ services:
       LAW_GLOBAL_MIN_REPEAT: "2"
       LAW_GLOBAL_MINLEN: "3"
       LAW_GLOBAL_MAXLEN: "140"
+      RAG_ENABLE_LAW_CHUNKER: "1" # 법령 청커 활성화 여부
+      RAG_ENABLE_LAYOUT_CHUNKER: "1" # 레이아웃 청커 활성화 여부
+      RAG_SEMANTIC_THRESHOLD: "0.7" # 의미 연결성 임계값
       # --- RAG 청킹/인코딩 옵션 ---
       RAG_PARSE_PDF: "1" # PDF 파싱 여부
       RAG_PARSE_DOCX: "1" # DOCX 파싱 여부
