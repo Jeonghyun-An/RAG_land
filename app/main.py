@@ -2,6 +2,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.llama_router import router as llama_router
+from app.api.eval_router import router as eval_router
 
 API_BASE = "/llama"
 
@@ -19,6 +20,7 @@ app.add_middleware(
 )
 
 app.include_router(llama_router, prefix=API_BASE)
+app.include_router(eval_router, prefix=API_BASE)
 
 @app.get(f"{API_BASE}/healthz")
 def healthz():
