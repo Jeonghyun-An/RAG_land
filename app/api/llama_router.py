@@ -925,6 +925,7 @@ def ask_question(req: AskReq):
 [중요 규칙]
 - 문서에 명확한 근거가 있는 경우에만 답변하세요
 - 추측이나 일반적인 지식으로 답하지 마세요
+- 답변은 2-3문장으로 간결하게 작성하세요
 - 같은 내용을 반복하지 마세요
 - 문서에서 찾을 수 없으면 "문서에서 해당 내용을 찾을 수 없습니다"라고 답하세요
 
@@ -933,6 +934,11 @@ def ask_question(req: AskReq):
 
 [질문]
 {req.question}
+
+[답변 형식]
+1. 정의: [문서에서 찾은 정의]
+2. 주요 내용: [구체적 절차나 규정]
+3. 관련 조항: [해당되는 경우]
 
 [답변]"""
 
@@ -964,35 +970,34 @@ def _clean_repetitive_answer(answer: str) -> str:
     if not answer:
         return answer
     
-    # 매우 긴 답변 잘라내기 (1000자 초과 시)
-    if len(answer) > 1000:
-        sentences = answer.split('.')
-        clean_sentences = []
-        for sentence in sentences[:5]:  # 최대 5문장만
-            if sentence.strip() and len(sentence.strip()) > 10:
-                clean_sentences.append(sentence.strip())
-        answer = '. '.join(clean_sentences) + '.'
+    # 문장 단위로 분리
+    sentences = answer.split('.')
+    unique_sentences = []
+    seen_content = set()
     
-    # 반복되는 구문 제거 (같은 구문이 3번 이상 반복되면 제거)
-    lines = answer.split('\n')
-    seen_lines = {}
-    filtered_lines = []
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if len(sentence) < 10:
             continue
+            
+        # 의미 있는 키워드만 추출해서 중복 확인
+        keywords = set(re.findall(r'[가-힣]{2,}|[A-Za-z]{3,}', sentence))
+        content_hash = frozenset(keywords)
         
-        if line in seen_lines:
-            seen_lines[line] += 1
-            if seen_lines[line] <= 2:  # 최대 2번까지만 허용
-                filtered_lines.append(line)
-        else:
-            seen_lines[line] = 1
-            filtered_lines.append(line)
+        # 70% 이상 유사하면 중복으로 간주
+        is_duplicate = False
+        for seen in seen_content:
+            overlap = len(content_hash & seen)
+            similarity = overlap / max(len(content_hash), len(seen)) if content_hash and seen else 0
+            if similarity > 0.7:
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            unique_sentences.append(sentence)
+            seen_content.add(content_hash)
     
-    return '\n'.join(filtered_lines).strip()
-
+    return '. '.join(unique_sentences[:5]) + '.' if unique_sentences else answer
 # ---------- Job State Management ----------
 @router.get("/job/{job_id}")
 def get_job(job_id: str):
