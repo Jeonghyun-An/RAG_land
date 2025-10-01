@@ -28,7 +28,6 @@ from app.services.pdf_converter import convert_stream_to_pdf_bytes, convert_to_p
 from app.services.milvus_store_v2 import MilvusStoreV2
 from app.services.embedding_model import get_embedding_model, embed
 from app.services.reranker import rerank
-from app.services.eval.eval_logger import log_qa_event
 
 router = APIRouter(tags=["llama"])
 
@@ -944,17 +943,6 @@ def ask_question(req: AskReq):
 
         answer = generate_answer_unified(prompt, req.model_name)
         answer = _clean_repetitive_answer(answer)
-        try:
-            log_qa_event(
-                question=req.question,
-                answer=answer,
-                sources=sources,  # 위에서 만든 sources 리스트 그대로
-                meta={"model": req.model_name, "top_k": req.top_k}
-            )
-        except Exception as _e:
-            print(f"[EVAL_LOG] skip: {getattr(_e,'message',_e)}")
-        print(f"[PROMPT]\n{prompt}\n[END PROMPT]")
-        print(f"[ASK] Q: {req.question} => A: {answer} (chunks={len(topk)})")
         return AskResp(answer=answer, used_chunks=len(topk), sources=sources)
 
     except HTTPException:
