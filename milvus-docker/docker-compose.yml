@@ -254,7 +254,7 @@ services:
       PDF_MARGIN_MM: "10"
 
       # --- DOCX/XLSX direct 파싱 여부 ---
-      RAG_PARSE_DIRECT_DOCX: "1"
+      RAG_PARSE_DIRECT_DOCX: "0"
       RAG_PARSE_DIRECT_XLSX: "1"
       RAG_CONVERT_NONPDF_TO_PDF: "1" # 기타 포맷 변환 허용
       # 임베딩

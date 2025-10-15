@@ -5,15 +5,18 @@
 - 문단간 유기성 보존  
 - 다양한 문서 구조 대응
 - 토큰 기반 적응형 분할
+- 표 감지 및 bbox 정보 활용
 """
 from __future__ import annotations
 import json
 import re
 from typing import List, Tuple, Dict, Optional, Callable, Any
 import math
+from app.services.enhanced_table_detector import EnhancedTableDetector, TableRegion
+
 
 class SmartChunker:
-    """개선된 스마트 청킹 클래스"""
+    """개선된 스마트 청킹 클래스 - 표 감지 및 레이아웃 정보 통합"""
     
     def __init__(self, encoder_fn: Callable, target_tokens: int = 400, overlap_tokens: int = 100):
         self.encoder = encoder_fn
@@ -21,6 +24,7 @@ class SmartChunker:
         self.overlap_tokens = overlap_tokens
         self.min_chunk_tokens = 50
         self.max_chunk_tokens = target_tokens * 2
+        self.table_detector = EnhancedTableDetector()
         
         # 문서 구조 패턴
         self.structure_patterns = {
@@ -32,38 +36,55 @@ class SmartChunker:
         
         # 연결어 패턴
         self.connective_words = [
-            '따라서', '그러므로', '그런데', '그러나', '하지만', '또한', '또한', '더욱이',
+            '따라서', '그러므로', '그런데', '그러나', '하지만', '또한', '더욱이',
             '즉', '다시 말해서', '예를 들어', '구체적으로', '특히', '반면에',
             '이에 따라', '이와 같이', '이와 더불어', '이와 관련하여'
         ]
         
-    def chunk_pages(self, pages_std: List[Tuple[int, str]], 
-                   layout_blocks: Optional[Dict[int, List[Dict]]] = None) -> List[Tuple[str, Dict]]:
-        """페이지별 스마트 청킹"""
+    def chunk_pages(
+        self, 
+        pages_std: List[Tuple[int, str]], 
+        layout_blocks: Optional[Dict[int, List[Dict]]] = None
+    ) -> List[Tuple[str, Dict]]:
+        """
+        페이지별 스마트 청킹 - layout_blocks 활용
+        
+        Args:
+            pages_std: [(page_no, text), ...] 형태의 페이지 데이터
+            layout_blocks: {page_no: [{'text': str, 'bbox': {...}}, ...]} 형태의 레이아웃 정보
+        
+        Returns:
+            [(chunk_text, metadata), ...] 형태의 청크 리스트
+        """
         if not pages_std:
             return []
-            
+
         all_chunks = []
-        
+
         for page_no, text in pages_std:
             if not text or not text.strip():
                 continue
-                
+
             # 문서 구조 분석
             structure_info = self._analyze_document_structure(text)
             
-            # 구조 기반 청킹
+            # 페이지별 레이아웃 정보 추출
+            page_layout = layout_blocks.get(page_no) if layout_blocks else None
+
+            # 구조 기반 청킹 (layout_blocks 전달)
             if structure_info['has_clear_structure']:
-                page_chunks = self._structure_based_chunking(text, page_no, structure_info)
+                page_chunks = self._structure_based_chunking(
+                    text, page_no, structure_info, page_layout
+                )
             else:
                 # 의미론적 청킹
                 page_chunks = self._semantic_chunking(text, page_no)
-            
+
             all_chunks.extend(page_chunks)
-        
+
         # 페이지 간 연속성 처리
         connected_chunks = self._process_inter_page_continuity(all_chunks)
-        
+
         # 최종 검증 및 정리
         return self._finalize_chunks(connected_chunks)
     
@@ -113,23 +134,205 @@ class SmartChunker:
         
         return structure_info
     
-    def _structure_based_chunking(self, text: str, page_no: int, structure_info: Dict) -> List[Tuple[str, Dict]]:
-        """구조 기반 청킹"""
+    def _structure_based_chunking(
+        self, 
+        text: str, 
+        page_no: int, 
+        structure_info: Dict,
+        layout_blocks: Optional[List[Dict]] = None
+    ) -> List[Tuple[str, Dict]]:
+        """
+        구조 기반 청킹 - 표 감지 통합
+        
+        Args:
+            text: 페이지 텍스트
+            page_no: 페이지 번호
+            structure_info: 구조 분석 정보
+            layout_blocks: 레이아웃 bbox 정보
+        """
         chunks = []
         
-        if structure_info['structure_type'] == 'hierarchical':
-            chunks = self._hierarchical_chunking(text, page_no)
-        elif structure_info['structure_type'] == 'list_heavy':
-            chunks = self._list_based_chunking(text, page_no)
-        elif structure_info['structure_type'] == 'table_heavy':
-            chunks = self._table_preserving_chunking(text, page_no)
+        # ✅ 1단계: 표 감지 먼저 수행
+        detected_tables = self.table_detector.detect_tables(
+            text, page_no, layout_blocks
+        )
+        
+        if detected_tables:
+            # 표가 있는 경우: 표와 일반 텍스트 분리 처리
+            chunks = self._chunk_with_tables(
+                text, page_no, detected_tables, structure_info
+            )
         else:
-            chunks = self._semantic_chunking(text, page_no)
+            # 표가 없는 경우: 기존 로직
+            if structure_info['structure_type'] == 'hierarchical':
+                chunks = self._hierarchical_chunking(text, page_no)
+            elif structure_info['structure_type'] == 'list_heavy':
+                chunks = self._list_based_chunking(text, page_no)
+            elif structure_info['structure_type'] == 'table_heavy':
+                chunks = self._table_preserving_chunking(text, page_no)
+            else:
+                chunks = self._semantic_chunking(text, page_no)
         
         return chunks
     
+    # ========== 표 처리 관련 메서드 ==========
+    
+    def _chunk_with_tables(
+        self,
+        text: str,
+        page_no: int,
+        tables: List[TableRegion],
+        structure_info: Dict
+    ) -> List[Tuple[str, Dict]]:
+        """표가 포함된 텍스트의 스마트 청킹"""
+        chunks = []
+        lines = text.split('\n')
+        
+        # 표 영역을 라인 번호로 정렬
+        table_regions = sorted(tables, key=lambda t: t.start_line)
+        
+        current_line = 0
+        
+        for table in table_regions:
+            # 표 이전의 일반 텍스트 처리
+            if current_line < table.start_line:
+                before_text = '\n'.join(lines[current_line:table.start_line])
+                if before_text.strip():
+                    # 일반 텍스트는 기존 청킹 로직 적용
+                    text_chunks = self._semantic_chunking(
+                        before_text, page_no
+                    )
+                    chunks.extend(text_chunks)
+            
+            # 표 자체 처리
+            table_chunk = self._process_table_chunk(table, page_no)
+            if table_chunk:
+                chunks.append(table_chunk)
+            
+            current_line = table.end_line + 1
+        
+        # 마지막 표 이후의 텍스트
+        if current_line < len(lines):
+            after_text = '\n'.join(lines[current_line:])
+            if after_text.strip():
+                text_chunks = self._semantic_chunking(
+                    after_text, page_no
+                )
+                chunks.extend(text_chunks)
+        
+        return chunks
+    
+    def _process_table_chunk(
+        self, 
+        table: TableRegion, 
+        page_no: int
+    ) -> Optional[Tuple[str, Dict]]:
+        """표 청크 생성 - bbox 정보 보존"""
+        if not table.content.strip():
+            return None
+        
+        table_tokens = self._count_tokens(table.content)
+        
+        # 표가 작으면 그대로 보존
+        if table_tokens <= self.max_chunk_tokens:
+            metadata = {
+                "type": "table",
+                "table_type": table.table_type,
+                "confidence": table.confidence,
+                "page": page_no,
+                "pages": [page_no],
+                "token_count": table_tokens,
+                "bbox": table.bbox,  # ✅ bbox 정보 보존
+                "bboxes": {page_no: [table.bbox]} if table.bbox else {}
+            }
+            return (table.content, metadata)
+        
+        # 표가 너무 크면 행 단위로 분할
+        return self._split_large_table_by_rows(table, page_no)
+    
+    def _split_large_table_by_rows(
+        self, 
+        table: TableRegion, 
+        page_no: int
+    ) -> Tuple[str, Dict]:
+        """큰 표를 행 단위로 분할 - 헤더 보존"""
+        lines = table.content.split('\n')
+        
+        # 헤더 추출 (첫 2-3줄에서 구조 파악)
+        header_lines = []
+        data_start = 0
+        
+        for i, line in enumerate(lines[:5]):
+            # 헤더 패턴 감지
+            if any(kw in line for kw in ['구분', '항목', '내용', '번호', '비고']):
+                header_lines.append(line)
+            elif i < 3 and ('─' in line or '═' in line or '|' in line):
+                header_lines.append(line)
+            else:
+                if header_lines:
+                    data_start = i
+                    break
+        
+        header = '\n'.join(header_lines) if header_lines else ""
+        
+        # 데이터 행들을 토큰 제한에 맞춰 그룹화
+        chunks = []
+        current_chunk = header + "\n" if header else ""
+        current_tokens = self._count_tokens(header)
+        
+        for line in lines[data_start:]:
+            line_tokens = self._count_tokens(line)
+            
+            if current_tokens + line_tokens <= self.target_tokens:
+                current_chunk += line + "\n"
+                current_tokens += line_tokens
+            else:
+                # 현재 청크 저장
+                if current_chunk.strip():
+                    metadata = {
+                        "type": "table_split",
+                        "table_type": table.table_type,
+                        "confidence": table.confidence,
+                        "page": page_no,
+                        "pages": [page_no],
+                        "token_count": current_tokens,
+                        "has_header": bool(header),
+                        "bbox": table.bbox,
+                        "bboxes": {page_no: [table.bbox]} if table.bbox else {}
+                    }
+                    chunks.append((current_chunk, metadata))
+                
+                # 새 청크 시작 (헤더 포함)
+                current_chunk = (header + "\n" if header else "") + line + "\n"
+                current_tokens = self._count_tokens(header) + line_tokens
+        
+        # 마지막 청크
+        if current_chunk.strip():
+            metadata = {
+                "type": "table_split",
+                "table_type": table.table_type,
+                "confidence": table.confidence,
+                "page": page_no,
+                "pages": [page_no],
+                "token_count": current_tokens,
+                "has_header": bool(header),
+                "bbox": table.bbox,
+                "bboxes": {page_no: [table.bbox]} if table.bbox else {}
+            }
+            chunks.append((current_chunk, metadata))
+        
+        # 첫 번째 청크 반환 (여러 청크인 경우 첫 번째만)
+        return chunks[0] if chunks else (table.content, {
+            "type": "table", 
+            "page": page_no, 
+            "pages": [page_no],
+            "token_count": self._count_tokens(table.content)
+        })
+    
+    # ========== 계층적 구조 청킹 ==========
+    
     def _hierarchical_chunking(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
-        """계층적 구조 기반 청킹"""
+        """계층적 구조 기반 청킹 (법령, 매뉴얼 등)"""
         chunks = []
         sections = self._split_by_headers(text)
         
@@ -172,6 +375,38 @@ class SmartChunker:
             sections.append(current_section)
         
         return sections
+    
+    def _subdivide_section(
+        self, 
+        section_text: str, 
+        page_no: int, 
+        section_header: str
+    ) -> List[Tuple[str, Dict]]:
+        """섹션을 세분화"""
+        chunks = []
+        paragraphs = self._split_into_paragraphs(section_text)
+        
+        current_chunk = ""
+        current_tokens = 0
+        
+        for paragraph in paragraphs:
+            para_tokens = self._count_tokens(paragraph)
+            
+            if current_tokens + para_tokens <= self.target_tokens:
+                current_chunk += "\n\n" + paragraph if current_chunk else paragraph
+                current_tokens += para_tokens
+            else:
+                if current_chunk:
+                    chunks.append(self._create_chunk(current_chunk, page_no, section_header))
+                current_chunk = paragraph
+                current_tokens = para_tokens
+        
+        if current_chunk:
+            chunks.append(self._create_chunk(current_chunk, page_no, section_header))
+        
+        return chunks
+    
+    # ========== 목록 기반 청킹 ==========
     
     def _list_based_chunking(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
         """목록 구조 기반 청킹"""
@@ -254,8 +489,10 @@ class SmartChunker:
         
         return chunks
     
+    # ========== 표 보존 청킹 ==========
+    
     def _table_preserving_chunking(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
-        """표 구조 보존 청킹"""
+        """표 구조 보존 청킹 (레거시 - 패턴 기반)"""
         chunks = []
         segments = self._separate_tables_and_text(text)
         
@@ -323,7 +560,7 @@ class SmartChunker:
         return segments
     
     def _split_large_table(self, table_text: str, page_no: int) -> List[Tuple[str, Dict]]:
-        """큰 표를 행 단위로 분할"""
+        """큰 표를 행 단위로 분할 (레거시 메서드)"""
         chunks = []
         lines = table_text.split('\n')
         
@@ -371,8 +608,10 @@ class SmartChunker:
         
         return chunks
     
+    # ========== 의미론적 청킹 ==========
+    
     def _semantic_chunking(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
-        """의미론적 청킹"""
+        """의미론적 청킹 - 문맥 연속성 보존"""
         chunks = []
         paragraphs = self._split_into_paragraphs(text)
         
@@ -385,7 +624,9 @@ class SmartChunker:
             # 문맥 연결성 점수 계산
             continuity_score = 0
             if i > 0:
-                continuity_score = self._calculate_semantic_continuity(paragraph, paragraphs[i-1])
+                continuity_score = self._calculate_semantic_continuity(
+                    paragraph, paragraphs[i-1]
+                )
             
             # 연결 조건 확인
             should_connect = (
@@ -504,36 +745,16 @@ class SmartChunker:
         
         return [s.strip() for s in sentences if s.strip()]
     
-    def _subdivide_section(self, section_text: str, page_no: int, section_header: str) -> List[Tuple[str, Dict]]:
-        """섹션을 세분화"""
-        chunks = []
-        paragraphs = self._split_into_paragraphs(section_text)
-        
-        current_chunk = ""
-        current_tokens = 0
-        
-        for paragraph in paragraphs:
-            para_tokens = self._count_tokens(paragraph)
-            
-            if current_tokens + para_tokens <= self.target_tokens:
-                current_chunk += "\n\n" + paragraph if current_chunk else paragraph
-                current_tokens += para_tokens
-            else:
-                if current_chunk:
-                    chunks.append(self._create_chunk(current_chunk, page_no, section_header))
-                current_chunk = paragraph
-                current_tokens = para_tokens
-        
-        if current_chunk:
-            chunks.append(self._create_chunk(current_chunk, page_no, section_header))
-        
-        return chunks
-    
     def _split_large_text(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
         """큰 텍스트를 적절히 분할"""
         return self._semantic_chunking(text, page_no)
     
-    def _process_inter_page_continuity(self, chunks: List[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:
+    # ========== 페이지 간 연속성 처리 ==========
+    
+    def _process_inter_page_continuity(
+        self, 
+        chunks: List[Tuple[str, Dict]]
+    ) -> List[Tuple[str, Dict]]:
         """페이지 간 연속성 처리"""
         if len(chunks) < 2:
             return chunks
@@ -573,6 +794,10 @@ class SmartChunker:
         if total_tokens > self.max_chunk_tokens:
             return False
         
+        # 표는 병합하지 않음
+        if 'table' in meta1.get('type', '') or 'table' in meta2.get('type', ''):
+            return False
+        
         # 같은 섹션 확인
         section1 = meta1.get('section', '')
         section2 = meta2.get('section', '')
@@ -585,7 +810,7 @@ class SmartChunker:
         type2 = meta2.get('type', '')
         
         # 같은 타입의 청크들은 연결 가능성 높음
-        if type1 == type2 and 'table' not in type1:  # 표는 제외
+        if type1 == type2:
             return True
         
         return False
@@ -610,9 +835,25 @@ class SmartChunker:
         # 토큰 수 합계
         merged['token_count'] = meta1.get('token_count', 0) + meta2.get('token_count', 0)
         
+        # bbox 정보 병합
+        bboxes1 = meta1.get('bboxes', {})
+        bboxes2 = meta2.get('bboxes', {})
+        merged_bboxes = bboxes1.copy()
+        for page, boxes in bboxes2.items():
+            if page in merged_bboxes:
+                merged_bboxes[page].extend(boxes)
+            else:
+                merged_bboxes[page] = boxes
+        merged['bboxes'] = merged_bboxes
+        
         return merged
     
-    def _finalize_chunks(self, chunks: List[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:
+    # ========== 최종 처리 ==========
+    
+    def _finalize_chunks(
+        self, 
+        chunks: List[Tuple[str, Dict]]
+    ) -> List[Tuple[str, Dict]]:
         """최종 청크 검증 및 정리"""
         finalized = []
         
@@ -639,10 +880,9 @@ class SmartChunker:
     
     def _clean_chunk_text(self, text: str) -> str:
         """청크 텍스트 정리"""
-        # 이상한 라벨 제거 ("인접행 묶음" 등)
+        # 이상한 라벨 제거
         text = re.sub(r'\b인접행\s*묶음\b', '', text)
         text = re.sub(r'\b[가-힣]*\s*묶음\b', '', text)
-        text = re.sub(r'\b\w*\s*묶음\b', '', text)
         
         # 과도한 공백/개행 정리
         text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
@@ -662,9 +902,25 @@ class SmartChunker:
             "bboxes": meta.get('bboxes', {}),
         }
         
+        # 표 관련 메타데이터 보존
+        if 'table' in meta.get('type', ''):
+            normalized.update({
+                "table_type": meta.get('table_type', 'unknown'),
+                "confidence": meta.get('confidence', 0.0),
+                "has_header": meta.get('has_header', False),
+                "bbox": meta.get('bbox')
+            })
+        
         return normalized
     
-    def _create_chunk(self, text: str, page_no: int, section: str = "") -> Tuple[str, Dict]:
+    # ========== 헬퍼 메서드 ==========
+    
+    def _create_chunk(
+        self, 
+        text: str, 
+        page_no: int, 
+        section: str = ""
+    ) -> Tuple[str, Dict]:
         """청크 생성 헬퍼 함수"""
         meta = {
             "type": "smart_chunk",
@@ -699,15 +955,29 @@ class SmartChunker:
             return int(korean_chars * 0.8 + english_words * 1.2 + numbers * 0.5)
 
 
+# ========== SmartChunkerPlus: 레이아웃 고도화 버전 ==========
+
 class SmartChunkerPlus(SmartChunker):
-    """스마트 청커 플러스 버전 - 레이아웃 정보 활용 기능 추가"""
+    """스마트 청커 플러스 버전 - 레이아웃 정보 완전 활용"""
     
     def __init__(self, encoder_fn: Callable, target_tokens: int = 400, overlap_tokens: int = 100):
         super().__init__(encoder_fn, target_tokens, overlap_tokens)
         
-    def chunk_pages_plus(self, pages_std: List[Tuple[int, str]], 
-                        layout_blocks: Optional[Dict[int, List[Dict]]] = None) -> List[Tuple[str, Dict]]:
-        """레이아웃 정보를 활용한 스마트 청킹"""
+    def chunk_pages_plus(
+        self, 
+        pages_std: List[Tuple[int, str]], 
+        layout_blocks: Optional[Dict[int, List[Dict]]] = None
+    ) -> List[Tuple[str, Dict]]:
+        """
+        레이아웃 정보를 완전히 활용한 스마트 청킹
+        
+        Args:
+            pages_std: [(page_no, text), ...] 형태의 페이지 데이터
+            layout_blocks: {page_no: [{'text': str, 'bbox': {...}}, ...]} 레이아웃 정보
+        
+        Returns:
+            [(chunk_text, metadata), ...] 형태의 청크 리스트
+        """
         if not pages_std:
             return []
         
@@ -732,7 +1002,12 @@ class SmartChunkerPlus(SmartChunker):
         
         return self._finalize_chunks(all_chunks)
     
-    def _layout_enhanced_chunking(self, text: str, page_no: int, blocks: List[Dict]) -> List[Tuple[str, Dict]]:
+    def _layout_enhanced_chunking(
+        self, 
+        text: str, 
+        page_no: int, 
+        blocks: List[Dict]
+    ) -> List[Tuple[str, Dict]]:
         """레이아웃 정보를 활용한 향상된 청킹"""
         chunks = []
         
@@ -741,10 +1016,11 @@ class SmartChunkerPlus(SmartChunker):
         for block in blocks:
             block_text = block.get('text', '').strip()
             if block_text:
+                bbox = block.get('bbox', {})
                 text_blocks.append({
                     'text': block_text,
-                    'bbox': block.get('bbox', {}),
-                    'y': block.get('bbox', {}).get('y0', 0)
+                    'bbox': bbox,
+                    'y': bbox.get('y0', 0) if isinstance(bbox, dict) else 0
                 })
         
         # Y 좌표 기준 정렬 (위에서 아래로)
@@ -756,9 +1032,13 @@ class SmartChunkerPlus(SmartChunker):
         # 그룹별 청킹
         for group in semantic_groups:
             group_text = '\n\n'.join(block['text'] for block in group['blocks'])
+            group_bboxes = [block['bbox'] for block in group['blocks']]
             
             if self._count_tokens(group_text) <= self.target_tokens:
-                chunks.append(self._create_chunk(group_text, page_no, group.get('section', '')))
+                chunk = self._create_chunk(group_text, page_no, group.get('section', ''))
+                # bbox 정보 추가
+                chunk[1]['bboxes'] = {page_no: group_bboxes}
+                chunks.append(chunk)
             else:
                 # 큰 그룹은 세분화
                 sub_chunks = self._subdivide_block_group(group, page_no)
@@ -779,7 +1059,8 @@ class SmartChunkerPlus(SmartChunker):
             prev_block = blocks[i-1]
             
             # 수직 거리 계산
-            y_distance = current_block['y'] - prev_block.get('bbox', {}).get('y1', prev_block['y'])
+            prev_bbox = prev_block.get('bbox', {})
+            y_distance = current_block['y'] - prev_bbox.get('y1', prev_block['y'])
             
             # 그룹 연속성 판단
             should_continue_group = (
@@ -838,7 +1119,10 @@ class SmartChunkerPlus(SmartChunker):
                 # 현재 청크 완료
                 if current_chunk_blocks:
                     chunk_text = '\n\n'.join(b['text'] for b in current_chunk_blocks)
-                    chunks.append(self._create_chunk(chunk_text, page_no, group.get('section', '')))
+                    chunk_bboxes = [b['bbox'] for b in current_chunk_blocks]
+                    chunk = self._create_chunk(chunk_text, page_no, group.get('section', ''))
+                    chunk[1]['bboxes'] = {page_no: chunk_bboxes}
+                    chunks.append(chunk)
                 
                 current_chunk_blocks = [block]
                 current_tokens = block_tokens
@@ -846,24 +1130,32 @@ class SmartChunkerPlus(SmartChunker):
         # 마지막 청크 처리
         if current_chunk_blocks:
             chunk_text = '\n\n'.join(b['text'] for b in current_chunk_blocks)
-            chunks.append(self._create_chunk(chunk_text, page_no, group.get('section', '')))
+            chunk_bboxes = [b['bbox'] for b in current_chunk_blocks]
+            chunk = self._create_chunk(chunk_text, page_no, group.get('section', ''))
+            chunk[1]['bboxes'] = {page_no: chunk_bboxes}
+            chunks.append(chunk)
         
         return chunks
 
 
-# 기존 인터페이스 호환 함수들
-def smart_chunk_pages(pages_std: List[Tuple[int, str]], 
-                     encoder_fn: Callable,
-                     target_tokens: int = 400,
-                     overlap_tokens: int = 100) -> List[Tuple[str, Dict]]:
+# ========== 외부 인터페이스 함수 ==========
+
+def smart_chunk_pages(
+    pages_std: List[Tuple[int, str]], 
+    encoder_fn: Callable,
+    target_tokens: int = 400,
+    overlap_tokens: int = 100,
+    layout_blocks: Optional[Dict[int, List[Dict]]] = None
+) -> List[Tuple[str, Dict]]:
     """
-    스마트 청킹 함수 (기본 버전)
+    스마트 청킹 함수 (기본 버전) - 표 감지 및 layout_blocks 지원
     
     Args:
         pages_std: [(page_no, text), ...] 형태의 페이지 데이터
         encoder_fn: 토큰 인코딩 함수
         target_tokens: 목표 토큰 수
-        overlap_tokens: 오버랩 토큰 수
+        overlap_tokens: 오버랩 토큰 수 (현재 미사용)
+        layout_blocks: {page_no: [{'text': str, 'bbox': {...}}, ...]} 레이아웃 정보
     
     Returns:
         [(chunk_text, metadata), ...] 형태의 청크 리스트
@@ -872,23 +1164,25 @@ def smart_chunk_pages(pages_std: List[Tuple[int, str]],
         return []
     
     chunker = SmartChunker(encoder_fn, target_tokens, overlap_tokens)
-    return chunker.chunk_pages(pages_std)
+    return chunker.chunk_pages(pages_std, layout_blocks)
 
 
-def smart_chunk_pages_plus(pages_std: List[Tuple[int, str]], 
-                          encoder_fn: Callable,
-                          target_tokens: int = 400,
-                          overlap_tokens: int = 100,
-                          layout_blocks: Optional[Dict[int, List[Dict]]] = None) -> List[Tuple[str, Dict]]:
+def smart_chunk_pages_plus(
+    pages_std: List[Tuple[int, str]], 
+    encoder_fn: Callable,
+    target_tokens: int = 400,
+    overlap_tokens: int = 100,
+    layout_blocks: Optional[Dict[int, List[Dict]]] = None
+) -> List[Tuple[str, Dict]]:
     """
-    스마트 청킹 함수 (플러스 버전 - 레이아웃 정보 활용)
+    스마트 청킹 함수 (플러스 버전) - 레이아웃 정보 완전 활용
     
     Args:
         pages_std: [(page_no, text), ...] 형태의 페이지 데이터
         encoder_fn: 토큰 인코딩 함수
         target_tokens: 목표 토큰 수
         overlap_tokens: 오버랩 토큰 수
-        layout_blocks: 레이아웃 블록 정보
+        layout_blocks: {page_no: [{'text': str, 'bbox': {...}}, ...]} 레이아웃 정보
     
     Returns:
         [(chunk_text, metadata), ...] 형태의 청크 리스트

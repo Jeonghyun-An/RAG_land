@@ -363,7 +363,8 @@ def index_pdf_to_milvus(
                 chunks = smart_chunk_pages(
                     pages_std, enc,
                     target_tokens=target_tokens, 
-                    overlap_tokens=overlap_tokens
+                    overlap_tokens=overlap_tokens,
+                    layout_blocks=layout_map,
                 )
                 
                 if chunks:
@@ -391,7 +392,8 @@ def index_pdf_to_milvus(
                     chunks = smart_chunk_pages(
                         pages_std, enc,
                         target_tokens=target_tokens, 
-                        overlap_tokens=overlap_tokens
+                        overlap_tokens=overlap_tokens,
+                        layout_blocks=layout_map
                     )
                     print(f"[CHUNK] OCR second-chance succeeded: {len(chunks or [])} chunks")
 
