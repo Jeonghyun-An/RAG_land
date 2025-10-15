@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import json
 from typing import List, Tuple, Dict, Optional, Callable, Any
+from app.services.enhanced_table_detector import EnhancedTableDetector, TableRegion
 
 # 법령/규정 패턴 정의
 LEGAL_PATTERNS = {
@@ -55,6 +56,7 @@ class NuclearLegalChunker:
         self.overlap_tokens = overlap_tokens
         self.min_chunk_tokens = 50
         self.max_chunk_tokens = target_tokens * 2
+        self.table_detector = EnhancedTableDetector()
         
     def chunk_pages(self, pages_std: List[Tuple[int, str]], 
                    layout_blocks: Optional[Dict[int, List[Dict]]] = None,
@@ -117,6 +119,11 @@ class NuclearLegalChunker:
     
     def _chunk_iaea_guide(self, text: str, page_no: int, blocks: List[Dict]) -> List[Tuple[str, Dict]]:
         """IAEA 가이드라인 특화 청킹"""
+        detected_tables = self.table_detector.detect_tables(text, page_no, blocks)
+        if detected_tables:
+        # 표가 있으면 표 중심 청킹
+            return self._chunk_with_tables_iaea(text, page_no, detected_tables, blocks)
+   
         chunks = []
         
         # 섹션 단위로 분할
@@ -138,6 +145,11 @@ class NuclearLegalChunker:
     
     def _chunk_korean_law(self, text: str, page_no: int, blocks: List[Dict]) -> List[Tuple[str, Dict]]:
         """한국 법령 특화 청킹"""
+        detected_tables = self.table_detector.detect_tables(text, page_no, blocks)
+        
+        if detected_tables:
+            return self._chunk_with_tables_law(text, page_no, detected_tables, blocks)
+        
         chunks = []
         
         # 조항별 분할
@@ -159,6 +171,11 @@ class NuclearLegalChunker:
     
     def _chunk_technical_manual(self, text: str, page_no: int, blocks: List[Dict]) -> List[Tuple[str, Dict]]:
         """기술 매뉴얼 특화 청킹"""
+        detected_tables = self.table_detector.detect_tables(text, page_no, blocks)
+    
+        if detected_tables:
+            return self._chunk_with_tables_manual(text, page_no, detected_tables, blocks)
+    
         chunks = []
         
         # 절차 단계별 분할
@@ -659,6 +676,185 @@ class NuclearLegalChunker:
             chunks.append(self._create_chunk(current_chunk, page_no))
             
         return chunks
+    
+    def _chunk_with_tables_iaea(self, text: str, page_no: int, 
+                                tables: List[TableRegion], blocks: List[Dict]) -> List[Tuple[str, Dict]]:
+        """IAEA 문서의 표 포함 청킹"""
+        chunks = []
+        lines = text.split('\n')
+        table_regions = sorted(tables, key=lambda t: t.start_line)
+        current_line = 0
+
+        for table in table_regions:
+            # 표 이전 텍스트
+            if current_line < table.start_line:
+                before_text = '\n'.join(lines[current_line:table.start_line])
+                if before_text.strip():
+                    # IAEA 섹션 분석 후 청킹
+                    sections = self._split_by_iaea_sections(before_text)
+                    for sec in sections:
+                        chunks.extend(self._semantic_chunking(sec['text'], page_no, sec['id']))
+
+            # 표 처리
+            if table.content.strip():
+                table_tokens = self._count_tokens(table.content)
+                if table_tokens <= self.max_chunk_tokens:
+                    chunks.append(self._create_chunk(
+                        table.content, page_no, 
+                        f"IAEA Table (page {page_no})"
+                    ))
+                else:
+                    # 큰 표는 행 단위 분할
+                    chunks.extend(self._split_large_table(table.content, page_no, "IAEA Table"))
+
+            current_line = table.end_line + 1
+
+        # 마지막 텍스트
+        if current_line < len(lines):
+            after_text = '\n'.join(lines[current_line:])
+            if after_text.strip():
+                sections = self._split_by_iaea_sections(after_text)
+                for sec in sections:
+                    chunks.extend(self._semantic_chunking(sec['text'], page_no, sec['id']))
+
+        return chunks
+
+    def _chunk_with_tables_law(self, text: str, page_no: int, 
+                               tables: List[TableRegion], blocks: List[Dict]) -> List[Tuple[str, Dict]]:
+        """법령 문서의 표 포함 청킹"""
+        chunks = []
+        lines = text.split('\n')
+        table_regions = sorted(tables, key=lambda t: t.start_line)
+        current_line = 0
+
+        for table in table_regions:
+            # 표 이전 텍스트 - 조항 단위로 처리
+            if current_line < table.start_line:
+                before_text = '\n'.join(lines[current_line:table.start_line])
+                if before_text.strip():
+                    articles = self._split_by_articles(before_text)
+                    for article in articles:
+                        if self._count_tokens(article['text']) > self.target_tokens:
+                            chunks.extend(self._split_article_by_paragraphs(
+                                article['text'], page_no, article['number']
+                            ))
+                        else:
+                            chunks.append(self._create_chunk(
+                                article['text'], page_no, f"제{article['number']}조"
+                            ))
+
+            # 표 처리
+            if table.content.strip():
+                chunks.append(self._create_chunk(
+                    table.content, page_no, 
+                    f"법령 별표 (page {page_no})"
+                ))
+
+            current_line = table.end_line + 1
+
+        # 마지막 텍스트
+        if current_line < len(lines):
+            after_text = '\n'.join(lines[current_line:])
+            if after_text.strip():
+                articles = self._split_by_articles(after_text)
+                for article in articles:
+                    if self._count_tokens(article['text']) > self.target_tokens:
+                        chunks.extend(self._split_article_by_paragraphs(
+                            article['text'], page_no, article['number']
+                        ))
+                    else:
+                        chunks.append(self._create_chunk(
+                            article['text'], page_no, f"제{article['number']}조"
+                        ))
+
+        return chunks
+
+    def _chunk_with_tables_manual(self, text: str, page_no: int, 
+                                  tables: List[TableRegion], blocks: List[Dict]) -> List[Tuple[str, Dict]]:
+        """매뉴얼 문서의 표 포함 청킹"""
+        chunks = []
+        lines = text.split('\n')
+        table_regions = sorted(tables, key=lambda t: t.start_line)
+        current_line = 0
+
+        for table in table_regions:
+            # 표 이전 텍스트 - 절차 단위로 처리
+            if current_line < table.start_line:
+                before_text = '\n'.join(lines[current_line:table.start_line])
+                if before_text.strip():
+                    procedures = self._split_by_procedures(before_text)
+                    for proc in procedures:
+                        if self._is_complex_procedure(proc['text']):
+                            chunks.extend(self._split_complex_procedure(
+                                proc['text'], page_no, proc['id']
+                            ))
+                        else:
+                            chunks.append(self._create_chunk(
+                                proc['text'], page_no, proc['id']
+                            ))
+
+            # 표 처리
+            if table.content.strip():
+                chunks.append(self._create_chunk(
+                    table.content, page_no, 
+                    f"매뉴얼 표 (page {page_no})"
+                ))
+
+            current_line = table.end_line + 1
+
+        # 마지막 텍스트
+        if current_line < len(lines):
+            after_text = '\n'.join(lines[current_line:])
+            if after_text.strip():
+                procedures = self._split_by_procedures(after_text)
+                for proc in procedures:
+                    if self._is_complex_procedure(proc['text']):
+                        chunks.extend(self._split_complex_procedure(
+                            proc['text'], page_no, proc['id']
+                        ))
+                    else:
+                        chunks.append(self._create_chunk(
+                            proc['text'], page_no, proc['id']
+                        ))
+
+        return chunks
+
+    def _split_large_table(self, table_text: str, page_no: int, section: str) -> List[Tuple[str, Dict]]:
+        """큰 표를 행 단위로 분할"""
+        chunks = []
+        lines = table_text.split('\n')
+
+        # 헤더 추출
+        header_lines = []
+        for i, line in enumerate(lines[:3]):
+            if any(kw in line for kw in ['구분', '항목', '내용', '번호']):
+                header_lines.append(line)
+            elif '─' in line or '═' in line or '|' in line:
+                header_lines.append(line)
+
+        header = '\n'.join(header_lines) if header_lines else ""
+        data_start = len(header_lines)
+
+        # 데이터 행 그룹핑
+        current_chunk = header + "\n" if header else ""
+        current_tokens = self._count_tokens(header)
+
+        for line in lines[data_start:]:
+            line_tokens = self._count_tokens(line)
+
+            if current_tokens + line_tokens <= self.target_tokens:
+                current_chunk += line + "\n"
+                current_tokens += line_tokens
+            else:
+                if current_chunk.strip():
+                    chunks.append(self._create_chunk(current_chunk, page_no, section))
+                current_chunk = (header + "\n" if header else "") + line + "\n"
+                current_tokens = self._count_tokens(header) + line_tokens
+
+        if current_chunk.strip():
+            chunks.append(self._create_chunk(current_chunk, page_no, section))
+
+        return chunks
 
 def law_chunk_pages(pages_std: List[Tuple[int, str]], 
                    encoder_fn: Callable,
@@ -695,3 +891,5 @@ def law_chunk_pages(pages_std: List[Tuple[int, str]],
     
     chunker = NuclearLegalChunker(encoder_fn, target_tokens, overlap_tokens)
     return chunker.chunk_pages(pages_std, layout_blocks, min_chunk_tokens)
+
+

@@ -6,7 +6,7 @@ import json
 from io import BytesIO
 from datetime import timedelta
 from typing import Iterable, List, Optional, Union, BinaryIO
-from urllib.parse import urlparse, urlunparse, quote_plus
+from urllib.parse import quote, urlparse, urlunparse, quote_plus
 
 from minio import Minio
 from minio.error import S3Error

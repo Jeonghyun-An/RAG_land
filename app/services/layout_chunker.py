@@ -12,6 +12,7 @@ import re
 from typing import List, Tuple, Dict, Optional, Callable, Set
 from dataclasses import dataclass
 import math
+from app.services.enhanced_table_detector import EnhancedTableDetector, TableRegion
 
 @dataclass
 class BBox:
@@ -75,6 +76,7 @@ class LayoutBlock:
             bbox_dict.get('y1', 0)
         )
         self.block_type = self._classify_block_type()
+        self.table_detector = EnhancedTableDetector()
         
     def _classify_block_type(self) -> str:
         """블록 유형 분류"""
@@ -112,6 +114,7 @@ class LayoutAwareChunker:
         self.overlap_tokens = overlap_tokens
         self.min_chunk_tokens = 50
         self.slide_rows = 4
+        self.table_detector = EnhancedTableDetector()
         
     def chunk_pages(self, pages_std: List[Tuple[int, str]], 
                    layout_blocks: Dict[int, List[Dict]],
