@@ -88,4 +88,5 @@ models/
 data/
 .flag
 
-FlagEmbedding/
+/_FlagEmbedding_local/
+*.err
