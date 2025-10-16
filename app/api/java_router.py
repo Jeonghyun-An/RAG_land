@@ -345,6 +345,7 @@ async def process_convert_and_index(
         
         converted_pdf_path = None
         is_already_pdf = file_id.lower().endswith('.pdf')
+        pdf_key: Optional[str] = None
         
         if not is_already_pdf:
             # 변환 필요
@@ -368,6 +369,11 @@ async def process_convert_and_index(
                     with open(converted_pdf_path, 'wb') as f:
                         f.write(pdf_bytes)
                     file_path = converted_pdf_path  # 이후 처리는 변환본 사용
+                    folder_only = path
+                    prefix = "COMMON/oskData/"
+                    if folder_only.startswith(folder_only):
+                        folder_only = folder_only[len(prefix):]
+                    db.update_converted_file(data_id, converted_name, folder_only)
                     
             except ConvertError as e:
                 raise RuntimeError(f"PDF 변환 실패: {e}")
@@ -404,6 +410,22 @@ async def process_convert_and_index(
         for page_no, text in pages_text:
             if text.strip():
                 db.insert_ocr_result(data_id, page_no, text)
+        # OCR 성공 마킹 + 중간 상태 갱신
+        db.mark_ocr_success(data_id)
+        db.update_parse_status(data_id, rag_status="pdf_ocr_done")
+        # 중간 웹훅: PDF+OCR 완료 알림
+        if webhook_url:
+            await send_webhook(
+                webhook_url,
+                WebhookPayload(
+                    job_id=job_id, data_id=data_id, status="pdf_ocr_done",
+                    converted=True, simulated=simulate_remote,
+                    metrics={"pages": len(pages_text)},
+                    timestamps={"start": start_time.isoformat()},
+                    pdf_key_minio=pdf_key if simulate_remote else None
+                ),
+                SHARED_SECRET
+            )
         
         # ========== Step 4: 청킹 ==========
         job_state.update(job_id, status="chunking", step="Chunking text")
@@ -555,15 +577,9 @@ async def process_convert_and_index(
                 pass
         
         # MinIO 키 저장
-        if simulate_remote and converted_pdf_path is None:
-            pdf_key = generate_minio_pdf_key(data_id)
-            try:
-                with db.get_conn() as conn:
-                    cur = conn.cursor()
-                    cur.execute("UPDATE data_master SET minio_pdf_key=? WHERE data_id=?", (pdf_key, data_id))
-                    cur.close()
-            except Exception:
-                pass
+        if simulate_remote and pdf_key:
+            db.update_minio_keys(data_id, original_key=None, pdf_key=pdf_key)
+            
         
         # ========== Step 7: 완료 & Webhook ==========
         job_state.complete(
@@ -588,7 +604,7 @@ async def process_convert_and_index(
                     "end": end_time.isoformat()
                 },
                 message="converted and indexed",
-                pdf_key_minio=generate_minio_pdf_key(data_id) if simulate_remote else None
+                pdf_key_minio=pdf_key if simulate_remote else None
             )
             await send_webhook(webhook_url, payload, SHARED_SECRET)
     
