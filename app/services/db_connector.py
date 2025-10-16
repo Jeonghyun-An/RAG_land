@@ -47,11 +47,10 @@ class DBConnector:
             cur.close()
         return True
 
-    # ---- 도메인 메서드 ----
+    # ==================== 기본 조회 ====================
     def get_file_by_id(self, data_id: str | int) -> Optional[Dict[str, Any]]:
         """
-        data_master 레코드 조회
-        ✅ 추가: simulated_yn, converted_path 컬럼 (선택)
+        data_master(osk_data) 레코드 조회
         """
         sql = """
         SELECT data_id, data_title, data_code, data_code_detail, data_code_detail_sub,
@@ -71,6 +70,154 @@ class DBConnector:
             return None
         return dict(zip(cols, row))
 
+    # ==================== 1. 파일 변환 시 (doc -> pdf) ====================
+    def update_converted_file_path(self, data_id: str | int, file_folder: str, file_id: str):
+        """
+        변환된 파일 경로 업데이트
+        자바 요구사항: file_folder는 /COMMON/oskData/ 이후 경로
+        
+        예: file_folder = "2023/12/21", file_id = "converted.pdf"
+        """
+        sql = """
+        UPDATE data_master
+           SET file_folder = ?,
+               file_id = ?
+         WHERE data_id = ?
+        """
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, (file_folder, file_id, data_id))
+            cur.close()
+
+    # ==================== 2. OCR 추출 - 시작 ====================
+    def mark_ocr_start(self, data_id: str | int):
+        """
+        OCR 시작: parse_yn='L', parse_start_dt=현재시간
+        자바 규격: L = Loading (진행중)
+        """
+        sql = """
+        UPDATE data_master
+           SET parse_yn = 'L',
+               parse_start_dt = SYS_DATETIME
+         WHERE data_id = ?
+        """
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, (data_id,))
+            cur.close()
+
+    # ==================== 3. OCR 추출 - 성공 ====================
+    def mark_ocr_success(self, data_id: str | int):
+        """
+        OCR 성공: parse_yn='S', parse_end_dt=현재시간
+        자바 규격: S = Success
+        """
+        sql = """
+        UPDATE data_master
+           SET parse_yn = 'S',
+               parse_end_dt = SYS_DATETIME
+         WHERE data_id = ?
+        """
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, (data_id,))
+            cur.close()
+
+    def insert_ocr_result(self, data_id: str | int, page: int, text: str):
+        """
+        OCR 결과 저장 (MERGE - upsert)
+        자바 규격: data_id + page로 upsert
+        """
+        sql = """
+        MERGE INTO ocr_text A USING DB_ROOT
+            ON A.data_id = ? AND A.page = ?
+            WHEN MATCHED THEN
+                UPDATE SET
+                    text = ?,
+                    upt_dt = SYS_DATETIME
+            WHEN NOT MATCHED THEN
+                INSERT (data_id, page, text, parse_dt)
+                VALUES (?, ?, ?, SYS_DATETIME)
+        """
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            # MERGE 구문: ON 조건 (data_id, page), UPDATE/INSERT 각각
+            cur.execute(sql, (data_id, page, text, data_id, page, text))
+            cur.close()
+
+    # ==================== 4. OCR 추출 - 실패 ====================
+    def mark_ocr_failure(self, data_id: str | int, error_msg: str = None):
+        """
+        OCR 실패: parse_yn='F', parse_end_dt=현재시간
+        자바 규격: F = Failure
+        """
+        sql = """
+        UPDATE data_master
+           SET parse_yn = 'F',
+               parse_end_dt = SYS_DATETIME
+         WHERE data_id = ?
+        """
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, (data_id,))
+            cur.close()
+        
+        # 실패 로그 기록
+        if error_msg:
+            self.insert_ocr_history(data_id, 'F', error_msg)
+
+    # ==================== 5. OCR 히스토리 로그 ====================
+    def insert_ocr_history(self, data_id: str | int, parse_yn: str, error_msg: str = None):
+        """
+        OCR 처리 이력 로그
+        자바 규격: osk_ocr_hist 테이블
+        
+        parse_yn: 'S' (성공) | 'F' (실패) | 'L' (진행중)
+        """
+        sql = """
+        INSERT INTO ocr_history (
+            data_id,
+            parse_yn,
+            parse_dt,
+            error_msg
+        ) VALUES (
+            ?,
+            ?,
+            SYS_DATETIME,
+            ?
+        )
+        """
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, (data_id, parse_yn, error_msg))
+            cur.close()
+
+    # ==================== RAG 인덱싱 완료 (기존 + 확장) ====================
+    def update_rag_completed(self, data_id: str | int, chunks: int | None = None, doc_id: str | None = None):
+        """
+        RAG 인덱싱 완료 처리
+        - OCR 성공 처리 포함 (parse_yn='S')
+        - chunk_count, milvus_doc_id 업데이트
+        """
+        sql = """
+        UPDATE data_master
+           SET parse_yn = 'S',
+               rag_index_status = 'done',
+               rag_last_indexed_at = SYS_DATETIME,
+               parse_end_dt = SYS_DATETIME,
+               chunk_count = COALESCE(?, chunk_count),
+               milvus_doc_id = COALESCE(?, milvus_doc_id)
+         WHERE data_id = ?
+        """
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, (chunks, doc_id, data_id))
+            cur.close()
+        
+        # 성공 로그 기록
+        self.insert_ocr_history(data_id, 'S', None)
+
+    # ==================== 기존 메서드 (호환성 유지) ====================
     def update_parse_status(
         self,
         data_id: str | int,
@@ -81,21 +228,21 @@ class DBConnector:
         rag_status: Optional[str] = None,
     ):
         """
-        파싱 상태 업데이트
-        ✅ rag_status: "queued" | "running" | "done" | "error" | "self_ocr_required"
+        기존 호환성 유지용 메서드
+        새로운 코드에서는 위의 전용 메서드 사용 권장
         """
         sets = []
         params: list[Any] = []
+        
         if parse_yn is not None:
             sets.append("parse_yn=?"); params.append(parse_yn)
         if start_dt is not None:
             sets.append("parse_start_dt=?"); params.append(start_dt)
-            # 진행중 표시
             if rag_status is None: rag_status = "running"
         if end_dt is not None:
             sets.append("parse_end_dt=?"); params.append(end_dt)
-            # 완료/에러는 호출부에서 넘겨도 되고 여기서 Y면 done으로 표시
-            if rag_status is None and parse_yn == "Y": rag_status = "done"
+            if rag_status is None and parse_yn in ('Y', 'S'): 
+                rag_status = "done"
         if ocr_failed is not None:
             sets.append("ocr_failed_yn=?"); params.append("Y" if ocr_failed else "N")
         if rag_status is not None:
@@ -111,53 +258,10 @@ class DBConnector:
             cur.execute(sql, tuple(params))
             cur.close()
 
-    def insert_ocr_result(self, data_id: str | int, page: int, text: str,
-                          head: str | None = None, middle: str | None = None, tail: str | None = None):
-        """
-        OCR 텍스트 저장 (upsert 유사)
-        """
-        # upsert 유사 로직
-        with self.get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT idx FROM ocr_text WHERE data_id=? AND page=?", (data_id, page))
-            row = cur.fetchone()
-            if row:
-                cur.execute("""
-                    UPDATE ocr_text
-                       SET text=?, upt_dt=SYS_DATETIME, text_sc_head=?, text_sc_middle=?, text_sc_end=?
-                     WHERE data_id=? AND page=?""",
-                    (text, head, middle, tail, data_id, page))
-            else:
-                cur.execute("""
-                    INSERT INTO ocr_text (data_id, page, text, parse_dt, text_sc_head, text_sc_middle, text_sc_end)
-                    VALUES (?, ?, ?, SYS_DATETIME, ?, ?, ?)""",
-                    (data_id, page, text, head, middle, tail))
-            cur.close()
-
-    def update_rag_completed(self, data_id: str | int, chunks: int | None = None, doc_id: str | None = None):
-        """
-        RAG 인덱싱 완료 처리
-        ✅ chunk_count, milvus_doc_id 업데이트
-        """
-        sql = """
-        UPDATE data_master
-           SET parse_yn='Y',
-               rag_index_status='done',
-               rag_last_indexed_at=SYS_DATETIME,
-               parse_end_dt=SYS_DATETIME,
-               chunk_count=COALESCE(?, chunk_count),
-               milvus_doc_id=COALESCE(?, milvus_doc_id)
-         WHERE data_id=?
-        """
-        with self.get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(sql, (chunks, doc_id, data_id))
-            cur.close()
-
+    # ==================== MinIO 키 관리 ====================
     def update_simulated_flag(self, data_id: str | int, simulated: bool):
         """
-        ✅ 신규: simulate_remote 모드 여부 기록
-        컬럼이 없으면 예외 무시
+        simulate_remote 모드 여부 기록
         """
         try:
             sql = "UPDATE data_master SET simulated_yn=? WHERE data_id=?"
@@ -166,14 +270,13 @@ class DBConnector:
                 cur.execute(sql, ('Y' if simulated else 'N', data_id))
                 cur.close()
         except Exception as e:
-            # 컬럼이 없거나 기타 오류 시 무시
             print(f"[DB] simulated_yn 업데이트 실패 (무시): {e}")
 
     def update_minio_keys(self, data_id: str | int, 
                           pdf_key: Optional[str] = None, 
                           original_key: Optional[str] = None):
         """
-        ✅ 신규: MinIO 키 업데이트
+        MinIO 키 업데이트
         """
         sets = []
         params: list[Any] = []
@@ -199,8 +302,7 @@ class DBConnector:
 
     def get_simulated_yn(self, data_id: str | int) -> Optional[str]:
         """
-        ✅ 신규: simulated_yn 조회
-        컬럼이 없으면 None 반환
+        simulated_yn 조회
         """
         try:
             sql = "SELECT simulated_yn FROM data_master WHERE data_id=?"
