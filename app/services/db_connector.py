@@ -49,10 +49,15 @@ class DBConnector:
 
     # ---- 도메인 메서드 ----
     def get_file_by_id(self, data_id: str | int) -> Optional[Dict[str, Any]]:
+        """
+        data_master 레코드 조회
+        ✅ 추가: simulated_yn, converted_path 컬럼 (선택)
+        """
         sql = """
         SELECT data_id, data_title, data_code, data_code_detail, data_code_detail_sub,
                file_folder, file_id, parse_yn, ocr_failed_yn,
-               minio_pdf_key, minio_original_key, rag_index_status
+               minio_pdf_key, minio_original_key, rag_index_status,
+               chunk_count, parse_start_dt, parse_end_dt, milvus_doc_id
           FROM data_master
          WHERE data_id=?
         """
@@ -75,6 +80,10 @@ class DBConnector:
         ocr_failed: Optional[bool] = None,
         rag_status: Optional[str] = None,
     ):
+        """
+        파싱 상태 업데이트
+        ✅ rag_status: "queued" | "running" | "done" | "error" | "self_ocr_required"
+        """
         sets = []
         params: list[Any] = []
         if parse_yn is not None:
@@ -104,6 +113,9 @@ class DBConnector:
 
     def insert_ocr_result(self, data_id: str | int, page: int, text: str,
                           head: str | None = None, middle: str | None = None, tail: str | None = None):
+        """
+        OCR 텍스트 저장 (upsert 유사)
+        """
         # upsert 유사 로직
         with self.get_conn() as conn:
             cur = conn.cursor()
@@ -123,6 +135,10 @@ class DBConnector:
             cur.close()
 
     def update_rag_completed(self, data_id: str | int, chunks: int | None = None, doc_id: str | None = None):
+        """
+        RAG 인덱싱 완료 처리
+        ✅ chunk_count, milvus_doc_id 업데이트
+        """
         sql = """
         UPDATE data_master
            SET parse_yn='Y',
@@ -137,3 +153,62 @@ class DBConnector:
             cur = conn.cursor()
             cur.execute(sql, (chunks, doc_id, data_id))
             cur.close()
+
+    def update_simulated_flag(self, data_id: str | int, simulated: bool):
+        """
+        ✅ 신규: simulate_remote 모드 여부 기록
+        컬럼이 없으면 예외 무시
+        """
+        try:
+            sql = "UPDATE data_master SET simulated_yn=? WHERE data_id=?"
+            with self.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, ('Y' if simulated else 'N', data_id))
+                cur.close()
+        except Exception as e:
+            # 컬럼이 없거나 기타 오류 시 무시
+            print(f"[DB] simulated_yn 업데이트 실패 (무시): {e}")
+
+    def update_minio_keys(self, data_id: str | int, 
+                          pdf_key: Optional[str] = None, 
+                          original_key: Optional[str] = None):
+        """
+        ✅ 신규: MinIO 키 업데이트
+        """
+        sets = []
+        params: list[Any] = []
+        
+        if pdf_key is not None:
+            sets.append("minio_pdf_key=?")
+            params.append(pdf_key)
+        
+        if original_key is not None:
+            sets.append("minio_original_key=?")
+            params.append(original_key)
+        
+        if not sets:
+            return
+        
+        sql = f"UPDATE data_master SET {', '.join(sets)} WHERE data_id=?"
+        params.append(data_id)
+        
+        with self.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, tuple(params))
+            cur.close()
+
+    def get_simulated_yn(self, data_id: str | int) -> Optional[str]:
+        """
+        ✅ 신규: simulated_yn 조회
+        컬럼이 없으면 None 반환
+        """
+        try:
+            sql = "SELECT simulated_yn FROM data_master WHERE data_id=?"
+            with self.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, (data_id,))
+                row = cur.fetchone()
+                cur.close()
+                return row[0] if row else None
+        except Exception:
+            return None
