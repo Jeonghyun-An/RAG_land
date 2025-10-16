@@ -1,4 +1,125 @@
-# app/api/java_router.py
+# ==================== Helper Functions ====================
+def verify_internal_token(token: Optional[str]) -> bool:
+    """내부 API 토큰 검증"""
+    if not token:
+        return False
+    return token == SHARED_SECRET
+
+
+def generate_hmac_signature(payload: str, secret: str) -> str:
+    """HMAC-SHA256 서명 생성"""
+    return hmac.new(
+        secret.encode('utf-8'),
+        payload.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def _simple_chunk_fallback(pages: List[Tuple[int, str]], encoder_fn, target_tokens: int = 400) -> List[Tuple[str, Dict]]:
+    """
+    최종 폴백 청커 - 단순 토큰 기반 분할
+    """
+    chunks = []
+    chunk_id = 0
+    
+    for page_no, text in pages:
+        if not text.strip():
+            continue
+        
+        # 텍스트를 문장 단위로 분리
+        sentences = text.replace('\n', ' ').split('. ')
+        sentences = [s.strip() + '.' for s in sentences if s.strip()]
+        
+        current_chunk = []
+        current_tokens = 0
+        
+        for sentence in sentences:
+            try:
+                sentence_tokens = len(encoder_fn(sentence))
+            except:
+                sentence_tokens = len(sentence.split())  # 단어 수로 근사
+            
+            if current_tokens + sentence_tokens > target_tokens and current_chunk:
+                # 청크 완성
+                chunk_text = ' '.join(current_chunk)
+                chunks.append((
+                    chunk_text,
+                    {
+                        'page': page_no,
+                        'section': f'page_{page_no}_chunk_{chunk_id}',
+                        'token_count': current_tokens
+                    }
+                ))
+                chunk_id += 1
+                current_chunk = []
+                current_tokens = 0
+            
+            current_chunk.append(sentence)
+            current_tokens += sentence_tokens
+        
+        # 마지막 청크 처리
+        if current_chunk:
+            chunk_text = ' '.join(current_chunk)
+            chunks.append((
+                chunk_text,
+                {
+                    'page': page_no,
+                    'section': f'page_{page_no}_chunk_{chunk_id}',
+                    'token_count': current_tokens
+                }
+            ))
+            chunk_id += 1
+    
+    return chunks
+
+
+async def send_webhook(url: str, payload: WebhookPayload, secret: str, max_retries: int = 3):
+    """
+    Webhook 전송 (지수 백오프 재시도)
+    """
+    payload_json = payload.model_dump_json()
+    signature = generate_hmac_signature(payload_json, secret)
+    
+    headers = {
+        "Content-Type": "application/json",
+        "X-RAG-Signature": signature
+    }
+    
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for attempt in range(max_retries):
+            try:
+                response = await client.post(url, content=payload_json, headers=headers)
+                if response.status_code < 500:  # 2xx, 3xx, 4xx는 재시도 안함
+                    print(f"[WEBHOOK] Sent to {url}, status={response.status_code}")
+                    return
+                else:
+                    print(f"[WEBHOOK] Attempt {attempt+1} failed with {response.status_code}")
+            except Exception as e:
+                print(f"[WEBHOOK] Attempt {attempt+1} error: {e}")
+            
+            # 지수 백오프
+            if attempt < max_retries - 1:
+                import asyncio
+                await asyncio.sleep(2 ** attempt)
+
+
+def get_converted_path(base_path: str, file_id: str) -> str:
+    """
+    변환된 파일 경로 계산
+    - PDF는 동일명 유지
+    - 기타는 .pdf 확장자로 변경
+    """
+    if file_id.lower().endswith('.pdf'):
+        return os.path.join(base_path, file_id)
+    else:
+        name_without_ext = os.path.splitext(file_id)[0]
+        return os.path.join(base_path, f"{name_without_ext}.pdf")
+
+
+def generate_minio_pdf_key(data_id: str) -> str:
+    """MinIO PDF 키 생성 (simulate_remote 모드용)"""
+    now = datetime.utcnow()
+    return f"converted/{now.year}/{now.month:02d}/{data_id}.pdf"# app/api/java_router.py
 """
 Java 시스템과 통신하는 전용 라우터
 - 트리거 API: convert-and-index
@@ -38,7 +159,7 @@ from app.services import job_state
 router = APIRouter(prefix="/java", tags=["java"])
 
 # 공유 시크릿 (환경변수)
-SHARED_SECRET = os.getenv("JAVA_SHARED_SECRET", "landsoftSecret2025!Nuclear")
+SHARED_SECRET = os.getenv("JAVA_SHARED_SECRET", "default-secret-change-me")
 
 # 서버 파일 시스템 베이스 경로 (실제 운영 시 마운트 경로)
 SERVER_BASE_PATH = os.getenv("SERVER_BASE_PATH", "/mnt/shared")
@@ -193,11 +314,9 @@ async def process_convert_and_index(
     
     # 상태 초기화
     job_state.start(job_id, data_id, "")
-    db.update_parse_status(
-        data_id,
-        rag_status="running",
-        start_dt=start_time
-    )
+    
+    # ✅ 자바 규격: OCR 시작 (parse_yn='L')
+    db.mark_ocr_start(data_id)
     
     try:
         # ========== Step 1: 파일 로드 ==========
@@ -295,20 +414,88 @@ async def process_convert_and_index(
             for page_no, blocks in pages_blocks:
                 layout_map[page_no] = blocks
         
-        # 청킹 수행 (기존 llama_router 로직 재사용)
-        from app.services.chunker import smart_chunk_pages
-        from sentence_transformers import SentenceTransformer
-        
+        # 임베딩 모델 및 인코더 준비
         model = get_embedding_model()
-        encoder = SentenceTransformer(model.model_name_or_path if hasattr(model, 'model_name_or_path') else 'sentence-transformers/all-MiniLM-L6-v2')
-        
-        chunks = smart_chunk_pages(
-            pages_text,
-            encoder.tokenizer.encode,
-            target_tokens=400,
-            overlap_tokens=100,
-            layout_blocks=layout_map
+        from sentence_transformers import SentenceTransformer
+        encoder_model = SentenceTransformer(
+            model.model_name_or_path if hasattr(model, 'model_name_or_path') 
+            else 'sentence-transformers/all-MiniLM-L6-v2'
         )
+        encoder_fn = encoder_model.tokenizer.encode
+        
+        # 청킹 전략: 다단계 폴백
+        chunks = None
+        
+        # 1순위: 원자력 법령/매뉴얼 전용 청커
+        try:
+            from app.services.law_chunker import NuclearLegalChunker
+            law_chunker = NuclearLegalChunker(
+                encoder_fn=encoder_fn,
+                target_tokens=400,
+                overlap_tokens=100
+            )
+            chunks = law_chunker.chunk_pages(pages_text, layout_map)
+            if chunks:
+                job_state.update(job_id, step="Using nuclear legal chunker")
+                print(f"[CHUNK] Nuclear legal chunker succeeded: {len(chunks)} chunks")
+        except Exception as e:
+            print(f"[CHUNK] Nuclear legal chunker failed: {e}")
+        
+        # 2순위: 레이아웃 인지 청커
+        if not chunks:
+            try:
+                from app.services.layout_chunker import LayoutAwareChunker
+                layout_chunker = LayoutAwareChunker(
+                    encoder_fn=encoder_fn,
+                    target_tokens=400,
+                    overlap_tokens=100
+                )
+                chunks = layout_chunker.chunk_pages(pages_text, layout_map)
+                if chunks:
+                    job_state.update(job_id, step="Using layout-aware chunker")
+                    print(f"[CHUNK] Layout-aware chunker succeeded: {len(chunks)} chunks")
+            except Exception as e:
+                print(f"[CHUNK] Layout-aware chunker failed: {e}")
+        
+        # 3순위: 스마트 청커 플러스
+        if not chunks:
+            try:
+                from app.services.chunker import smart_chunk_pages_plus
+                chunks = smart_chunk_pages_plus(
+                    pages_text,
+                    encoder_fn,
+                    target_tokens=400,
+                    overlap_tokens=100,
+                    layout_blocks=layout_map
+                )
+                if chunks:
+                    job_state.update(job_id, step="Using smart chunker plus")
+                    print(f"[CHUNK] Smart chunker plus succeeded: {len(chunks)} chunks")
+            except Exception as e:
+                print(f"[CHUNK] Smart chunker plus failed: {e}")
+        
+        # 4순위: 기본 스마트 청커
+        if not chunks:
+            try:
+                from app.services.chunker import smart_chunk_pages
+                chunks = smart_chunk_pages(
+                    pages_text,
+                    encoder_fn,
+                    target_tokens=400,
+                    overlap_tokens=100,
+                    layout_blocks=layout_map
+                )
+                if chunks:
+                    job_state.update(job_id, step="Using basic smart chunker")
+                    print(f"[CHUNK] Basic smart chunker succeeded: {len(chunks)} chunks")
+            except Exception as e:
+                print(f"[CHUNK] Basic smart chunker failed: {e}")
+        
+        # 최종 폴백: 단순 분할
+        if not chunks:
+            print("[CHUNK] All advanced chunkers failed, using simple fallback")
+            job_state.update(job_id, step="Using fallback chunker")
+            chunks = _simple_chunk_fallback(pages_text, encoder_fn, target_tokens=400)
         
         if not chunks:
             raise RuntimeError("청킹 결과가 비어있습니다")
