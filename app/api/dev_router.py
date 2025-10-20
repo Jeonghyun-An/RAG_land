@@ -36,23 +36,25 @@ LOCAL_STAGING_PATH = os.getenv("LOCAL_STAGING_PATH", "/tmp/remote_staging")
 
 # ==================== Schemas ====================
 class DevConvertRequest(BaseModel):
-    """개발용 트리거 요청"""
+    """개발용 트리거 요청 (운영 스펙과 동일)"""
     data_id: str
+    path: str = ""  # 개발 모드에서는 사용 안 함 (호환성)
     file_id: str  # 로컬 스테이징 디렉토리 내 파일명
     webhook_url: Optional[str] = None
+    ocr_manual_required: bool = False  # 개발 모드에서는 무시
+    reindex_required_yn: bool = False  # 개발 모드에서는 무시
 
 
 class DevConvertResponse(BaseModel):
-    """즉시 응답"""
+    """즉시 응답 (운영 스펙과 동일)"""
     status: str
     job_id: str
     data_id: str
     message: str
-    local_file_path: str
 
 
 class DevWebhookPayload(BaseModel):
-    """개발용 Webhook 페이로드"""
+    """개발용 Webhook 페이로드 (운영 스펙과 동일)"""
     job_id: str
     data_id: str
     status: str
@@ -65,15 +67,14 @@ class DevWebhookPayload(BaseModel):
 
 
 class DevStatusResponse(BaseModel):
-    """개발용 상태 응답 (메모리 기반)"""
+    """개발용 상태 응답 (운영 스펙과 동일)"""
     data_id: str
-    status: str
-    step: str
-    pages: Optional[int] = None
-    chunks: Optional[int] = None
-    start_time: Optional[str] = None
-    end_time: Optional[str] = None
-    error: Optional[str] = None
+    rag_index_status: str  # 운영과 동일한 필드명
+    parse_yn: Optional[str] = None
+    chunk_count: Optional[int] = None
+    parse_start_dt: Optional[str] = None
+    parse_end_dt: Optional[str] = None
+    milvus_doc_id: Optional[str] = None
 
 
 # ==================== Helper Functions ====================
@@ -429,15 +430,14 @@ async def dev_convert_and_index(
         status="accepted",
         job_id=job_id,
         data_id=request.data_id,
-        message="Development mode processing (no DB update)",
-        local_file_path=str(file_path)
+        message="Development mode processing (no DB update)"
     )
 
 
 @router.get("/status/{data_id}", response_model=DevStatusResponse)
 def dev_get_status(data_id: str, x_dev_token: Optional[str] = Header(None)):
     """
-    개발용 상태 조회 (메모리 기반)
+    개발용 상태 조회 (운영 스펙과 동일)
     """
     if not verify_dev_token(x_dev_token):
         raise HTTPException(401, "Unauthorized - Invalid dev token")
@@ -449,13 +449,12 @@ def dev_get_status(data_id: str, x_dev_token: Optional[str] = Header(None)):
     
     return DevStatusResponse(
         data_id=data_id,
-        status=state.get('status', 'unknown'),
-        step=state.get('step', ''),
-        pages=state.get('pages'),
-        chunks=state.get('chunks'),
-        start_time=state.get('start_time'),
-        end_time=state.get('end_time'),
-        error=state.get('error')
+        rag_index_status=state.get('status', 'unknown'),
+        parse_yn=state.get('parse_yn'),
+        chunk_count=state.get('chunks'),
+        parse_start_dt=state.get('created_at'),
+        parse_end_dt=state.get('updated_at'),
+        milvus_doc_id=data_id
     )
 
 
