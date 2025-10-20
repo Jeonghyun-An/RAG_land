@@ -4,7 +4,6 @@
 - 로컬 디렉토리 파일 사용
 - DB 업데이트 없음
 - Webhook 페이로드만 전달
-- 빠른 테스트 및 디버깅용
 """
 from __future__ import annotations
 
@@ -13,7 +12,7 @@ import hashlib
 import hmac
 import uuid
 from datetime import datetime
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Header, BackgroundTasks, UploadFile, File
@@ -21,10 +20,7 @@ from pydantic import BaseModel
 import httpx
 
 from app.services.minio_store import MinIOStore
-from app.services.milvus_store_v2 import MilvusStoreV2
-from app.services.embedding_model import get_embedding_model
 from app.services.pdf_converter import convert_to_pdf, ConvertError
-from app.services.file_parser import parse_pdf_blocks
 from app.services import job_state
 
 router = APIRouter(prefix="/dev", tags=["development"])
@@ -36,17 +32,15 @@ LOCAL_STAGING_PATH = os.getenv("LOCAL_STAGING_PATH", "/tmp/remote_staging")
 
 # ==================== Schemas ====================
 class DevConvertRequest(BaseModel):
-    """개발용 트리거 요청 (운영 스펙과 동일)"""
     data_id: str
-    path: str = ""  # 개발 모드에서는 사용 안 함 (호환성)
-    file_id: str  # 로컬 스테이징 디렉토리 내 파일명
+    path: str = ""
+    file_id: str
     webhook_url: Optional[str] = None
-    ocr_manual_required: bool = False  # 개발 모드에서는 무시
-    reindex_required_yn: bool = False  # 개발 모드에서는 무시
+    ocr_manual_required: bool = False
+    reindex_required_yn: bool = False
 
 
 class DevConvertResponse(BaseModel):
-    """즉시 응답 (운영 스펙과 동일)"""
     status: str
     job_id: str
     data_id: str
@@ -54,7 +48,6 @@ class DevConvertResponse(BaseModel):
 
 
 class DevWebhookPayload(BaseModel):
-    """개발용 Webhook 페이로드 (운영 스펙과 동일)"""
     job_id: str
     data_id: str
     status: str
@@ -67,9 +60,8 @@ class DevWebhookPayload(BaseModel):
 
 
 class DevStatusResponse(BaseModel):
-    """개발용 상태 응답 (운영 스펙과 동일)"""
     data_id: str
-    rag_index_status: str  # 운영과 동일한 필드명
+    rag_index_status: str
     parse_yn: Optional[str] = None
     chunk_count: Optional[int] = None
     parse_start_dt: Optional[str] = None
@@ -92,76 +84,26 @@ def generate_hmac_signature(payload: str, secret: str) -> str:
     ).hexdigest()
 
 
-async def send_dev_webhook(url: str, payload: DevWebhookPayload, secret: str, max_retries: int = 3):
-    payload_json = payload.model_dump_json()
-    signature = generate_hmac_signature(payload_json, secret)
-    
-    headers = {
-        "Content-Type": "application/json",
-        "X-Dev-Signature": signature
-    }
-    
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for attempt in range(max_retries):
-            try:
-                response = await client.post(url, content=payload_json, headers=headers)
-                if response.status_code < 500:
-                    print(f"[DEV-WEBHOOK] Sent to {url}, status={response.status_code}")
-                    return
-                else:
-                    print(f"[DEV-WEBHOOK] Attempt {attempt+1} failed with {response.status_code}")
-            except Exception as e:
-                print(f"[DEV-WEBHOOK] Attempt {attempt+1} error: {e}")
-            
-            if attempt < max_retries - 1:
-                import asyncio
-                await asyncio.sleep(2 ** attempt)
+async def send_dev_webhook(url: str, payload: DevWebhookPayload, secret: str):
+    try:
+        payload_json = payload.model_dump_json()
+        signature = generate_hmac_signature(payload_json, secret)
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Webhook-Signature': signature
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, content=payload_json, headers=headers)
+            response.raise_for_status()
+            print(f"[DEV-WEBHOOK] ✅ Sent to {url}")
+    except Exception as e:
+        print(f"[DEV-WEBHOOK] ❌ Failed: {e}")
 
 
 def generate_minio_pdf_key(data_id: str) -> str:
-    now = datetime.utcnow()
-    return f"dev_converted/{now.year}/{now.month:02d}/{data_id}.pdf"
-
-
-def _simple_chunk_fallback(pages_text: List[Tuple[int, str]], 
-                           encoder_fn, 
-                           target_tokens: int = 400) -> List[Tuple[str, Dict]]:
-    """최종 폴백 청커"""
-    chunks = []
-    chunk_id = 0
-    
-    for page_no, text in pages_text:
-        if not text or not text.strip():
-            continue
-            
-        paragraphs = text.split('\n\n')
-        current_text = ""
-        current_tokens = 0
-        
-        for para in paragraphs:
-            para_tokens = len(encoder_fn(para))
-            
-            if current_tokens + para_tokens <= target_tokens:
-                current_text += para + "\n\n"
-                current_tokens += para_tokens
-            else:
-                if current_text.strip():
-                    chunks.append((
-                        current_text.strip(),
-                        {'page': page_no, 'section': f'page_{page_no}_chunk_{chunk_id}', 'token_count': current_tokens}
-                    ))
-                    chunk_id += 1
-                current_text = para + "\n\n"
-                current_tokens = para_tokens
-        
-        if current_text.strip():
-            chunks.append((
-                current_text.strip(),
-                {'page': page_no, 'section': f'page_{page_no}_chunk_{chunk_id}', 'token_count': current_tokens}
-            ))
-            chunk_id += 1
-    
-    return chunks
+    return f"dev/pdfs/{data_id}.pdf"
 
 
 # ==================== Background Task ====================
@@ -173,7 +115,7 @@ async def process_dev_convert_and_index(
 ):
     """
     개발용 백그라운드 처리
-    - 로컬 파일 사용
+    - llama_router의 index_pdf_to_milvus() 재사용
     - DB 업데이트 없음
     - Webhook으로 결과 전달
     """
@@ -195,8 +137,8 @@ async def process_dev_convert_and_index(
         
         print(f"[DEV] Using local file: {file_path}")
         
-        # ========== Step 2: PDF 변환 ==========
-        job_state.update(job_id, status="parsing", step="Converting to PDF")
+        # ========== Step 2: PDF 변환 (필요시) ==========
+        job_state.update(job_id, status="parsing", step="Converting to PDF if needed")
         
         is_already_pdf = file_id.lower().endswith('.pdf')
         pdf_key: Optional[str] = None
@@ -204,164 +146,79 @@ async def process_dev_convert_and_index(
         
         if not is_already_pdf:
             try:
-                pdf_bytes = convert_to_pdf(str(file_path))
+                # PDF 변환
+                converted_pdf_path = convert_to_pdf(str(file_path))
                 
-                # MinIO에 저장
+                # MinIO 업로드
+                with open(converted_pdf_path, 'rb') as f:
+                    pdf_bytes = f.read()
+                
                 pdf_key = generate_minio_pdf_key(data_id)
-                store.put_bytes(pdf_key, pdf_bytes)
+                store.upload_bytes(
+                    data=pdf_bytes,
+                    object_name=pdf_key,
+                    content_type="application/pdf",
+                    length=len(pdf_bytes)
+                )
                 
-                # 로컬 임시 파일로도 저장 (OCR 처리용)
-                temp_pdf = staging_dir / f"{data_id}_converted.pdf"
-                with open(temp_pdf, 'wb') as f:
-                    f.write(pdf_bytes)
-                converted_pdf_path = str(temp_pdf)
-                print(f"[DEV] PDF saved to MinIO: {pdf_key}")
+                print(f"[DEV] ✅ PDF converted and uploaded: {pdf_key}")
                     
             except ConvertError as ce:
                 raise RuntimeError(f"PDF 변환 실패: {ce}")
+            except Exception as e:
+                print(f"[DEV] ❌ Upload error: {e}")
+                raise RuntimeError(f"MinIO 업로드 실패: {e}")
         
-        # ========== Step 3: OCR 추출 ==========
-        job_state.update(job_id, status="parsing", step="Extracting text with OCR")
-        
-        pages_text, pages_blocks = parse_pdf_blocks(converted_pdf_path)
-        
-        if not pages_text:
-            raise RuntimeError("OCR 결과가 비어있습니다")
-        
-        print(f"[DEV] OCR extracted {len(pages_text)} pages")
-        
-        # PDF+OCR 완료 웹훅
+        # PDF 변환 완료 웹훅
         if webhook_url:
             await send_dev_webhook(
                 webhook_url,
                 DevWebhookPayload(
                     job_id=job_id,
                     data_id=data_id,
-                    status="pdf_ocr_done",
+                    status="pdf_converted",
                     converted=not is_already_pdf,
-                    metrics={"pages": len(pages_text)},
+                    metrics={"converted": not is_already_pdf},
                     timestamps={"start": start_time.isoformat()},
                     pdf_key_minio=pdf_key
                 ),
                 DEV_SECRET
             )
         
-        # ========== Step 4: 청킹 ==========
-        job_state.update(job_id, status="chunking", step="Chunking text")
+        # ========== Step 3: 고도화된 청킹 & 인덱싱 (llama_router 재사용) ==========
+        job_state.update(job_id, status="processing", step="Using advanced indexing pipeline")
         
-        layout_map = {}
-        if pages_blocks:
-            for page_no, blocks in pages_blocks:
-                layout_map[page_no] = blocks
-        
-        model = get_embedding_model()
-        from sentence_transformers import SentenceTransformer
-        encoder_model = SentenceTransformer(
-            model.model_name_or_path if hasattr(model, 'model_name_or_path') 
-            else 'sentence-transformers/all-MiniLM-L6-v2'
-        )
-        encoder_fn = encoder_model.tokenizer.encode
-        
-        chunks = None
-        
-        # 1순위: 원자력 법령/매뉴얼 청커
+        # 🔥 핵심: OCR 모드를 'never'로 설정 (변환된 PDF는 텍스트 포함)
+        original_ocr_mode = os.environ.get("OCR_MODE")
         try:
-            from app.services.law_chunker import NuclearLegalChunker
-            law_chunker = NuclearLegalChunker(encoder_fn=encoder_fn, target_tokens=400, overlap_tokens=100)
-            chunks = law_chunker.chunk_pages(pages_text, layout_map)
-            if chunks:
-                print(f"[DEV-CHUNK] Nuclear legal chunker: {len(chunks)} chunks")
-        except Exception as e:
-            print(f"[DEV-CHUNK] Nuclear legal chunker failed: {e}")
-        
-        # 2순위: 레이아웃 인지 청커
-        if not chunks:
-            try:
-                from app.services.layout_chunker import LayoutAwareChunker
-                layout_chunker = LayoutAwareChunker(encoder_fn=encoder_fn, target_tokens=400, overlap_tokens=100)
-                chunks = layout_chunker.chunk_pages(pages_text, layout_map)
-                if chunks:
-                    print(f"[DEV-CHUNK] Layout-aware chunker: {len(chunks)} chunks")
-            except Exception as e:
-                print(f"[DEV-CHUNK] Layout-aware chunker failed: {e}")
-        
-        # 3순위: 스마트 청커 플러스
-        if not chunks:
-            try:
-                from app.services.chunker import smart_chunk_pages_plus
-                chunks = smart_chunk_pages_plus(pages_text, encoder_fn, target_tokens=400, overlap_tokens=100, layout_blocks=layout_map)
-                if chunks:
-                    print(f"[DEV-CHUNK] Smart chunker plus: {len(chunks)} chunks")
-            except Exception as e:
-                print(f"[DEV-CHUNK] Smart chunker plus failed: {e}")
-        
-        # 4순위: 기본 스마트 청커
-        if not chunks:
-            try:
-                from app.services.chunker import smart_chunk_pages
-                chunks = smart_chunk_pages(pages_text, encoder_fn, target_tokens=400, overlap_tokens=100, layout_blocks=layout_map)
-                if chunks:
-                    print(f"[DEV-CHUNK] Basic smart chunker: {len(chunks)} chunks")
-            except Exception as e:
-                print(f"[DEV-CHUNK] Basic smart chunker failed: {e}")
-        
-        # 최종 폴백
-        if not chunks:
-            print("[DEV-CHUNK] Using fallback chunker")
-            chunks = _simple_chunk_fallback(pages_text, encoder_fn, target_tokens=400)
-        
-        if not chunks:
-            raise RuntimeError("청킹 결과가 비어있습니다")
-        
-        # 청킹 완료 웹훅
-        if webhook_url:
-            await send_dev_webhook(
-                webhook_url,
-                DevWebhookPayload(
-                    job_id=job_id,
-                    data_id=data_id,
-                    status="chunking_done",
-                    metrics={"chunks": len(chunks)},
-                    chunk_count=len(chunks),
-                    timestamps={"start": start_time.isoformat()}
-                ),
-                DEV_SECRET
+            if not is_already_pdf:
+                os.environ["OCR_MODE"] = "never"  # 변환된 PDF는 OCR 불필요
+            
+            # llama_router의 고도화된 인덱싱 파이프라인 호출
+            from app.api.llama_router import index_pdf_to_milvus
+            
+            index_pdf_to_milvus(
+                job_id=job_id,
+                file_path=converted_pdf_path,
+                minio_object=pdf_key,  # MinIO 경로도 전달
+                uploaded=True,
+                remove_local=False,  # 개발 모드에서는 로컬 파일 유지
+                doc_id=data_id
             )
+            
+        finally:
+            # 환경변수 복원
+            if original_ocr_mode is not None:
+                os.environ["OCR_MODE"] = original_ocr_mode
+            elif "OCR_MODE" in os.environ:
+                del os.environ["OCR_MODE"]
         
-        # ========== Step 5: 임베딩 & Milvus 적재 ==========
-        job_state.update(job_id, status="embedding", step="Generating embeddings")
+        # ========== Step 4: 결과 조회 및 웹훅 전송 ==========
+        state = job_state.get(job_id) or {}
+        chunks = state.get('chunks', 0)
+        pages = state.get('pages', 0)
         
-        from app.services.embedding_model import embed
-        
-        chunk_texts = [chunk[0] for chunk in chunks]
-        embeddings = embed(chunk_texts)
-        
-        job_state.update(job_id, status="indexing", step="Indexing to Milvus")
-        
-        milvus = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-        
-        chunk_ids = [f"{data_id}_{i}" for i in range(len(chunks))]
-        doc_ids = [data_id] * len(chunks)
-        sections = []
-        
-        for chunk_text, chunk_meta in chunks:
-            section_info = chunk_meta.get('section', '')
-            if len(section_info) > 512:
-                section_info = section_info[:512]
-            sections.append(section_info)
-        
-        milvus.upsert(
-            chunk_ids=chunk_ids,
-            doc_ids=doc_ids,
-            sections=sections,
-            embeddings=embeddings,
-            chunks=chunk_texts
-        )
-        
-        print(f"[DEV] Indexed {len(chunks)} chunks to Milvus")
-        
-        # ========== Step 6: 완료 (DB 업데이트 없음) ==========
-        job_state.complete(job_id, pages=len(pages_text), chunks=len(chunks))
+        print(f"[DEV] ✅ Completed: {pages} pages, {chunks} chunks")
         
         if webhook_url:
             end_time = datetime.utcnow()
@@ -370,9 +227,12 @@ async def process_dev_convert_and_index(
                 data_id=data_id,
                 status="done",
                 converted=not is_already_pdf,
-                metrics={"pages": len(pages_text), "chunks": len(chunks)},
-                chunk_count=len(chunks),
-                timestamps={"start": start_time.isoformat(), "end": end_time.isoformat()},
+                metrics={"pages": pages, "chunks": chunks},
+                chunk_count=chunks,
+                timestamps={
+                    "start": start_time.isoformat(), 
+                    "end": end_time.isoformat()
+                },
                 message="Development mode: converted and indexed (no DB update)",
                 pdf_key_minio=pdf_key
             )
@@ -380,7 +240,7 @@ async def process_dev_convert_and_index(
     
     except Exception as e:
         job_state.fail(job_id, str(e))
-        print(f"[DEV] Error: {e}")
+        print(f"[DEV] ❌ Error: {e}")
         
         if webhook_url:
             payload = DevWebhookPayload(
@@ -401,15 +261,10 @@ async def dev_convert_and_index(
     background_tasks: BackgroundTasks,
     x_dev_token: Optional[str] = Header(None)
 ):
-    """
-    개발용 트리거 API
-    - 로컬 스테이징 디렉토리 파일 사용
-    - DB 업데이트 없음
-    """
+    """개발용 트리거 API"""
     if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized - Invalid dev token")
+        raise HTTPException(401, "Unauthorized")
     
-    # 로컬 파일 존재 확인
     staging_dir = Path(LOCAL_STAGING_PATH)
     file_path = staging_dir / request.file_id
     
@@ -430,17 +285,15 @@ async def dev_convert_and_index(
         status="accepted",
         job_id=job_id,
         data_id=request.data_id,
-        message="Development mode processing (no DB update)"
+        message="Development mode processing"
     )
 
 
 @router.get("/status/{data_id}", response_model=DevStatusResponse)
 def dev_get_status(data_id: str, x_dev_token: Optional[str] = Header(None)):
-    """
-    개발용 상태 조회 (운영 스펙과 동일)
-    """
+    """상태 조회"""
     if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized - Invalid dev token")
+        raise HTTPException(401, "Unauthorized")
     
     state = job_state.get(data_id)
     
@@ -460,25 +313,19 @@ def dev_get_status(data_id: str, x_dev_token: Optional[str] = Header(None)):
 
 @router.get("/jobs")
 def dev_list_jobs(x_dev_token: Optional[str] = Header(None)):
-    """
-    개발용: 모든 Job 목록 조회
-    """
+    """모든 Job 목록"""
     if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized - Invalid dev token")
+        raise HTTPException(401, "Unauthorized")
     
-    # list_jobs 함수 사용
     jobs = job_state.list_jobs(status=None, limit=100)
-    
     return {"jobs": jobs, "count": len(jobs)}
 
 
 @router.delete("/jobs/{job_id}")
 def dev_clear_job(job_id: str, x_dev_token: Optional[str] = Header(None)):
-    """
-    개발용: Job 상태 삭제
-    """
+    """Job 상태 삭제"""
     if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized - Invalid dev token")
+        raise HTTPException(401, "Unauthorized")
     
     job_state.clear(job_id)
     return {"message": f"Job {job_id} cleared"}
@@ -486,11 +333,9 @@ def dev_clear_job(job_id: str, x_dev_token: Optional[str] = Header(None)):
 
 @router.delete("/jobs")
 def dev_clear_all_jobs(x_dev_token: Optional[str] = Header(None)):
-    """
-    개발용: 모든 Job 상태 삭제
-    """
+    """모든 Job 삭제"""
     if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized - Invalid dev token")
+        raise HTTPException(401, "Unauthorized")
     
     job_state.clear_all()
     return {"message": "All jobs cleared"}
@@ -514,23 +359,18 @@ async def dev_upload_test_file(
     file: UploadFile = File(...),
     x_dev_token: Optional[str] = Header(None)
 ):
-    """
-    개발용: 테스트 파일 업로드 (로컬 스테이징에 저장)
-    """
+    """테스트 파일 업로드"""
     if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized - Invalid dev token")
+        raise HTTPException(401, "Unauthorized")
     
     staging_dir = Path(LOCAL_STAGING_PATH)
     staging_dir.mkdir(parents=True, exist_ok=True)
     
-    # 파일명 안전하게 처리
     file_id = os.path.basename(file.filename or "upload.bin")
     file_path = staging_dir / file_id
     
-    # 파일 내용 읽기
     content = await file.read()
     
-    # 파일 저장
     with open(file_path, 'wb') as f:
         f.write(content)
     
