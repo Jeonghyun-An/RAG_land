@@ -12,7 +12,7 @@ import hashlib
 import hmac
 import uuid
 from datetime import datetime
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Header, BackgroundTasks
@@ -20,17 +20,13 @@ from pydantic import BaseModel
 import httpx
 
 from app.services.db_connector import DBConnector
-from app.services.minio_store import MinIOStore
-from app.services.milvus_store_v2 import MilvusStoreV2
-from app.services.embedding_model import get_embedding_model
 from app.services.pdf_converter import convert_to_pdf, ConvertError
-from app.services.file_parser import parse_pdf_blocks
 from app.services import job_state
 
 router = APIRouter(prefix="/java", tags=["java-production"])
 
 # 환경변수
-SHARED_SECRET = os.getenv("JAVA_SHARED_SECRET", "landsoftSecret2025!Nuclear")
+SHARED_SECRET = os.getenv("JAVA_SHARED_SECRET", "")
 SERVER_BASE_PATH = os.getenv("SERVER_BASE_PATH", "/mnt/shared")
 
 
@@ -91,71 +87,22 @@ def generate_hmac_signature(payload: str, secret: str) -> str:
     ).hexdigest()
 
 
-async def send_webhook(url: str, payload: WebhookPayload, secret: str, max_retries: int = 3):
-    payload_json = payload.model_dump_json()
-    signature = generate_hmac_signature(payload_json, secret)
-    
-    headers = {
-        "Content-Type": "application/json",
-        "X-RAG-Signature": signature
-    }
-    
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for attempt in range(max_retries):
-            try:
-                response = await client.post(url, content=payload_json, headers=headers)
-                if response.status_code < 500:
-                    print(f"[WEBHOOK] Sent to {url}, status={response.status_code}")
-                    return
-                else:
-                    print(f"[WEBHOOK] Attempt {attempt+1} failed with {response.status_code}")
-            except Exception as e:
-                print(f"[WEBHOOK] Attempt {attempt+1} error: {e}")
-            
-            if attempt < max_retries - 1:
-                import asyncio
-                await asyncio.sleep(2 ** attempt)
-
-
-def _simple_chunk_fallback(pages_text: List[Tuple[int, str]], 
-                           encoder_fn, 
-                           target_tokens: int = 400) -> List[Tuple[str, Dict]]:
-    """최종 폴백 청커"""
-    chunks = []
-    chunk_id = 0
-    
-    for page_no, text in pages_text:
-        if not text or not text.strip():
-            continue
-            
-        paragraphs = text.split('\n\n')
-        current_text = ""
-        current_tokens = 0
+async def send_webhook(url: str, payload: WebhookPayload, secret: str):
+    try:
+        payload_json = payload.model_dump_json()
+        signature = generate_hmac_signature(payload_json, secret)
         
-        for para in paragraphs:
-            para_tokens = len(encoder_fn(para))
-            
-            if current_tokens + para_tokens <= target_tokens:
-                current_text += para + "\n\n"
-                current_tokens += para_tokens
-            else:
-                if current_text.strip():
-                    chunks.append((
-                        current_text.strip(),
-                        {'page': page_no, 'section': f'page_{page_no}_chunk_{chunk_id}', 'token_count': current_tokens}
-                    ))
-                    chunk_id += 1
-                current_text = para + "\n\n"
-                current_tokens = para_tokens
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Webhook-Signature': signature
+        }
         
-        if current_text.strip():
-            chunks.append((
-                current_text.strip(),
-                {'page': page_no, 'section': f'page_{page_no}_chunk_{chunk_id}', 'token_count': current_tokens}
-            ))
-            chunk_id += 1
-    
-    return chunks
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, content=payload_json, headers=headers)
+            response.raise_for_status()
+            print(f"[PROD-WEBHOOK] ✅ Sent to {url}")
+    except Exception as e:
+        print(f"[PROD-WEBHOOK] ❌ Failed: {e}")
 
 
 # ==================== Background Task ====================
@@ -170,7 +117,7 @@ async def process_convert_and_index_prod(
 ):
     """
     운영용 백그라운드 처리
-    - 서버 파일시스템 사용
+    - llama_router의 index_pdf_to_milvus() 재사용
     - DB 완전 업데이트
     """
     db = DBConnector()
@@ -190,21 +137,26 @@ async def process_convert_and_index_prod(
         
         print(f"[PROD] Using server file: {full_path}")
         
-        # ========== Step 2: PDF 변환 ==========
-        job_state.update(job_id, status="parsing", step="Converting to PDF")
+        # ========== Step 2: PDF 변환 (필요시) ==========
+        job_state.update(job_id, status="parsing", step="Converting to PDF if needed")
         
         is_already_pdf = file_id.lower().endswith('.pdf')
         converted_pdf_path = full_path
         
         if not is_already_pdf:
             try:
-                pdf_bytes = convert_to_pdf(full_path)
+                # PDF 변환
+                converted_pdf_path = convert_to_pdf(full_path)
                 converted_name = os.path.splitext(file_id)[0] + '.pdf'
                 
                 # 서버 파일시스템에 저장
-                converted_pdf_path = os.path.join(SERVER_BASE_PATH, path, converted_name)
-                with open(converted_pdf_path, 'wb') as f:
-                    f.write(pdf_bytes)
+                final_pdf_path = os.path.join(SERVER_BASE_PATH, path, converted_name)
+                
+                # 변환된 파일 복사 (convert_to_pdf가 임시 경로에 생성했을 경우)
+                if converted_pdf_path != final_pdf_path:
+                    import shutil
+                    shutil.copy2(converted_pdf_path, final_pdf_path)
+                    converted_pdf_path = final_pdf_path
                 
                 # DB 업데이트: 변환된 파일 경로
                 folder_only = path
@@ -212,150 +164,74 @@ async def process_convert_and_index_prod(
                 if folder_only.startswith(prefix):
                     folder_only = folder_only[len(prefix):]
                 db.update_converted_file_path(data_id, folder_only, converted_name)
-                print(f"[PROD] PDF saved: {converted_pdf_path}")
+                
+                print(f"[PROD] ✅ PDF converted and saved: {converted_pdf_path}")
                     
             except ConvertError as ce:
                 raise RuntimeError(f"PDF 변환 실패: {ce}")
+            except Exception as e:
+                print(f"[PROD] ❌ Conversion error: {e}")
+                raise RuntimeError(f"PDF 변환/저장 실패: {e}")
         
-        # ========== Step 3: OCR 추출 ==========
-        job_state.update(job_id, status="parsing", step="Extracting text with OCR")
-        
-        pages_text, pages_blocks = parse_pdf_blocks(converted_pdf_path)
-        
-        if not pages_text:
-            raise RuntimeError("OCR 결과가 비어있습니다")
-        
-        # DB에 OCR 결과 저장
-        db.mark_ocr_success(data_id)
-        for page_no, text in pages_text:
-            if text.strip():
-                db.insert_ocr_result(data_id, page_no, text)
-        
-        # PDF+OCR 완료 웹훅
+        # PDF 변환 완료 웹훅
         if webhook_url:
             await send_webhook(
                 webhook_url,
                 WebhookPayload(
                     job_id=job_id,
                     data_id=data_id,
-                    status="pdf_ocr_done",
+                    status="pdf_converted",
                     converted=not is_already_pdf,
-                    metrics={"pages": len(pages_text)},
+                    metrics={"converted": not is_already_pdf},
                     timestamps={"start": start_time.isoformat()}
                 ),
                 SHARED_SECRET
             )
         
-        # ========== Step 4: 청킹 ==========
-        job_state.update(job_id, status="chunking", step="Chunking text")
+        # ========== Step 3: 고도화된 청킹 & 인덱싱 (llama_router 재사용) ==========
+        job_state.update(job_id, status="processing", step="Using advanced indexing pipeline")
         
-        layout_map = {}
-        if pages_blocks:
-            for page_no, blocks in pages_blocks:
-                layout_map[page_no] = blocks
-        
-        model = get_embedding_model()
-        from sentence_transformers import SentenceTransformer
-        encoder_model = SentenceTransformer(
-            model.model_name_or_path if hasattr(model, 'model_name_or_path') 
-            else 'sentence-transformers/all-MiniLM-L6-v2'
-        )
-        encoder_fn = encoder_model.tokenizer.encode
-        
-        chunks = None
-        
-        # 1순위: 원자력 법령/매뉴얼 청커
+        # 🔥 핵심: OCR 모드를 'never'로 설정 (변환된 PDF는 텍스트 포함)
+        original_ocr_mode = os.environ.get("OCR_MODE")
         try:
-            from app.services.law_chunker import NuclearLegalChunker
-            law_chunker = NuclearLegalChunker(encoder_fn=encoder_fn, target_tokens=400, overlap_tokens=100)
-            chunks = law_chunker.chunk_pages(pages_text, layout_map)
-            if chunks:
-                print(f"[CHUNK] Nuclear legal chunker: {len(chunks)} chunks")
-        except Exception as e:
-            print(f"[CHUNK] Nuclear legal chunker failed: {e}")
+            if not is_already_pdf:
+                os.environ["OCR_MODE"] = "never"  # 변환된 PDF는 OCR 불필요
+            
+            # llama_router의 고도화된 인덱싱 파이프라인 호출
+            from app.api.llama_router import index_pdf_to_milvus
+            
+            index_pdf_to_milvus(
+                job_id=job_id,
+                file_path=converted_pdf_path,
+                minio_object=None,  # 운영에서는 로컬 파일 우선
+                uploaded=True,
+                remove_local=False,  # 서버 파일은 유지
+                doc_id=data_id
+            )
+            
+        finally:
+            # 환경변수 복원
+            if original_ocr_mode is not None:
+                os.environ["OCR_MODE"] = original_ocr_mode
+            elif "OCR_MODE" in os.environ:
+                del os.environ["OCR_MODE"]
         
-        # 2순위: 레이아웃 인지 청커
-        if not chunks:
-            try:
-                from app.services.layout_chunker import LayoutAwareChunker
-                layout_chunker = LayoutAwareChunker(encoder_fn=encoder_fn, target_tokens=400, overlap_tokens=100)
-                chunks = layout_chunker.chunk_pages(pages_text, layout_map)
-                if chunks:
-                    print(f"[CHUNK] Layout-aware chunker: {len(chunks)} chunks")
-            except Exception as e:
-                print(f"[CHUNK] Layout-aware chunker failed: {e}")
+        # ========== Step 4: 결과 조회 및 DB 업데이트 ==========
+        state = job_state.get(job_id) or {}
+        chunks = state.get('chunks', 0)
+        pages = state.get('pages', 0)
         
-        # 3순위: 스마트 청커 플러스
-        if not chunks:
-            try:
-                from app.services.chunker import smart_chunk_pages_plus
-                chunks = smart_chunk_pages_plus(pages_text, encoder_fn, target_tokens=400, overlap_tokens=100, layout_blocks=layout_map)
-                if chunks:
-                    print(f"[CHUNK] Smart chunker plus: {len(chunks)} chunks")
-            except Exception as e:
-                print(f"[CHUNK] Smart chunker plus failed: {e}")
+        print(f"[PROD] ✅ Indexing completed: {pages} pages, {chunks} chunks")
         
-        # 4순위: 기본 스마트 청커
-        if not chunks:
-            try:
-                from app.services.chunker import smart_chunk_pages
-                chunks = smart_chunk_pages(pages_text, encoder_fn, target_tokens=400, overlap_tokens=100, layout_blocks=layout_map)
-                if chunks:
-                    print(f"[CHUNK] Basic smart chunker: {len(chunks)} chunks")
-            except Exception as e:
-                print(f"[CHUNK] Basic smart chunker failed: {e}")
-        
-        # 최종 폴백
-        if not chunks:
-            print("[CHUNK] Using fallback chunker")
-            chunks = _simple_chunk_fallback(pages_text, encoder_fn, target_tokens=400)
-        
-        if not chunks:
-            raise RuntimeError("청킹 결과가 비어있습니다")
-        
-        # ========== Step 5: 임베딩 & Milvus 적재 ==========
-        job_state.update(job_id, status="embedding", step="Generating embeddings")
-        
-        from app.services.embedding_model import embed
-        
-        chunk_texts = [chunk[0] for chunk in chunks]
-        embeddings = embed(chunk_texts)
-        
-        job_state.update(job_id, status="indexing", step="Indexing to Milvus")
-        
-        milvus = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-        
-        chunk_ids = [f"{data_id}_{i}" for i in range(len(chunks))]
-        doc_ids = [data_id] * len(chunks)
-        sections = []
-        
-        for chunk_text, chunk_meta in chunks:
-            section_info = chunk_meta.get('section', '')
-            if len(section_info) > 512:
-                section_info = section_info[:512]
-            sections.append(section_info)
-        
-        milvus.upsert(
-            chunk_ids=chunk_ids,
-            doc_ids=doc_ids,
-            sections=sections,
-            embeddings=embeddings,
-            chunks=chunk_texts
-        )
-        
-        # ========== Step 6: DB 업데이트 ==========
-        job_state.update(job_id, status="cleanup", step="Updating database")
-        
-        end_time = datetime.utcnow()
-        
+        # DB 업데이트: RAG 인덱싱 완료
         db.update_rag_completed(
             data_id,
-            chunks=len(chunks),
+            chunks=chunks,
             doc_id=data_id
         )
         
-        # ========== Step 7: 완료 & Webhook ==========
-        job_state.complete(job_id, pages=len(pages_text), chunks=len(chunks))
+        # ========== Step 5: 완료 & Webhook ==========
+        end_time = datetime.utcnow()
         
         if webhook_url:
             payload = WebhookPayload(
@@ -363,9 +239,12 @@ async def process_convert_and_index_prod(
                 data_id=data_id,
                 status="done",
                 converted=not is_already_pdf,
-                metrics={"pages": len(pages_text), "chunks": len(chunks)},
-                chunk_count=len(chunks),
-                timestamps={"start": start_time.isoformat(), "end": end_time.isoformat()},
+                metrics={"pages": pages, "chunks": chunks},
+                chunk_count=chunks,
+                timestamps={
+                    "start": start_time.isoformat(), 
+                    "end": end_time.isoformat()
+                },
                 message="converted and indexed" if not is_already_pdf else "indexed"
             )
             await send_webhook(webhook_url, payload, SHARED_SECRET)
@@ -373,6 +252,7 @@ async def process_convert_and_index_prod(
     except Exception as e:
         job_state.fail(job_id, str(e))
         db.update_parse_status(data_id, rag_status="error")
+        print(f"[PROD] ❌ Error: {e}")
         
         if webhook_url:
             payload = WebhookPayload(
