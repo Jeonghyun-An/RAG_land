@@ -12,6 +12,7 @@ from starlette.responses import StreamingResponse
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
 from pydantic import BaseModel
 import asyncio, json
+import numpy as np
 from sse_starlette.sse import EventSourceResponse  # ✅ 요구사항: sse-starlette
 from app.services import job_state, milvus_store
 from datetime import datetime, timedelta, timezone

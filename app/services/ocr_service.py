@@ -6,6 +6,11 @@ import os, subprocess
 from pathlib import Path
 from typing import Tuple, Dict
 from io import BytesIO
+import fitz  # PyMuPDF
+import numpy as np
+import pytesseract
+from PIL import Image
+import easyocr
 
 OCR_MODE = os.getenv("OCR_MODE", "auto")  # off | auto | force
 OCR_LANGS = os.getenv("OCR_LANGS", "kor+eng")
@@ -102,8 +107,6 @@ def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str | None:
     if not enabled:
         return None
     try:
-        import fitz  # PyMuPDF
-        import numpy as np
         dpi = int(os.getenv("OCR_DPI", "300"))
         zoom = max(1.0, dpi / 72.0)
         mat = fitz.Matrix(zoom, zoom)
@@ -114,8 +117,6 @@ def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str | None:
         texts: list[str] = []
 
         if engine == "tesseract":
-            import pytesseract
-            from PIL import Image
             tcmd = os.getenv("OCR_TESSERACT_CMD", "").strip()
             if tcmd:
                 pytesseract.pytesseract.tesseract_cmd = tcmd
@@ -127,7 +128,6 @@ def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str | None:
                 if t:
                     texts.append(t)
         else:
-            import easyocr
             langs = [s.strip() for s in os.getenv("OCR_LANG", "ko,en").replace("+", ",").split(",")]
             gpu = os.getenv("OCR_EASYOCR_GPU", "0").strip() == "1"
             reader = easyocr.Reader(langs, gpu=gpu)
