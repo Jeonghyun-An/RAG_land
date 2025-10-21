@@ -30,7 +30,7 @@ class SmartChunker:
         self.structure_patterns = {
             'header': re.compile(r'^(?:제\s*\d+\s*[조절항장편]|[A-Z0-9]+\.\s|\d+\.\d+\s)', re.MULTILINE),
             'list_item': re.compile(r'^[\s]*(?:\d+\.|[가나다라마바사아자차카타파하]\.|\([가나다라마바사아자차카타파하]\)|\d+\))', re.MULTILINE),
-            'quote': re.compile(r'^[\s]*(?:"|"|'|'|※|□|▪|▫)', re.MULTILINE),
+            'quote': re.compile(r"^[\s]*(?:['\"“”‘’]|※|□|▪|▫)", re.MULTILINE),
             'table_line': re.compile(r'[\|\+\-]{3,}|[┌┐└┘├┤┬┴┼─│]'),
         }
         
@@ -1016,13 +1016,22 @@ class SmartChunkerPlus(SmartChunker):
         for block in blocks:
             block_text = block.get('text', '').strip()
             if block_text:
-                bbox = block.get('bbox', {})
+                bbox = block.get('bbox', {}) or {}
+                def _y0(b):
+                    if not isinstance(b, dict):
+                        return 0
+                    return (
+                        b.get('y0')
+                        or b.get('top')
+                        or b.get('ymin')
+                        or b.get('y_start')
+                        or 0
+                    )
                 text_blocks.append({
                     'text': block_text,
                     'bbox': bbox,
-                    'y': bbox.get('y0', 0) if isinstance(bbox, dict) else 0
-                })
-        
+                    'y': _y0(bbox),
+                })        
         # Y 좌표 기준 정렬 (위에서 아래로)
         text_blocks.sort(key=lambda b: b['y'])
         
@@ -1060,8 +1069,14 @@ class SmartChunkerPlus(SmartChunker):
             
             # 수직 거리 계산
             prev_bbox = prev_block.get('bbox', {})
-            y_distance = current_block['y'] - prev_bbox.get('y1', prev_block['y'])
-            
+            prev_y1 = (
+                prev_bbox.get('y1')
+                or prev_bbox.get('bottom')
+                or prev_bbox.get('ymax')
+                or prev_bbox.get('y_end')
+                or prev_block.get('y', 0)
+            )
+            y_distance = current_block['y'] - prev_y1            
             # 그룹 연속성 판단
             should_continue_group = (
                 y_distance < 30 and  # 30pt 미만의 간격
