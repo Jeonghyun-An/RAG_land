@@ -20,6 +20,33 @@ PDF 텍스트 추출
     * OCR_EASYOCR_GPU: "1"이면 GPU 사용 시도, 기본 "0"
     * OCR_MIN_CHARS: auto 모드에서 OCR 전환 기준(기본 40)
 """
+from PIL import Image
+if not hasattr(Image, "ANTIALIAS"):
+    try:
+        Image.ANTIALIAS = Image.LANCZOS
+    except Exception:
+        Image.ANTIALIAS = getattr(Image, "BICUBIC", None)
+
+def _pdf_page_count(path: str) -> int:
+    """PDF 페이지 수 안전 획득"""
+    try:
+        import fitz
+        with fitz.open(path) as d:
+            return d.page_count
+    except Exception:
+        return 1  # 최후 보호
+
+def _make_image_placeholder_chunk(page_no: int) -> tuple[str, dict]:
+    text = f"[page {page_no}: image or low-text content]"
+    meta = {
+        "type": "image_page",
+        "section": "",
+        "page": page_no,
+        "pages": [page_no],
+        "token_count": len(text.split()),
+        "bboxes": {},
+    }
+    return (text, meta)
 
 # ---------------------- Text extract (no OCR) ---------------------- #
 def _extract_text_pdfminer(path: str, by_page: bool) -> Union[str, List[Tuple[int, str]]]:
@@ -107,7 +134,7 @@ def _ocr_with_tesseract(images_iter, by_page: bool, lang: str) -> Union[str, Lis
 def _ocr_with_easyocr(images_iter, by_page: bool, lang: str) -> Union[str, List[Tuple[int, str]]]:
     import easyocr
     langs = _norm_easyocr_langs(lang)
-    gpu = os.getenv("OCR_EASYOCR_GPU", "0").strip() == "1"
+    gpu = os.getenv("OCR_EASYOCR_GPU", "1").strip() == "1"
     reader = easyocr.Reader(langs, gpu=gpu)
 
     pages: List[Tuple[int, str]] = []
@@ -201,8 +228,11 @@ def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, st
     ocr_engine = os.getenv("OCR_ENGINE", "easyocr").lower()
     ocr_dpi    = int(os.getenv("OCR_DPI", "300"))
 
+    #  페이지 수를 미리 구해둔다 (폴백 생성용)
+    page_count = _pdf_page_count(path)
+
     if ocr_engine == "tesseract":
-        ocr_lang = os.getenv("OCR_LANG", "kor+eng")
+        ocr_langs = os.getenv("OCR_LANGS", "kor+eng")
     elif ocr_engine == "easyocr":
         ocr_lang = os.getenv("OCR_LANG", "ko,en")
     else:
@@ -218,33 +248,59 @@ def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, st
             except Exception:
                 text_result = "" if not by_page else []
         if ocr_mode == "never":
-            if text_result is None:
-                raise RuntimeError("PDF 텍스트 추출 실패(never 모드)")
-            return text_result
+            return text_result if text_result is not None else ("" if not by_page else [])
         if text_result and not _should_ocr(text_result):
             return text_result
 
+    # OCR 시도 (1차 → 2차 대체 엔진)
     try:
         images_iter = _render_pdf_pages_fitz(path, ocr_dpi)
+
+        def _empty(x):
+            return (isinstance(x, str) and not x.strip()) or (isinstance(x, list) and len(x) == 0)
+
+        # 1차: 지정 엔진
         if ocr_engine == "tesseract":
-            ocr_out = _ocr_with_tesseract(images_iter, by_page, ocr_lang)
+            ocr_out = _ocr_with_tesseract(images_iter, by_page, ocr_langs)
         elif ocr_engine == "easyocr":
             ocr_out = _ocr_with_easyocr(images_iter, by_page, ocr_lang)
         else:
             ocr_out = _ocr_with_paddle(images_iter, by_page, ocr_lang)
 
-        if (isinstance(ocr_out, list) and not ocr_out) or (isinstance(ocr_out, str) and not ocr_out.strip()):
+        # 1차가 비었으면 대체 엔진 재시도
+        if _empty(ocr_out):
+            images_iter = _render_pdf_pages_fitz(path, ocr_dpi)  # 제너레이터 재생성
+            if ocr_engine == "easyocr":
+                # easyocr → tesseract
+                ocr_out = _ocr_with_tesseract(images_iter, by_page, os.getenv("OCR_LANGS", "kor+eng"))
+            else:
+                # tesseract/paddle → easyocr
+                ocr_out = _ocr_with_easyocr(images_iter, by_page, os.getenv("OCR_LANG", "ko,en"))
+
+        # 그래도 비면: 텍스트 추출값이 있으면 그걸, 없으면 페이지별 플레이스홀더
+        if _empty(ocr_out):
             if text_result and ((isinstance(text_result, str) and text_result.strip()) or (isinstance(text_result, list) and len(text_result) > 0)):
                 return text_result
+            # 페이지별 플레이스홀더 생성
+            if by_page:
+                return [(p, _make_image_placeholder_chunk(p)[0]) for p in range(1, page_count + 1)]
+            else:
+                return "\n".join(_make_image_placeholder_chunk(p)[0] for p in range(1, page_count + 1))
+
         return ocr_out
+
     except Exception as e:
+        # OCR 중 예외: 텍스트 추출값이 있으면 사용, 아니면 페이지별 플레이스홀더
         if text_result and ((isinstance(text_result, str) and text_result.strip()) or (isinstance(text_result, list) and len(text_result) > 0)):
             return text_result
-        raise RuntimeError(f"OCR 실패 및 텍스트 추출 실패: {e}")
+        if by_page:
+            return [(p, _make_image_placeholder_chunk(p)[0]) for p in range(1, page_count + 1)]
+        else:
+            return "\n".join(_make_image_placeholder_chunk(p)[0] for p in range(1, page_count + 1))
+
 
 
 def parse_pdf_blocks(path: str) -> list[tuple[int, list[dict]]]:
-    """PDF 레이아웃 블록 추출"""
     import fitz
     out = []
     doc = fitz.open(path)
@@ -256,11 +312,15 @@ def parse_pdf_blocks(path: str) -> list[tuple[int, list[dict]]]:
                     continue
                 x0, y0, x1, y1, txt = b[0], b[1], b[2], b[3], (b[4] or "").strip()
                 if txt:
-                    blocks.append({"text": txt, "bbox": [float(x0), float(y0), float(x1), float(y1)]})
+                    blocks.append({
+                        "text": txt,
+                        "bbox": {"x0": float(x0), "y0": float(y0), "x1": float(x1), "y1": float(y1)}
+                    })
             out.append((i, blocks))
     finally:
         doc.close()
     return out
+
 
     
 def parse_any(path: str) -> List[Tuple[int, str]]:

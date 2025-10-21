@@ -797,7 +797,8 @@ class SmartChunker:
         # 표는 병합하지 않음
         if 'table' in meta1.get('type', '') or 'table' in meta2.get('type', ''):
             return False
-        
+        if 'image_page' in (meta1.get('type', ''), meta2.get('type', '')):
+            return False   # placeholder는 병합 금지
         # 같은 섹션 확인
         section1 = meta1.get('section', '')
         section2 = meta2.get('section', '')
@@ -858,18 +859,15 @@ class SmartChunker:
         finalized = []
         
         for text, meta in chunks:
-            # 최소 토큰 수 확인
-            if meta.get('token_count', 0) < self.min_chunk_tokens:
-                continue
-            
-            # 텍스트 정리
+            # 1) 텍스트 정리
             clean_text = self._clean_chunk_text(text)
             if not clean_text.strip():
                 continue
-            
-            # 메타데이터 정규화
+            # 2) 메타데이터 정규화(토큰 재계산 포함)
             clean_meta = self._normalize_chunk_metadata(meta, clean_text)
-            
+            # 3) 최소 토큰 수 확인 (정규화 후 기준)
+            if clean_meta.get('token_count', 0) < self.min_chunk_tokens:
+                continue           
             # META 라인 추가
             meta_line = "META: " + json.dumps(clean_meta, ensure_ascii=False)
             final_text = meta_line + "\n" + self._strip_meta_line(clean_text)

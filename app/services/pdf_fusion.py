@@ -7,12 +7,20 @@ PDF 융합 파서 개선 버전
 - 표 영역 bbox 최적화
 """
 from __future__ import annotations
+from PIL import Image
+if not hasattr(Image, "ANTIALIAS"):
+    try:
+        Image.ANTIALIAS = Image.LANCZOS
+    except Exception:
+        from PIL import Image as _I
+        Image.ANTIALIAS = getattr(_I, "BICUBIC", None)
+import fitz
+import numpy as np
 from typing import List, Tuple, Dict, Optional
 import os
 from io import BytesIO
 
-import fitz
-import numpy as np
+
 
 # easyocr 언어코드 보정
 try:
@@ -279,7 +287,7 @@ def _ocr_page_image(fitz_page: "fitz.Page") -> Tuple[str, List[Dict]]:
         return _ocr_page_with_tesseract(img, lang)
     else:
         lang = os.getenv("OCR_LANG", "ko,en")
-        gpu  = os.getenv("OCR_EASYOCR_GPU", "0").strip() == "1"
+        gpu  = os.getenv("OCR_EASYOCR_GPU", "1").strip() == "1"
         return _ocr_page_with_easyocr(img, lang, gpu)
 
 # ---------- 공개: 경로 입력을 OCR-융합으로 뽑기 ----------

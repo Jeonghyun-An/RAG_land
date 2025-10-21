@@ -1,4 +1,11 @@
 from __future__ import annotations
+from PIL import Image
+if not hasattr(Image, "ANTIALIAS"):
+    try:
+        Image.ANTIALIAS = Image.LANCZOS
+    except Exception:
+        from PIL import Image as _I
+        Image.ANTIALIAS = getattr(_I, "BICUBIC", None)
 import os, io, time, requests, shutil, subprocess
 from typing import Optional
 from pathlib import Path

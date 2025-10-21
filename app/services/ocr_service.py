@@ -1,16 +1,23 @@
 # app/services/ocr_service.py
 from __future__ import annotations
+from PIL import Image
+if not hasattr(Image, "ANTIALIAS"):
+    try:
+        Image.ANTIALIAS = Image.LANCZOS
+    except Exception:
+        from PIL import Image as _I
+        Image.ANTIALIAS = getattr(_I, "BICUBIC", None)
+import fitz  # PyMuPDF
+import numpy as np
+import pytesseract
+import easyocr
 import math
 import re
 import os, subprocess
 from pathlib import Path
 from typing import Tuple, Dict
 from io import BytesIO
-import fitz  # PyMuPDF
-import numpy as np
-import pytesseract
-from PIL import Image
-import easyocr
+
 
 OCR_MODE = os.getenv("OCR_MODE", "auto")  # off | auto | force
 OCR_LANGS = os.getenv("OCR_LANGS", "kor+eng")
@@ -129,7 +136,7 @@ def try_ocr_pdf_bytes(pdf_bytes: bytes, enabled: bool) -> str | None:
                     texts.append(t)
         else:
             langs = [s.strip() for s in os.getenv("OCR_LANG", "ko,en").replace("+", ",").split(",")]
-            gpu = os.getenv("OCR_EASYOCR_GPU", "0").strip() == "1"
+            gpu = os.getenv("OCR_EASYOCR_GPU", "1").strip() == "1"
             reader = easyocr.Reader(langs, gpu=gpu)
             for page in doc:
                 pix = page.get_pixmap(matrix=mat, alpha=False)

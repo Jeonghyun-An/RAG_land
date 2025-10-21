@@ -1,4 +1,12 @@
 # app/main.py
+from PIL import Image
+if not hasattr(Image, "ANTIALIAS"):
+    try:
+        Image.ANTIALIAS = Image.LANCZOS
+    except Exception:
+        from PIL import Image as _I
+        Image.ANTIALIAS = getattr(_I, "BICUBIC", None)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.llama_router import router as llama_router
