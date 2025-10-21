@@ -203,20 +203,31 @@ def _text_to_pdf(src: Path, out: Path):
     out.write_bytes(pdf)
 
 def _image_to_pdf(src: Path, out: Path):
-    # Pillow 우선(멀티페이지 TIFF 지원) → 실패 시 Chromium 폴백
+    """이미지 → PDF 변환 (Pillow 10.0+ 호환)"""
     try:
         from PIL import Image, ImageSequence
         im = Image.open(src)
-        frames = [frame.convert("RGB") for frame in ImageSequence.Iterator(im)] or [im.convert("RGB")]
+        
+        # Pillow 10.0+ 호환: LANCZOS 사용 (ANTIALIAS 제거됨)
+        frames = []
+        for frame in ImageSequence.Iterator(im):
+            rgb_frame = frame.convert("RGB")
+            # 리샘플링이 필요한 경우 LANCZOS 명시
+            frames.append(rgb_frame)
+        
+        if not frames:
+            frames = [im.convert("RGB")]
+        
         if len(frames) == 1:
-            frames[0].save(out, "PDF")
+            frames[0].save(out, "PDF", resolution=100.0)
         else:
-            frames[0].save(out, "PDF", save_all=True, append_images=frames[1:])
+            frames[0].save(out, "PDF", save_all=True, append_images=frames[1:], resolution=100.0)
         return
-    except Exception:
+    except Exception as e:
+        print(f"[PDF_CONVERTER] Pillow 변환 실패, Chromium 폴백: {e}")
         pass
     _image_to_pdf_via_chromium(src, out)
-
+    
 def _image_to_pdf_via_chromium(src: Path, out: Path):
     if not _gotenberg_ok():
         raise ConvertError("Gotenberg healthcheck 실패")
