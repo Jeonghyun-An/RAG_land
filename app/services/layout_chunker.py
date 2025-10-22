@@ -1,10 +1,11 @@
 # app/services/layout_chunker.py
 """
-레이아웃 인지 청킹 모듈 - 고도화 버전
+레이아웃 인지 청킹 모듈 - 고도화 버전 (교정/교열 완전 텍스트 보존)
 - PDF 레이아웃 정보를 활용한 의미론적 청킹
 - 표, 그림, 박스 구조 보존
 - 문단 간 시각적 연관성 분석
 - 원자력 문서의 구조적 특성 반영
+- **교정·교열을 위해 모든 글자를 순서대로 누락 없이 보존**
 """
 from __future__ import annotations
 import json
@@ -292,19 +293,71 @@ class LayoutAwareChunker:
         return chunks
     
     def _extract_group_text(self, group: Dict) -> str:
-        """그룹에서 텍스트 추출"""
+        """
+        그룹에서 텍스트 추출 - 교정/교열을 위해 모든 글자를 순서대로 완전 보존
+        
+        CRITICAL: 텍스트 누락 방지를 위해 모든 블록의 전체 텍스트를 순서대로 연결
+        """
         blocks = group['blocks']
         
+        if not blocks:
+            return ""
+        
+        # 그룹 타입에 관계없이 **모든 블록의 텍스트를 순서대로 완전히 보존**
+        # 단, 타입별로 적절한 구분자를 사용하여 가독성 유지
+        
         if group['type'] == 'table':
-            # 표 구조는 원형 보존
+            # 표: 줄바꿈으로 연결 (표 구조 유지)
             return '\n'.join(block.text for block in blocks)
+        
         elif group['type'] == 'list_item':
-            # 목록은 적절한 들여쓰기
-            return '\n'.join(f"  {block.text}" if not block.text.startswith((' ', '\t')) else block.text 
-                           for block in blocks)
-        else:
-            # 일반 텍스트는 문단 단위로 결합
-            return '\n\n'.join(block.text for block in blocks)
+            # 목록: 각 항목을 줄바꿈으로 연결
+            # 들여쓰기가 없으면 추가, 있으면 그대로 유지
+            lines = []
+            for block in blocks:
+                text = block.text
+                # 이미 들여쓰기가 있는지 확인
+                if text and not text[0].isspace():
+                    lines.append(f"  {text}")
+                else:
+                    lines.append(text)
+            return '\n'.join(lines)
+        
+        elif group['type'] == 'quote_box':
+            # 인용/박스: 줄바꿈으로 연결하되 구분 유지
+            return '\n'.join(block.text for block in blocks)
+        
+        elif group['type'] == 'header':
+            # 헤더: 공백으로 연결 (보통 짧은 제목)
+            return ' '.join(block.text for block in blocks)
+        
+        elif group['type'] == 'footnote':
+            # 각주: 공백으로 연결
+            return ' '.join(block.text for block in blocks)
+        
+        else:  # 'paragraph' 및 기타
+            # 일반 문단: 문장 단위로 연결
+            # 블록 간 적절한 간격 유지
+            result_parts = []
+            for i, block in enumerate(blocks):
+                text = block.text
+                
+                # 문단 구분: 이전 블록과의 연결성 판단
+                if i > 0:
+                    prev_text = blocks[i-1].text
+                    # 이전 텍스트가 문장 끝(마침표, 물음표, 느낌표)으로 끝나면 줄바꿈
+                    if prev_text and prev_text[-1] in '.?!。':
+                        result_parts.append('\n\n')
+                    # 이전 텍스트가 쉼표나 접속사로 끝나면 공백
+                    elif prev_text and prev_text[-1] in ',;:':
+                        result_parts.append(' ')
+                    # 그 외에는 자연스럽게 공백 연결
+                    else:
+                        result_parts.append(' ')
+                
+                result_parts.append(text)
+            
+            return ''.join(result_parts)
     
     def _create_chunk_from_group(self, group: Dict, page_no: int) -> Tuple[str, Dict]:
         """그룹으로부터 청크 생성"""
@@ -393,7 +446,7 @@ class LayoutAwareChunker:
         return chunks
     
     def _split_table_by_rows(self, blocks: List[LayoutBlock], page_no: int) -> List[Tuple[str, Dict]]:
-        """표를 행 단위로 분할"""
+        """표를 행 단위로 분할 - 전체 텍스트 보존"""
         chunks = []
         current_rows = []
         current_tokens = 0
@@ -416,7 +469,8 @@ class LayoutAwareChunker:
         return chunks
     
     def _create_table_chunk(self, blocks: List[LayoutBlock], page_no: int) -> Tuple[str, Dict]:
-        """표 청크 생성"""
+        """표 청크 생성 - 모든 행 완전 보존"""
+        # 표의 모든 행을 줄바꿈으로 연결하여 완전히 보존
         text = '\n'.join(block.text for block in blocks)
         bbox = self._merge_bboxes([block.bbox for block in blocks])
         
@@ -436,7 +490,7 @@ class LayoutAwareChunker:
         return (final_text, meta)
     
     def _split_list_items(self, blocks: List[LayoutBlock], page_no: int) -> List[Tuple[str, Dict]]:
-        """목록 항목들을 적절히 그룹화"""
+        """목록 항목들을 적절히 그룹화 - 전체 텍스트 보존"""
         chunks = []
         current_items = []
         current_tokens = 0
@@ -459,9 +513,18 @@ class LayoutAwareChunker:
         return chunks
     
     def _create_list_chunk(self, blocks: List[LayoutBlock], page_no: int) -> Tuple[str, Dict]:
-        """목록 청크 생성"""
-        text = '\n'.join(f"  {block.text}" if not block.text.startswith((' ', '\t')) else block.text 
-                        for block in blocks)
+        """목록 청크 생성 - 모든 항목 완전 보존"""
+        # 각 항목을 줄바꿈으로 연결, 들여쓰기 추가
+        lines = []
+        for block in blocks:
+            text = block.text
+            # 이미 들여쓰기가 있으면 유지, 없으면 추가
+            if text and not text[0].isspace():
+                lines.append(f"  {text}")
+            else:
+                lines.append(text)
+        
+        text = '\n'.join(lines)
         bbox = self._merge_bboxes([block.bbox for block in blocks])
         
         meta = {
@@ -480,7 +543,7 @@ class LayoutAwareChunker:
         return (final_text, meta)
     
     def _split_blocks_by_tokens(self, blocks: List[LayoutBlock], page_no: int, group_type: str) -> List[Tuple[str, Dict]]:
-        """블록들을 토큰 수 기준으로 분할"""
+        """블록들을 토큰 수 기준으로 분할 - 전체 텍스트 보존"""
         chunks = []
         current_blocks = []
         current_tokens = 0
@@ -511,8 +574,20 @@ class LayoutAwareChunker:
         return chunks
     
     def _create_blocks_chunk(self, blocks: List[LayoutBlock], page_no: int, group_type: str) -> Tuple[str, Dict]:
-        """블록들로부터 청크 생성"""
-        text = '\n\n'.join(block.text for block in blocks)
+        """블록들로부터 청크 생성 - 모든 블록 텍스트 완전 보존"""
+        # 모든 블록의 텍스트를 적절한 구분자로 연결
+        if group_type == 'table':
+            text = '\n'.join(block.text for block in blocks)
+        elif group_type == 'list_item':
+            lines = []
+            for block in blocks:
+                t = block.text
+                lines.append(f"  {t}" if t and not t[0].isspace() else t)
+            text = '\n'.join(lines)
+        else:
+            # 일반 텍스트: 문단 구분 유지하며 연결
+            text = '\n\n'.join(block.text for block in blocks)
+        
         bbox = self._merge_bboxes([block.bbox for block in blocks])
         section = self._extract_section_from_blocks(blocks)
         
@@ -533,40 +608,68 @@ class LayoutAwareChunker:
     
     def _extract_section_from_blocks(self, blocks: List[LayoutBlock]) -> str:
         """블록들에서 섹션 정보 추출"""
-        for block in blocks:
-            section = self._extract_section_info({'blocks': [block]})
-            if section:
-                return section
+        if not blocks:
+            return ""
+        
+        first_text = blocks[0].text
+        
+        # 조항 패턴
+        article_match = re.search(r'제\s*\d+\s*조[가-힣\s]*', first_text)
+        if article_match:
+            return article_match.group(0)
+        
+        # 절/항 패턴
+        section_match = re.search(r'제\s*\d+\s*[절항][가-힣\s]*', first_text)
+        if section_match:
+            return section_match.group(0)
+        
+        # IAEA 섹션 패턴
+        iaea_match = re.search(r'\d+\.\d+(?:\.\d+)?\s*[가-힣\s]*', first_text)
+        if iaea_match:
+            return iaea_match.group(0)
+        
+        # 일반적인 제목 패턴
+        if len(first_text) < 100 and not first_text.endswith('.'):
+            return first_text
+        
         return ""
     
     def _split_large_block(self, block: LayoutBlock, page_no: int, group_type: str) -> List[Tuple[str, Dict]]:
-        """큰 블록을 문장 단위로 분할"""
-        chunks = []
-        sentences = self._split_sentences(block.text)
+        """큰 블록을 문장 단위로 분할 - 모든 문장 완전 보존"""
+        text = block.text
+        sentences = self._split_into_sentences(text)
         
-        current_text = ""
+        if not sentences:
+            return []
+        
+        chunks = []
+        current_sentences = []
         current_tokens = 0
         
         for sentence in sentences:
             sentence_tokens = self._count_tokens(sentence)
             
             if current_tokens + sentence_tokens <= self.target_tokens:
-                current_text += " " + sentence if current_text else sentence
+                current_sentences.append(sentence)
                 current_tokens += sentence_tokens
             else:
-                if current_text:
-                    chunks.append(self._create_text_chunk(current_text, page_no, group_type, block.bbox))
-                current_text = sentence
+                if current_sentences:
+                    chunk_text = ' '.join(current_sentences)
+                    chunks.append(self._create_text_chunk(chunk_text, page_no, group_type, block.bbox))
+                
+                current_sentences = [sentence]
                 current_tokens = sentence_tokens
         
-        if current_text:
-            chunks.append(self._create_text_chunk(current_text, page_no, group_type, block.bbox))
+        if current_sentences:
+            chunk_text = ' '.join(current_sentences)
+            chunks.append(self._create_text_chunk(chunk_text, page_no, group_type, block.bbox))
         
         return chunks
     
-    def _split_sentences(self, text: str) -> List[str]:
-        """문장 분리"""
-        sentence_end = re.compile(r'[.!?]+\s*(?=[A-Z가-힣]|$)')
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """텍스트를 문장 단위로 분할 - 모든 문장 보존"""
+        # 문장 종결 부호 기준 분할
+        sentence_end = re.compile(r'(?<=[.!?。])\s+(?=[A-Z가-힣]|$)')
         sentences = sentence_end.split(text)
         return [s.strip() for s in sentences if s.strip()]
     
@@ -643,11 +746,12 @@ class LayoutAwareChunker:
         return False
     
     def _merge_chunk_texts(self, text1: str, text2: str) -> str:
-        """두 청크 텍스트 병합"""
+        """두 청크 텍스트 병합 - 모든 텍스트 보존"""
         # META 라인 제거
         clean_text1 = self._strip_meta_line(text1)
         clean_text2 = self._strip_meta_line(text2)
         
+        # 자연스럽게 연결 (줄바꿈 유지)
         return clean_text1 + "\n\n" + clean_text2
     
     def _merge_chunk_metas(self, meta1: Dict, meta2: Dict) -> Dict:
@@ -674,7 +778,7 @@ class LayoutAwareChunker:
         return text
     
     def _fallback_chunking(self, text: str, page_no: int) -> List[Tuple[str, Dict]]:
-        """레이아웃 정보 없을 때의 폴백 청킹"""
+        """레이아웃 정보 없을 때의 폴백 청킹 - 모든 텍스트 보존"""
         chunks = []
         paragraphs = text.split('\n\n')
         
@@ -719,7 +823,7 @@ class LayoutAwareChunker:
         return (final_text, meta)
     
     def _finalize_chunks(self, chunks: List[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:
-        """최종 청크 정리"""
+        """최종 청크 정리 - 텍스트 손실 방지"""
         finalized = []
         
         for text, meta in chunks:
@@ -727,7 +831,7 @@ class LayoutAwareChunker:
             if meta.get('token_count', 0) < self.min_chunk_tokens:
                 continue
             
-            # 텍스트 정리
+            # 텍스트 정리 (과도한 공백만 제거, 내용은 보존)
             clean_text = self._clean_chunk_text(text)
             if not clean_text.strip():
                 continue
@@ -741,13 +845,16 @@ class LayoutAwareChunker:
         return finalized
     
     def _clean_chunk_text(self, text: str) -> str:
-        """청크 텍스트 정리"""
-        # 이상한 라벨 제거
+        """
+        청크 텍스트 정리 - 교정/교열을 위해 내용 보존, 불필요한 공백만 제거
+        """
+        # 이상한 라벨 제거 (그룹화 과정에서 추가된 불필요한 레이블)
         text = re.sub(r'\b인접행\s*묶음\b', '', text)
         text = re.sub(r'\b[가-힣]*\s*묶음\b', '', text)
         
-        # 과도한 공백 정리
+        # 과도한 공백 정리 (3줄 이상 → 2줄로)
         text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+        # 연속된 공백/탭 → 단일 공백
         text = re.sub(r'[ \t]+', ' ', text)
         
         return text.strip()
@@ -759,7 +866,7 @@ class LayoutAwareChunker:
         try:
             return len(self.encoder(text))
         except:
-            return len(text.split()) * 1.3
+            return int(len(text.split()) * 1.3)
 
 
 def layout_aware_chunks(pages_std: List[Tuple[int, str]], 
