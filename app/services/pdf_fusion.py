@@ -20,7 +20,23 @@ from typing import List, Tuple, Dict, Optional
 import os
 from io import BytesIO
 
+# [신규] EasyOCR Reader 싱글톤 캐싱
+_EASYOCR_READER_CACHE = {}
 
+def _get_easyocr_reader(langs: list[str], gpu: bool):
+    """
+    [성능 개선] EasyOCR Reader를 재사용
+    - 언어와 GPU 설정별로 캐싱
+    - 페이지마다 새로 생성하지 않음
+    """
+    cache_key = (tuple(sorted(langs)), gpu)
+    
+    if cache_key not in _EASYOCR_READER_CACHE:
+        import easyocr
+        print(f"[OCR] Creating EasyOCR Reader: langs={langs}, gpu={gpu}")
+        _EASYOCR_READER_CACHE[cache_key] = easyocr.Reader(langs, gpu=gpu)
+    
+    return _EASYOCR_READER_CACHE[cache_key]
 
 # easyocr 언어코드 보정
 try:
@@ -100,16 +116,13 @@ def _pdfminer_pages_and_blocks_from_bytes(pdf_bytes: bytes) -> Tuple[List[Tuple[
 # ---------- 내부: EasyOCR로 한 페이지 OCR (bbox 정확도 개선) ----------
 def _ocr_page_with_easyocr(img_nd: "np.ndarray", lang: str, gpu: bool) -> Tuple[str, List[Dict]]:
     """
-    [개선] EasyOCR bbox 정확도 향상
-    - paragraph=False로 라인 단위 감지
-    - 신뢰도 기반 필터링
-    - bbox 정규화
+    [개선] EasyOCR bbox 정확도 향상 + Reader 재사용
     """
-    import easyocr
     import numpy as np
     
     langs = _norm_easyocr_langs(lang)
-    reader = easyocr.Reader(langs, gpu=gpu)
+    # [핵심 수정] Reader 재사용
+    reader = _get_easyocr_reader(langs, gpu)
     
     # detail=1로 bbox, text, confidence 받기
     res = reader.readtext(img_nd, detail=1, paragraph=False)
@@ -143,23 +156,22 @@ def _ocr_page_with_easyocr(img_nd: "np.ndarray", lang: str, gpu: bool) -> Tuple[
             if x1 <= x0 or y1 <= y0:
                 continue
             
+            texts.append(txt)
             blocks.append({
-                "text": txt, 
+                "text": txt,
                 "bbox": {
-                    "x0": x0, 
-                    "y0": y0, 
-                    "x1": x1, 
+                    "x0": x0,
+                    "y0": y0,
+                    "x1": x1,
                     "y1": y1
                 },
-                "confidence": float(conf)
+                "confidence": conf
             })
-            texts.append(txt)
-            
         except Exception:
-            continue
+            pass
     
     # 워터마크 필터링 (선택적)
-    if os.getenv("OCR_FILTER_WATERMARKS", "1") == "1":
+    if os.getenv("OCR_FILTER_WATERMARKS", "1") == "1" and blocks:
         blocks = _filter_watermark_blocks(blocks, img_nd.shape[1], img_nd.shape[0])
     
     # Y 좌표 기준 정렬 (읽는 순서)
