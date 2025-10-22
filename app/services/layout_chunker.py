@@ -175,7 +175,7 @@ class LayoutAwareChunker:
         
         # 각 행 내에서 X 좌표로 정렬
         sorted_blocks = []
-        for row_y in sorted(blocks_by_row.keys()):
+        for row_y in sorted(blocks_by_row.keys(),reverse=True):
             row_blocks = sorted(blocks_by_row[row_y], key=lambda b: b.bbox.x0)
             sorted_blocks.extend(row_blocks)
         
