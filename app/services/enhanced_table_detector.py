@@ -33,6 +33,7 @@ class EnhancedTableDetector:
             '구분', '항목', '내용', '비고', '번호', '명칭', 
             '수량', '금액', '단위', '기준', '조건', '결과'
         ]
+        self.row_tolerance = 10
         
     def detect_tables(
         self, 
@@ -97,36 +98,47 @@ class EnhancedTableDetector:
         
         return tables
     
-    def _find_aligned_blocks(self, blocks: List[Dict]) -> List[Dict]:
-        """정렬된 블록 그룹 찾기"""
+    def _find_aligned_blocks(self, blocks: List[Dict]) -> List[List[Dict]]:
+        """
+        Y좌표가 비슷한 블록들을 그룹화 (같은 행)
+        [수정] bbox dict 형식 대응
+        """
         if not blocks:
             return []
-        
-        groups = []
-        
-        # Y좌표 기준으로 정렬
-        sorted_blocks = sorted(blocks, key=lambda b: b.get('bbox', [0,0,0,0])[1])
-        
-        current_group = []
-        current_y = None
-        y_tolerance = 5  # 5pt 이내는 같은 줄로 간주
-        
-        for block in sorted_blocks:
-            bbox = block.get('bbox', [0,0,0,0])
-            y = bbox[1]
-            
-            if current_y is None or abs(y - current_y) < y_tolerance:
-                current_group.append(block)
-                current_y = y
+
+        # [수정] bbox 형식 통일 함수
+        def get_y_coord(block):
+            bbox = block.get('bbox', {})
+            if isinstance(bbox, dict):
+                return bbox.get('y0', 0)  # dict 형식
+            elif isinstance(bbox, (list, tuple)) and len(bbox) >= 2:
+                return bbox[1]  # list 형식 [x0, y0, x1, y1]
             else:
-                if len(current_group) >= 2:  # 최소 2개 블록
-                    groups.append(self._create_group(current_group))
+                return 0
+
+        # Y 좌표 기준 정렬
+        sorted_blocks = sorted(blocks, key=get_y_coord)
+
+        groups = []
+        current_group = [sorted_blocks[0]]
+        current_y = get_y_coord(sorted_blocks[0])
+
+        for block in sorted_blocks[1:]:
+            block_y = get_y_coord(block)
+
+            # Y 좌표 차이가 threshold 이내면 같은 행
+            if abs(block_y - current_y) < self.row_tolerance:
+                current_group.append(block)
+            else:
+                if len(current_group) >= 2:  # 최소 2개 이상
+                    groups.append(current_group)
                 current_group = [block]
-                current_y = y
-        
+                current_y = block_y
+
+        # 마지막 그룹
         if len(current_group) >= 2:
-            groups.append(self._create_group(current_group))
-        
+            groups.append(current_group)
+
         return groups
     
     def _is_table_like_group(self, group: Dict) -> bool:
