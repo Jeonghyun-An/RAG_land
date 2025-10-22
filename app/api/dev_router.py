@@ -2,7 +2,8 @@
 """
 개발/테스트용 라우터
 - 로컬 디렉토리 파일 사용
-- DB 업데이트 없음
+- DB 업데이트 없음 (개발 모드)
+- 단순 청커(simple_proofreading_chunker) 사용
 - Webhook 페이로드만 전달
 """
 from __future__ import annotations
@@ -35,9 +36,7 @@ class DevConvertRequest(BaseModel):
     data_id: str
     path: str = ""
     file_id: str
-    webhook_url: Optional[str] = None
-    ocr_manual_required: bool = False
-    reindex_required_yn: bool = False
+    callback_url: Optional[str] = None  # callback_url로 변경
 
 
 class DevConvertResponse(BaseModel):
@@ -111,11 +110,11 @@ async def process_dev_convert_and_index(
     job_id: str,
     data_id: str,
     file_id: str,
-    webhook_url: Optional[str]
+    callback_url: Optional[str]
 ):
     """
     개발용 백그라운드 처리
-    - llama_router의 index_pdf_to_milvus() 재사용
+    - 단순 청커(simple_proofreading_chunker) 사용
     - DB 업데이트 없음
     - Webhook으로 결과 전달
     """
@@ -170,9 +169,9 @@ async def process_dev_convert_and_index(
                 raise RuntimeError(f"MinIO 업로드 실패: {e}")
         
         # PDF 변환 완료 웹훅
-        if webhook_url:
+        if callback_url:
             await send_dev_webhook(
-                webhook_url,
+                callback_url,
                 DevWebhookPayload(
                     job_id=job_id,
                     data_id=data_id,
@@ -185,50 +184,119 @@ async def process_dev_convert_and_index(
                 DEV_SECRET
             )
         
-        # ========== Step 3: 고도화된 청킹 & 인덱싱 (llama_router 재사용) ==========
-        job_state.update(job_id, status="processing", step="Using advanced indexing pipeline")
+        # ========== Step 3: 단순 청킹 & 인덱싱 ==========
+        job_state.update(job_id, status="processing", step="Simple chunking for development")
         
-        # 🔥 핵심: OCR 모드를 'never'로 설정 (변환된 PDF는 텍스트 포함)
-        original_ocr_mode = os.environ.get("OCR_MODE")
-        try:
-            if not is_already_pdf:
-                os.environ["OCR_MODE"] = "never"  # 변환된 PDF는 OCR 불필요
+        # 3-1) PDF 텍스트 추출
+        from app.services.file_parser import parse_pdf
+        
+        print(f"[DEV-CHUNK] Extracting text from: {converted_pdf_path}")
+        pages_std = parse_pdf(converted_pdf_path, by_page=True)
+        
+        if not pages_std:
+            raise RuntimeError("텍스트 추출 실패")
+        
+        print(f"[DEV-CHUNK] Extracted {len(pages_std)} pages")
+        
+        # 3-2) 단순 청킹
+        from app.services.simple_proofreading_chunker import simple_chunk_by_paragraph
+        from app.services.embedding_model import get_embedding_model
+        
+        embed_model = get_embedding_model()
+        encoder_fn = embed_model.tokenizer.encode
+        
+        print(f"[DEV-CHUNK] Chunking with simple proofreading chunker (paragraph-based)")
+        
+        chunks = simple_chunk_by_paragraph(
+            pages_std,
+            encoder_fn,
+            target_tokens=400  # 조정 가능
+        )
+        
+        if not chunks:
+            raise RuntimeError("청킹 실패: 청크가 생성되지 않음")
+        
+        print(f"[DEV-CHUNK] Created {len(chunks)} chunks")
+        
+        # 3-3) 임베딩
+        job_state.update(job_id, status="embedding", step=f"Embedding {len(chunks)} chunks")
+        
+        from app.services.embedding_model import embed
+        
+        chunk_texts = []
+        chunk_metas = []
+        
+        for chunk_text, chunk_meta in chunks:
+            # META 라인 제거하고 본문만
+            clean_text = chunk_text
+            if clean_text.startswith("META:"):
+                nl_pos = clean_text.find("\n")
+                clean_text = clean_text[nl_pos + 1:] if nl_pos != -1 else ""
             
-            # llama_router의 고도화된 인덱싱 파이프라인 호출
-            from app.api.llama_router import index_pdf_to_milvus
-            
-            index_pdf_to_milvus(
-                job_id=job_id,
-                file_path=converted_pdf_path,
-                minio_object=pdf_key,  # MinIO 경로도 전달
-                uploaded=True,
-                remove_local=False,  # 개발 모드에서는 로컬 파일 유지
-                doc_id=data_id
+            chunk_texts.append(clean_text.strip())
+            chunk_metas.append(chunk_meta)
+        
+        print(f"[DEV-CHUNK] Embedding {len(chunk_texts)} chunks...")
+        embeddings = embed(chunk_texts)
+        
+        # 3-4) Milvus 저장
+        job_state.update(job_id, status="indexing", step="Indexing to Milvus")
+        
+        from app.services.milvus_store_v2 import MilvusStoreV2
+        
+        mvs = MilvusStoreV2()
+        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "nuclear_rag")
+        
+        # 기존 문서 삭제 (개발 모드에서 재테스트 시)
+        print(f"[DEV-CHUNK] Deleting existing doc (if any): {data_id}")
+        mvs.delete_by_doc_id(collection_name, data_id)
+        
+        # 청크 삽입
+        print(f"[DEV-CHUNK] Inserting {len(chunks)} chunks to Milvus")
+        
+        for i, (emb, text, meta) in enumerate(zip(embeddings, chunk_texts, chunk_metas)):
+            mvs.insert_one(
+                collection_name,
+                doc_id=data_id,
+                chunk_id=f"{data_id}_chunk_{i}",
+                chunk_index=i,
+                text=text,
+                embedding=emb.tolist() if hasattr(emb, 'tolist') else emb,
+                page=meta.get('page', 1),
+                pages=meta.get('pages', [meta.get('page', 1)]),
+                metadata={
+                    "type": meta.get('type', 'simple_dev_chunk'),
+                    "token_count": meta.get('token_count', 0),
+                    "char_count": meta.get('char_count', 0),
+                    "file_id": file_id,
+                    "data_id": data_id
+                }
             )
-            
-        finally:
-            # 환경변수 복원
-            if original_ocr_mode is not None:
-                os.environ["OCR_MODE"] = original_ocr_mode
-            elif "OCR_MODE" in os.environ:
-                del os.environ["OCR_MODE"]
+        
+        print(f"[DEV-CHUNK] ✅ Successfully indexed {len(chunks)} chunks")
         
         # ========== Step 4: 결과 조회 및 웹훅 전송 ==========
-        state = job_state.get(job_id) or {}
-        chunks = state.get('chunks', 0)
-        pages = state.get('pages', 0)
+        pages = len(pages_std)
+        chunk_count = len(chunks)
         
-        print(f"[DEV] ✅ Completed: {pages} pages, {chunks} chunks")
+        print(f"[DEV] ✅ Completed: {pages} pages, {chunk_count} chunks")
         
-        if webhook_url:
+        # Job 상태 업데이트 (DB 업데이트는 하지 않음)
+        job_state.complete(
+            job_id,
+            pages=pages,
+            chunks=chunk_count
+        )
+        
+        if callback_url:
             end_time = datetime.utcnow()
             payload = DevWebhookPayload(
                 job_id=job_id,
                 data_id=data_id,
                 status="done",
                 converted=not is_already_pdf,
-                metrics={"pages": pages, "chunks": chunks},
-                chunk_count=chunks,
+                metrics={"pages": pages, "chunks": chunk_count},
+                chunk_count=chunk_count,
                 timestamps={
                     "start": start_time.isoformat(), 
                     "end": end_time.isoformat()
@@ -236,20 +304,20 @@ async def process_dev_convert_and_index(
                 message="Development mode: converted and indexed (no DB update)",
                 pdf_key_minio=pdf_key
             )
-            await send_dev_webhook(webhook_url, payload, DEV_SECRET)
+            await send_dev_webhook(callback_url, payload, DEV_SECRET)
     
     except Exception as e:
         job_state.fail(job_id, str(e))
         print(f"[DEV] ❌ Error: {e}")
         
-        if webhook_url:
+        if callback_url:
             payload = DevWebhookPayload(
                 job_id=job_id,
                 data_id=data_id,
                 status="error",
                 message=str(e)
             )
-            await send_dev_webhook(webhook_url, payload, DEV_SECRET)
+            await send_dev_webhook(callback_url, payload, DEV_SECRET)
         
         raise
 
@@ -261,7 +329,7 @@ async def dev_convert_and_index(
     background_tasks: BackgroundTasks,
     x_dev_token: Optional[str] = Header(None)
 ):
-    """개발용 트리거 API"""
+    """개발용 트리거 API - 단순 청커 사용, DB 업데이트 없음"""
     if not verify_dev_token(x_dev_token):
         raise HTTPException(401, "Unauthorized")
     
@@ -278,23 +346,24 @@ async def dev_convert_and_index(
         job_id=job_id,
         data_id=request.data_id,
         file_id=request.file_id,
-        webhook_url=request.webhook_url
+        callback_url=request.callback_url
     )
     
     return DevConvertResponse(
         status="accepted",
         job_id=job_id,
         data_id=request.data_id,
-        message="Development mode processing"
+        message="Development mode processing (simple chunker, no DB)"
     )
 
 
 @router.get("/status/{data_id}", response_model=DevStatusResponse)
 def dev_get_status(data_id: str, x_dev_token: Optional[str] = Header(None)):
-    """상태 조회"""
+    """상태 조회 (개발 모드에서는 job_state만 조회)"""
     if not verify_dev_token(x_dev_token):
         raise HTTPException(401, "Unauthorized")
     
+    # job_state에서 조회 (DB 조회 없음)
     state = job_state.get(data_id)
     
     if not state:
@@ -303,80 +372,19 @@ def dev_get_status(data_id: str, x_dev_token: Optional[str] = Header(None)):
     return DevStatusResponse(
         data_id=data_id,
         rag_index_status=state.get('status', 'unknown'),
-        parse_yn=state.get('parse_yn'),
+        parse_yn=None,  # 개발 모드에서는 DB 없음
         chunk_count=state.get('chunks'),
         parse_start_dt=state.get('created_at'),
-        parse_end_dt=state.get('updated_at'),
+        parse_end_dt=state.get('completed_at'),
         milvus_doc_id=data_id
     )
-
-
-@router.get("/jobs")
-def dev_list_jobs(x_dev_token: Optional[str] = Header(None)):
-    """모든 Job 목록"""
-    if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized")
-    
-    jobs = job_state.list_jobs(status=None, limit=100)
-    return {"jobs": jobs, "count": len(jobs)}
-
-
-@router.delete("/jobs/{job_id}")
-def dev_clear_job(job_id: str, x_dev_token: Optional[str] = Header(None)):
-    """Job 상태 삭제"""
-    if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized")
-    
-    job_state.clear(job_id)
-    return {"message": f"Job {job_id} cleared"}
-
-
-@router.delete("/jobs")
-def dev_clear_all_jobs(x_dev_token: Optional[str] = Header(None)):
-    """모든 Job 삭제"""
-    if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized")
-    
-    job_state.clear_all()
-    return {"message": "All jobs cleared"}
 
 
 @router.get("/health")
 def dev_health_check():
     """헬스 체크"""
-    staging_dir = Path(LOCAL_STAGING_PATH)
     return {
-        "status": "ok",
-        "service": "dev-router",
-        "local_staging_path": str(staging_dir),
-        "staging_dir_exists": staging_dir.exists(),
-        "staging_dir_writable": os.access(staging_dir, os.W_OK) if staging_dir.exists() else False
-    }
-
-
-@router.post("/upload-test-file")
-async def dev_upload_test_file(
-    file: UploadFile = File(...),
-    x_dev_token: Optional[str] = Header(None)
-):
-    """테스트 파일 업로드"""
-    if not verify_dev_token(x_dev_token):
-        raise HTTPException(401, "Unauthorized")
-    
-    staging_dir = Path(LOCAL_STAGING_PATH)
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    
-    file_id = os.path.basename(file.filename or "upload.bin")
-    file_path = staging_dir / file_id
-    
-    content = await file.read()
-    
-    with open(file_path, 'wb') as f:
-        f.write(content)
-    
-    return {
-        "message": "Test file uploaded",
-        "file_id": file_id,
-        "file_path": str(file_path),
-        "size": len(content)
+        "status": "ok", 
+        "service": "dev-router (simple chunker, no DB)",
+        "mode": "development"
     }
