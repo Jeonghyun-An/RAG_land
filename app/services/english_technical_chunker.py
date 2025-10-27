@@ -1,15 +1,15 @@
-# app/services/english_technical_chunker.py (성능 최적화 버전)
+# app/services/english_technical_chunker.py (교정교열용 - 깔끔한 문단 분할)
 """
-영어 기술 문서 특화 청킹 모듈 - 성능 최적화
-- 토큰 카운팅 캐싱 ⭐
-- 불필요한 인코딩 제거
-- 빠른 문자열 추정 우선 사용
+영어 기술 문서 특화 청킹 모듈 - 교정교열용
+- 오버랩 없음 (중복 제거)
+- 문단 단위로 깔끔하게 분할
+- 섹션 구조 보존
+- 성능 최적화
 """
 from __future__ import annotations
 import re
 from typing import List, Tuple, Dict, Optional, Callable
 from dataclasses import dataclass
-from functools import lru_cache
 
 
 @dataclass
@@ -23,16 +23,16 @@ class SectionInfo:
 
 
 class EnglishTechnicalChunker:
-    """영어 기술 문서 전용 청킹 클래스 - 성능 최적화"""
+    """영어 기술 문서 전용 청킹 - 교정교열 최적화"""
     
-    def __init__(self, encoder_fn: Callable, target_tokens: int = 800, overlap_tokens: int = 100):
+    def __init__(self, encoder_fn: Callable, target_tokens: int = 800, overlap_tokens: int = 0):
         self.encoder = encoder_fn
         self.target_tokens = target_tokens
-        self.overlap_tokens = overlap_tokens
+        self.overlap_tokens = 0  # ⭐ 교정교열용이므로 오버랩 없음
         self.min_chunk_tokens = 100
         self.max_chunk_tokens = target_tokens * 3
         
-        # ⭐ 토큰 카운트 캐시
+        # 토큰 카운트 캐시
         self._token_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
@@ -64,7 +64,7 @@ class EnglishTechnicalChunker:
         pages_std: List[Tuple[int, str]], 
         layout_blocks: Optional[Dict[int, List[Dict]]] = None
     ) -> List[Tuple[str, Dict]]:
-        """페이지별 영어 기술 문서 청킹"""
+        """페이지별 영어 기술 문서 청킹 - 교정교열용"""
         if not pages_std:
             return []
         
@@ -87,7 +87,7 @@ class EnglishTechnicalChunker:
             # 섹션 없으면 문단 기반
             return self._paragraph_based_chunking(pages_std, layout_blocks)
         
-        # 각 섹션 청킹
+        # 각 섹션 청킹 (오버랩 없이)
         for section in sections:
             section_chunks = self._chunk_section(
                 section, 
@@ -96,10 +96,11 @@ class EnglishTechnicalChunker:
             )
             all_chunks.extend(section_chunks)
         
-        # 디버그 정보 출력
+        # 디버그 정보
         if self._cache_hits + self._cache_misses > 0:
             hit_rate = self._cache_hits / (self._cache_hits + self._cache_misses) * 100
-            print(f"[CHUNKER] Token cache hit rate: {hit_rate:.1f}% ({self._cache_hits}/{self._cache_hits + self._cache_misses})")
+            print(f"[CHUNKER] Token cache hit rate: {hit_rate:.1f}%")
+        print(f"[CHUNKER] Total chunks: {len(all_chunks)} (no overlap)")
         
         return self._finalize_chunks(all_chunks)
     
@@ -146,17 +147,15 @@ class EnglishTechnicalChunker:
         page_boundaries: List[Tuple[int, int, int]],
         layout_blocks: Optional[Dict[int, List[Dict]]]
     ) -> List[Tuple[str, Dict]]:
-        """섹션 청킹"""
+        """섹션 청킹 - 깔끔하게 분할"""
         chunks = []
         
         section_header = f"{section.number} {section.title}"
         
-        # ⭐ 빠른 길이 추정 먼저 (정확한 토큰 카운트 전에)
+        # 빠른 길이 추정
         estimated_tokens = self._estimate_tokens_fast(section.content)
         
-        # 추정치로 큰 섹션인지 빠르게 판단
         if estimated_tokens <= self.max_chunk_tokens:
-            # 작으면 정확한 카운트
             actual_tokens = self._count_tokens(section.content)
             
             if actual_tokens <= self.max_chunk_tokens:
@@ -205,7 +204,6 @@ class EnglishTechnicalChunker:
         """하위 섹션 찾기"""
         subsections = []
         lines = text.split('\n')
-        parent_level = parent_num.count('.') + 1
         
         i = 0
         while i < len(lines):
@@ -253,7 +251,6 @@ class EnglishTechnicalChunker:
         layout_blocks: Optional[Dict[int, List[Dict]]]
     ) -> List[Tuple[str, Dict]]:
         """하위 섹션 청킹"""
-        # ⭐ 빠른 추정 먼저
         estimated_tokens = self._estimate_tokens_fast(subsection.content)
         
         if estimated_tokens <= self.max_chunk_tokens:
@@ -293,7 +290,7 @@ class EnglishTechnicalChunker:
         layout_blocks: Optional[Dict[int, List[Dict]]],
         base_start: int = 0
     ) -> List[Tuple[str, Dict]]:
-        """섹션을 문단으로 청킹"""
+        """섹션을 문단으로 청킹 - 깔끔하게"""
         chunks = []
         
         paragraphs = self._split_into_semantic_paragraphs(section.content)
@@ -303,10 +300,10 @@ class EnglishTechnicalChunker:
         chunk_start_line = 0
         
         for para in paragraphs:
-            # ⭐ 빠른 추정
             para_tokens = self._estimate_tokens_fast(para)
             
             if para_tokens > self.max_chunk_tokens:
+                # 현재 청크 저장
                 if current_chunk:
                     pages = self._get_pages_for_text(
                         current_chunk,
@@ -314,7 +311,6 @@ class EnglishTechnicalChunker:
                         page_boundaries
                     )
                     
-                    # 정확한 카운트는 최종 청크 생성 시만
                     actual_tokens = self._count_tokens(current_chunk)
                     
                     metadata = {
@@ -334,6 +330,7 @@ class EnglishTechnicalChunker:
                 chunks.extend(sent_chunks)
                 
             elif current_tokens + para_tokens <= self.target_tokens:
+                # 현재 청크에 추가
                 if current_chunk:
                     current_chunk += "\n\n" + para
                 else:
@@ -342,6 +339,7 @@ class EnglishTechnicalChunker:
                 current_tokens += para_tokens
                 
             else:
+                # 현재 청크 완료하고 새 청크 시작
                 if current_chunk:
                     pages = self._get_pages_for_text(
                         current_chunk,
@@ -361,10 +359,12 @@ class EnglishTechnicalChunker:
                     }
                     chunks.append((current_chunk, metadata))
                 
+                # 새 청크 시작
                 current_chunk = para
                 current_tokens = para_tokens
                 chunk_start_line = section.content.find(para)
         
+        # 마지막 청크
         if current_chunk:
             pages = self._get_pages_for_text(
                 current_chunk,
@@ -397,24 +397,25 @@ class EnglishTechnicalChunker:
         for line in lines:
             stripped = line.strip()
             
+            # 빈 줄 처리
             if not stripped:
-                if current_para:
-                    if in_bullet_group:
-                        current_para.append(line)
-                    else:
-                        paragraphs.append('\n'.join(current_para))
-                        current_para = []
+                if current_para and not in_bullet_group:
+                    paragraphs.append('\n'.join(current_para))
+                    current_para = []
                 continue
             
+            # 불릿 포인트 확인
             is_bullet = any(p.match(line) for p in self.bullet_patterns)
             
             if is_bullet:
                 in_bullet_group = True
                 current_para.append(line)
             elif in_bullet_group:
+                # 들여쓰기 있으면 계속 같은 그룹
                 if line.startswith('  ') or line.startswith('\t'):
                     current_para.append(line)
                 else:
+                    # 불릿 그룹 종료
                     if current_para:
                         paragraphs.append('\n'.join(current_para))
                         current_para = []
@@ -423,6 +424,7 @@ class EnglishTechnicalChunker:
             else:
                 current_para.append(line)
         
+        # 마지막 문단
         if current_para:
             paragraphs.append('\n'.join(current_para))
         
@@ -445,7 +447,6 @@ class EnglishTechnicalChunker:
             if not sent:
                 continue
             
-            # ⭐ 빠른 추정
             sent_tokens = self._estimate_tokens_fast(sent)
             
             if current_tokens + sent_tokens <= self.target_tokens:
@@ -549,22 +550,18 @@ class EnglishTechnicalChunker:
         
         return sorted(set(pages)) if pages else [1]
     
-    # ⭐ 최적화: 빠른 토큰 추정 (정확한 카운트 전에 사용)
     def _estimate_tokens_fast(self, text: str) -> int:
-        """빠른 토큰 수 추정 (인코딩 없이)"""
+        """빠른 토큰 수 추정"""
         if not text:
             return 0
-        # 영어는 대략 단어당 1.3 토큰
         words = len(text.split())
         return int(words * 1.3)
     
-    # ⭐ 최적화: 토큰 카운트 캐싱
     def _count_tokens(self, text: str) -> int:
         """토큰 수 계산 (캐싱)"""
         if not text:
             return 0
         
-        # 캐시 확인 (텍스트 해시 사용)
         text_hash = hash(text)
         if text_hash in self._token_cache:
             self._cache_hits += 1
@@ -575,10 +572,8 @@ class EnglishTechnicalChunker:
         try:
             tokens = len(self.encoder(text))
         except:
-            # 폴백
             tokens = int(len(text.split()) * 1.3)
         
-        # 캐시 저장 (메모리 제한)
         if len(self._token_cache) < 10000:
             self._token_cache[text_hash] = tokens
         
@@ -592,6 +587,9 @@ class EnglishTechnicalChunker:
             if not text.strip():
                 continue
             
+            # 청크 텍스트 정리
+            text = self._clean_chunk_text(text)
+            
             meta["chunk_index"] = i
             meta.setdefault("type", "unknown")
             meta.setdefault("page", 1)
@@ -601,6 +599,19 @@ class EnglishTechnicalChunker:
             finalized.append((text, meta))
         
         return finalized
+    
+    def _clean_chunk_text(self, text: str) -> str:
+        """청크 텍스트 정리 - 교정교열용"""
+        # 과도한 공백 제거 (3줄 이상 → 2줄로)
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+        
+        # 연속된 공백/탭 → 단일 공백
+        text = re.sub(r'[ \t]+', ' ', text)
+        
+        # 줄 끝 공백 제거
+        text = re.sub(r' +$', '', text, flags=re.MULTILINE)
+        
+        return text.strip()
 
 
 # ========== 외부 인터페이스 ==========
@@ -609,10 +620,10 @@ def english_technical_chunk_pages(
     pages_std: List[Tuple[int, str]], 
     encoder_fn: Callable,
     target_tokens: int = 800,
-    overlap_tokens: int = 100,
+    overlap_tokens: int = 0,  # ⭐ 기본값 0
     layout_blocks: Optional[Dict[int, List[Dict]]] = None
 ) -> List[Tuple[str, Dict]]:
-    """영어 기술 문서 전용 청킹 - 성능 최적화"""
+    """영어 기술 문서 전용 청킹 - 교정교열 최적화 (오버랩 없음)"""
     if not pages_std:
         return []
     
