@@ -172,6 +172,8 @@ def meta_key(doc_id: str) -> str:
 def legacy_meta_key(doc_id: str) -> str:
     return f"uploaded/__meta__/{doc_id}.json"
 
+# app/api/llama_router.py 중 index_pdf_to_milvus 함수 (최종 수정)
+
 def index_pdf_to_milvus(
     job_id: str,
     file_path: str | None = None,
@@ -182,7 +184,6 @@ def index_pdf_to_milvus(
 ) -> None:
     """
     업로드된(또는 MinIO 상의) PDF를 파싱 → 청킹 → 임베딩 → Milvus upsert.
-    [수정] pdf_fusion 우선 사용으로 OCR+layout_blocks 통합
     """
     try:
         job_state.update(job_id, status="parsing", step="parse_pdf:start")
@@ -196,14 +197,14 @@ def index_pdf_to_milvus(
             print(f"[INDEX] skip: uploaded=False (already uploaded), job_id={job_id}")
             return
 
-        # ---------- 1) PDF → 텍스트/레이아웃 (pdf_fusion 우선 사용) ----------
+        # ---------- 1) PDF → 텍스트/레이아웃 ----------
         pages: list | None = None
         layout_map: dict[int, list[dict]] = {}
         pdf_bytes: bytes | None = None
 
         use_bytes_path = (NO_LOCAL or file_path is None) and bool(minio_object)
         
-        # [핵심 수정] pdf_fusion 모듈 우선 사용 (OCR + layout_blocks 통합)
+        # [핵심] pdf_fusion 모듈 우선 사용 (OCR + layout_blocks 통합)
         try:
             if use_bytes_path:
                 # MinIO → bytes
@@ -211,7 +212,7 @@ def index_pdf_to_milvus(
                 mstore = MinIOStore()
                 pdf_bytes = mstore.get_bytes(minio_object)
                 
-                # pdf_fusion으로 통합 추출 (OCR + layout_blocks)
+                # pdf_fusion으로 통합 추출
                 from app.services.pdf_fusion import extract_pdf_fused_from_bytes
                 print("[PARSE] Using pdf_fusion (bytes mode) with OCR+layout integration")
                 pages_tuples, layout_map = extract_pdf_fused_from_bytes(pdf_bytes)
@@ -219,7 +220,6 @@ def index_pdf_to_milvus(
                 
             else:
                 # 로컬 파일
-                # pdf_fusion으로 통합 추출 (OCR + layout_blocks)
                 from app.services.pdf_fusion import extract_pdf_fused
                 print("[PARSE] Using pdf_fusion (file mode) with OCR+layout integration")
                 pages_tuples, layout_map = extract_pdf_fused(file_path)
@@ -272,97 +272,94 @@ def index_pdf_to_milvus(
 
         chunks: list[tuple[str, dict]] | None = None
 
-        # 2-1) 법령 청커 (law_chunker) 최우선
-        ENABLE_LAW_CHUNKER = os.getenv("RAG_ENABLE_LAW_CHUNKER", "1") == "1"
+        # 2-1) 영어 기술 문서 청커 (english_technical_chunker) 최우선
+        ENABLE_EN_TECH_CHUNKER = os.getenv("RAG_ENABLE_EN_TECH_CHUNKER", "1") == "1"
         
-        if ENABLE_LAW_CHUNKER:
+        if ENABLE_EN_TECH_CHUNKER:
             try:
-                from app.services.law_chunker import law_chunk_pages
-                print("[CHUNK] Trying law chunker (nuclear/legal optimized)...")
+                from app.services.english_technical_chunker import english_technical_chunk_pages
+                print("[CHUNK] Trying English technical chunker (IAEA/standards optimized)...")
                 
-                chunks = law_chunk_pages(
-                    pages_std, enc, target_tokens, overlap_tokens,
-                    layout_blocks=layout_map,
-                    min_chunk_tokens=min_chunk_tokens
+                # 영어 문서는 더 큰 타겟 토큰 사용
+                en_target_tokens = int(os.getenv("RAG_EN_TARGET_TOKENS", "800"))
+                
+                chunks = english_technical_chunk_pages(
+                    pages_std, enc, en_target_tokens, overlap_tokens, layout_map
                 )
                 
                 if chunks and len(chunks) > 0:
-                    print(f"[CHUNK] Law chunker succeeded: {len(chunks)} chunks")
+                    print(f"[CHUNK] English technical chunker: {len(chunks)} chunks")
                 else:
-                    print("[CHUNK] Law chunker returned empty, trying next...")
+                    print("[CHUNK] English technical chunker returned empty, falling back")
                     chunks = None
-            except Exception as e_law:
-                import traceback
-                print(f"[CHUNK] law_chunker failed: {e_law}")
-                print(f"[CHUNK] law_chunker traceback:\n{traceback.format_exc()}")
-                chunks = None        
+            except Exception as e:
+                print(f"[CHUNK] English technical chunker error: {e}")
+                chunks = None
 
-        # 2-2) 레이아웃 인지 청커 (layout-aware)
-        if not chunks:
-            try:
-                from app.services.layout_chunker import layout_aware_chunks
-                print("[CHUNK] Trying layout-aware chunker...")
-                
-                chunks = layout_aware_chunks(
-                    pages_std, enc,
-                    target_tokens=target_tokens,
-                    overlap_tokens=overlap_tokens,
-                    layout_blocks=layout_map
-                )
-                
-                if chunks:
-                    print(f"[CHUNK] Layout chunker succeeded: {len(chunks)} chunks")
-                else:
-                    print("[CHUNK] Layout chunker returned empty")
+        # 2-2) 법령 청커 (law_chunker)
+        if chunks is None:
+            ENABLE_LAW_CHUNKER = os.getenv("RAG_ENABLE_LAW_CHUNKER", "1") == "1"
+            
+            if ENABLE_LAW_CHUNKER:
+                try:
+                    from app.services.law_chunker import law_chunk_pages
+                    print("[CHUNK] Trying law chunker (nuclear/legal optimized)...")
                     
-            except ImportError:
-                print("[CHUNK] layout_aware_chunks not available")
-            except Exception as e1:
-                print(f"[CHUNK] layout_aware_chunks failed: {e1}")
-
-        # 2-3) 스마트 청커 플러스
-        if not chunks:
-            try:
-                from app.services.chunker import smart_chunk_pages_plus
-                print("[CHUNK] Trying smart chunker plus...")
-                
-                chunks = smart_chunk_pages_plus(
-                    pages_std, enc,
-                    target_tokens=target_tokens,
-                    overlap_tokens=overlap_tokens,
-                    layout_blocks=layout_map
-                )
-                
-                if chunks:
-                    print(f"[CHUNK] Smart chunker plus succeeded: {len(chunks)} chunks")
-                else:
-                    print("[CHUNK] Smart chunker plus returned empty")
+                    chunks = law_chunk_pages(
+                        pages_std, enc, target_tokens, overlap_tokens,
+                        layout_blocks=layout_map, min_chunk_tokens=min_chunk_tokens
+                    )
                     
-            except Exception as e2:
-                print(f"[CHUNK] smart_chunk_pages_plus failed: {e2}")
+                    if chunks and len(chunks) > 0:
+                        print(f"[CHUNK] Law chunker: {len(chunks)} chunks")
+                    else:
+                        print("[CHUNK] Law chunker returned empty, falling back")
+                        chunks = None
+                except Exception as e:
+                    print(f"[CHUNK] Law chunker error: {e}")
+                    chunks = None
 
-        # 2-4) 기본 스마트 청커
-        if not chunks:
+        # 2-3) Smart chunker Plus (layout 활용)
+        if chunks is None:
+            ENABLE_LAYOUT_CHUNKER = os.getenv("RAG_ENABLE_LAYOUT_CHUNKER", "1") == "1"
+            
+            if ENABLE_LAYOUT_CHUNKER and layout_map:
+                try:
+                    from app.services.chunker import smart_chunk_pages_plus
+                    print("[CHUNK] Using layout-aware chunker (SmartChunkerPlus)...")
+                    
+                    chunks = smart_chunk_pages_plus(
+                        pages_std, enc, target_tokens, overlap_tokens, layout_map
+                    )
+                    
+                    if chunks and len(chunks) > 0:
+                        print(f"[CHUNK] Layout chunker: {len(chunks)} chunks")
+                    else:
+                        print("[CHUNK] Layout chunker returned empty, falling back")
+                        chunks = None
+                except Exception as e:
+                    print(f"[CHUNK] Layout chunker error: {e}")
+                    chunks = None
+
+        # 2-4) 기본 Smart chunker
+        if chunks is None:
             try:
                 from app.services.chunker import smart_chunk_pages
-                print("[CHUNK] Falling back to basic smart chunker...")
+                print("[CHUNK] Using basic smart chunker...")
                 
                 chunks = smart_chunk_pages(
-                    pages_std, enc,
-                    target_tokens=target_tokens,
-                    overlap_tokens=overlap_tokens,
-                    layout_blocks=layout_map,
+                    pages_std, enc, target_tokens, overlap_tokens, layout_map
                 )
                 
-                if chunks:
-                    print(f"[CHUNK] Basic smart chunker succeeded: {len(chunks)} chunks")
+                if chunks and len(chunks) > 0:
+                    print(f"[CHUNK] Basic chunker: {len(chunks)} chunks")
                 else:
-                    print("[CHUNK] All chunkers failed - will use fallback protection")
-                    
-            except Exception as e3:
-                print(f"[CHUNK] smart_chunk_pages failed: {e3}")
+                    raise RuntimeError("Basic chunker returned empty")
+            except Exception as e:
+                print(f"[CHUNK] Basic chunker error: {e}")
+                raise RuntimeError(f"모든 청킹 방법 실패: {e}")
 
-        # 2-5) 최후 보호막
+        # 2-5) 최후 보호막 (폴백)
         if not chunks or len(chunks) == 0:
             print("[CHUNK] All chunkers failed - using fallback protection")
             
@@ -443,9 +440,9 @@ def index_pdf_to_milvus(
             if any(k in reason for k in ["duplicate", "exists", "doc_id"]):
                 try:
                     if hasattr(store, "delete_by_doc_id"):
-                        deleted = store.delete_by_doc_id(real_doc_id)  # type: ignore
+                        deleted = store.delete_by_doc_id(real_doc_id)
                     else:
-                        deleted = store._delete_by_doc_id(real_doc_id)  # type: ignore
+                        deleted = store._delete_by_doc_id(real_doc_id)
                     print(f"[INDEX] retry-after-delete: deleted={deleted}, doc_id={real_doc_id}")
                     res = store.insert(doc_id, chunks, embed_fn=embed)
                     real_doc_id = res.get("doc_id", doc_id)
@@ -480,24 +477,24 @@ def index_pdf_to_milvus(
                 os.remove(file_path)
             except Exception:
                 pass
-        # TOTAL 청크 수 집계    
         total = len(chunks) if isinstance(chunks, list) else None
 
         if total is None:
             try:
-                total = milvus_store.count_by_doc(doc_id) 
+                total = store.count_by_doc(real_doc_id)
             except Exception:
                 total = None
     
         # 메타 갱신
         try:
+            from app.services.minio_store import MinIOStore
             mstore = MinIOStore()
             meta = {}
             try:
-                if mstore.exists(meta_key(doc_id)):
-                    meta = mstore.get_json(meta_key(doc_id))
-                elif mstore.exists(legacy_meta_key(doc_id)):
-                    meta = mstore.get_json(legacy_meta_key(doc_id))
+                if mstore.exists(meta_key(real_doc_id)):
+                    meta = mstore.get_json(meta_key(real_doc_id))
+                elif mstore.exists(legacy_meta_key(real_doc_id)):
+                    meta = mstore.get_json(legacy_meta_key(real_doc_id))
             except Exception:
                 meta = {}
 
@@ -507,7 +504,7 @@ def index_pdf_to_milvus(
             meta["indexed"] = True
             meta["last_indexed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            mstore.put_json(meta_key(doc_id), meta)
+            mstore.put_json(meta_key(real_doc_id), meta)
         except Exception as e:
             print(f"[INDEXER] warn: failed to update meta chunk_count: {e}")
     
@@ -525,6 +522,14 @@ def index_pdf_to_milvus(
     except Exception as e:
         job_state.fail(job_id, str(e))
         raise
+
+
+# ============================================
+# 환경 변수 설정 (.env)
+# ============================================
+# RAG_ENABLE_EN_TECH_CHUNKER=1
+# RAG_EN_TARGET_TOKENS=800
+# RAG_OVERLAP_TOKENS=0  # 교정교열용이므로 0
 def _content_disposition(disposition: str, filename: str) -> str:
     """
     latin-1 제한을 피하기 위해:
