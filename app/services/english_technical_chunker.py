@@ -10,6 +10,7 @@ English technical papers chunker (v2)
 from __future__ import annotations
 import re
 from typing import List, Tuple, Dict, Optional, Callable
+import os, re
 
 # -------------------- 헤더/불릿/각주 패턴 --------------------
 EN_HEADER_RE = re.compile(
@@ -28,6 +29,45 @@ EN_BULLET_RE = re.compile(
 FOOTRULE_RE = re.compile(r'^[ _]{5,}$')           # 하단 긴 밑줄
 FOOTNOTE_LINE_RE = re.compile(r'^\s*\d+\s+.+')     # "1 some note..."
 PAGENO_RE = re.compile(r'^\s*\d+\s*$')             # 페이지 번호 단독 라인
+
+def _take_first_paragraph(text: str) -> tuple[str, str]:
+    """text에서 첫 번째 문단만 분리해 (first, rest)로 반환."""
+    m = re.search(r'\n\s*\n', text)
+    if not m:
+        return text.strip(), ""
+    i = m.start()
+    first = text[:i].strip()
+    rest = text[m.end():].lstrip()
+    return first, rest
+
+
+MILVUS_VARCHAR_MAX = int(os.getenv("MILVUS_VARCHAR_MAX", "8192"))
+SAFE_TEXT_LIMIT = MILVUS_VARCHAR_MAX - 200
+
+def _split_by_limit(text: str, limit: int = SAFE_TEXT_LIMIT) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    parts, buf = [], ""
+    sents = re.split(r'(?<=[.!?])\s+(?=[A-Z(])', text)
+    for s in sents:
+        s = s.strip()
+        if not s:
+            continue
+        if len(buf) + 1 + len(s) <= limit:
+            buf = (buf + " " + s).strip()
+        else:
+            if buf:
+                parts.append(buf)
+            if len(s) > limit:
+                for i in range(0, len(s), limit):
+                    parts.append(s[i:i+limit])
+                buf = ""
+            else:
+                buf = s
+    if buf:
+        parts.append(buf)
+    return parts
+
 
 # -------------------- 본 클래스 --------------------
 class EnglishTechnicalChunker:
@@ -200,83 +240,93 @@ class EnglishTechnicalChunker:
             return chunks
     
         merged: List[Tuple[str, Dict]] = []
-        current_section: Optional[str] = None
     
         def first_header(text: str) -> Optional[str]:
-            first = text.split("\n", 1)[0].strip()
-            return first if EN_HEADER_RE.match(first) else None
+            head = text.split("\n", 1)[0].strip()
+            return head if EN_HEADER_RE.match(head) else None
     
         def ends_mid_sentence(s: str) -> bool:
             s = s.rstrip()
             if not s:
                 return False
-            # 문장 종결부호/따옴표/괄호로 끝나지 않으면 미완성 가능성↑
             return s[-1] not in {".", "?", "!", "”", "’", '"', "'", ")", "]", "}"}
     
         def looks_like_continuation(s: str) -> bool:
-            # 소문자/숫자/괄호로 시작하거나, 접속사·부사로 시작하면 이어쓰기 가능성↑
-            head = s.lstrip()[:12]
+            head = s.lstrip()[:20]
             return bool(re.match(r'^[a-z0-9(]', head)) or re.match(
                 r'^\s*(?:and|or|but|so|also|as|well|thus|therefore|hence|however|while|whereas|in|under|with|for)\b',
                 s, flags=re.I
             )
     
         for text, meta in chunks:
-            header = first_header(text)
+            cur_header = first_header(text)
     
-            if header:
-                # 새 섹션 시작
-                current_section = header
-                # 메타에 섹션 저장
-                if meta.get("section") != header:
-                    meta = dict(meta, section=header)
-    
-                # 단순 push 또는 직전과 같은 섹션이면 이어붙일지 검사
-                if not merged:
-                    merged.append((text, meta))
-                    continue
-                
-                prev_text, prev_meta = merged[-1]
-                prev_header = prev_meta.get("section") or first_header(prev_text)
-                if prev_header and prev_header == header:
-                    # 같은 헤더가 연속으로 등장하면 이어붙임
-                    new_text = prev_text + "\n\n" + text
-                    new_meta = dict(prev_meta)
-                    new_meta["pages"] = sorted(set(prev_meta.get("pages", []) + meta.get("pages", [])))
-                    new_meta["token_count"] = self._estimate_tokens(new_text)
-                    new_meta["section"] = header
-                    merged[-1] = (new_text, new_meta)
-                else:
-                    merged.append((text, meta))
+            # 새 섹션 헤더면 섹션 기록하고 그대로 추가
+            if cur_header:
+                if meta.get("section") != cur_header:
+                    meta = dict(meta, section=cur_header)
+                merged.append((text, meta))
                 continue
             
-            # header 없는 청크(= 섹션 본문 지속)
+            # 본문 청크
             if not merged:
                 merged.append((text, meta))
                 continue
             
             prev_text, prev_meta = merged[-1]
-            prev_section = prev_meta.get("section") or first_header(prev_text)
+            prev_header = prev_meta.get("section") or first_header(prev_text)
     
-            if prev_section:
-                # ① 이전이 문장 중간에서 끝났거나 ② 현재가 이어지는 형태면 병합
-                if ends_mid_sentence(prev_text) or looks_like_continuation(text):
-                    new_text = prev_text + "\n\n" + text
+            # 이전이 문장 중간이거나 현재가 이어지는 형태면 → "첫 문단"을 앞 청크에 붙인다
+            if prev_header and (ends_mid_sentence(prev_text) or looks_like_continuation(text)):
+                first_para, rest = _take_first_paragraph(text)
+    
+                # 앞 청크에 first_para 이어붙이기 (줄바꿈 2칸으로 단락 유지)
+                joiner = "\n\n" if not prev_text.endswith((" ", "\n")) else ""
+                new_text = f"{prev_text}{joiner}{first_para}"
+    
+                # 길이 가드: 너무 길어지면 안전 분할 (SAFE_TEXT_LIMIT가 정의돼 있다고 가정)
+                try:
+                    limit = SAFE_TEXT_LIMIT  # env로 8k-여유 설정됨
+                except NameError:
+                    limit = 8000
+    
+                if len(new_text) <= limit:
                     new_meta = dict(prev_meta)
                     new_meta["pages"] = sorted(set(prev_meta.get("pages", []) + meta.get("pages", [])))
                     new_meta["token_count"] = self._estimate_tokens(new_text)
-                    new_meta["section"] = prev_section
+                    new_meta["section"] = prev_header
                     merged[-1] = (new_text, new_meta)
-                    continue
                 else:
-                    # 섹션은 유지하되 새 청크로 둠
-                    meta = dict(meta, section=prev_section)
+                    # 합친 결과가 너무 길면 안전하게 쪼갠다(붙이는 동작은 유지)
+                    parts = _split_by_limit(new_text, limit)
+                    # 앞 청크 교체
+                    rep_text = parts[0]
+                    rep_meta = dict(prev_meta)
+                    rep_meta["pages"] = sorted(set(prev_meta.get("pages", []) + meta.get("pages", [])))
+                    rep_meta["token_count"] = self._estimate_tokens(rep_text)
+                    rep_meta["section"] = prev_header
+                    merged[-1] = (rep_text, rep_meta)
+                    # 남은 조각들 추가
+                    for extra in parts[1:]:
+                        em = dict(rep_meta)
+                        em["token_count"] = self._estimate_tokens(extra)
+                        merged.append((extra, em))
     
+                # 남은 텍스트(rest)는 같은 섹션으로 새 청크로 유지
+                if rest:
+                    rest_meta = dict(meta)
+                    rest_meta["section"] = prev_header
+                    rest_meta["token_count"] = self._estimate_tokens(rest)
+                    merged.append((rest, rest_meta))
+                continue
+            
+            # 연속 아님 → 섹션 메타만 승계
+            if prev_header and not meta.get("section"):
+                meta = dict(meta, section=prev_header)
             merged.append((text, meta))
     
         return merged
-
-
+    
     # -------- 유틸 --------
     @staticmethod
     def _estimate_tokens(s: str) -> int:
@@ -318,19 +368,23 @@ class EnglishTechnicalChunker:
 
     def _finalize_chunks(self, chunks: List[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:
         finalized = []
-        for i, (text, meta) in enumerate(chunks):
+        idx = 0  
+        for _, (text, meta) in enumerate(chunks):
             if not text.strip():
                 continue
             clean = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
             clean = re.sub(r'[ \t]+', ' ', clean)
             clean = re.sub(r' +$', '', clean, flags=re.MULTILINE).strip()
-            m = dict(meta)
-            m["chunk_index"] = i
-            m.setdefault("type", "paragraph_group")
-            m.setdefault("page", meta.get("page", 1))
-            m.setdefault("pages", meta.get("pages", [m["page"]]))
-            m["token_count"] = self._estimate_tokens(clean)
-            finalized.append((clean, m))
+            pieces = _split_by_limit(clean, SAFE_TEXT_LIMIT)
+            for j, piece in enumerate(pieces):
+                m = dict(meta)
+                m["chunk_index"] = idx
+                idx += 1
+                if len(pieces) > 1:
+                    m["sub_index"] = j
+                    m["orig_chunk_chars"] = len(clean)
+                m["token_count"] = self._estimate_tokens(piece)
+                finalized.append((piece, m))
         return finalized
 
 # -------- 외부 함수 --------
