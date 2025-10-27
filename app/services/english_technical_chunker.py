@@ -276,8 +276,8 @@ class EnglishTechnicalChunker:
             prev_text, prev_meta = merged[-1]
             prev_header = prev_meta.get("section") or first_header(prev_text)
     
-            # 이전이 문장 중간이거나 현재가 이어지는 형태면 → "첫 문단"을 앞 청크에 붙인다
-            if prev_header and (ends_mid_sentence(prev_text) or looks_like_continuation(text)):
+            # 이전이 문장 중간이면 → "첫 문단"을 앞 청크에 붙인다
+            if prev_header and ends_mid_sentence(prev_text):
                 first_para, rest = _take_first_paragraph(text)
     
                 # 앞 청크에 first_para 이어붙이기 (줄바꿈 2칸으로 단락 유지)
