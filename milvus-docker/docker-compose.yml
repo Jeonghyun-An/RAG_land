@@ -50,11 +50,8 @@ services:
     container_name: minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      # 최신 이미지로 바꾸면:
-      # MINIO_ROOT_USER: minioadmin
-      # MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY}"
     volumes:
       - minio_data:/data
     networks: [ragnet]
@@ -76,7 +73,6 @@ services:
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
       - MINIO_USE_SSL=false
-      # 버킷 이름(없으면 Milvus가 만들어줍니다)
       - MINIO_BUCKET_NAME=milvus-bucket
       # 일부 버전에서는 이 키를 씁니다(겸사겸사 넣어도 무해)
       - MINIO_BUCKET=milvus-bucket
@@ -149,8 +145,8 @@ services:
       IS_DOCKER: "true"
       # MinIO/Milvus 접속 명시 (컨테이너 네트워크 이름으로)
       MINIO_ENDPOINT: "minio:9000"
-      MINIO_ACCESS_KEY: "minioadmin"
-      MINIO_SECRET_KEY: "minioadmin"
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY}"
       MINIO_SECURE: "false" # true면 https, 내부라서 일단 false
       # 프론트가 접근할 외부 게이트웨이
       MINIO_PRESIGN_SCHEME: "https"
