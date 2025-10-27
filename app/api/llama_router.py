@@ -172,8 +172,6 @@ def meta_key(doc_id: str) -> str:
 def legacy_meta_key(doc_id: str) -> str:
     return f"uploaded/__meta__/{doc_id}.json"
 
-# app/api/llama_router.py 중 index_pdf_to_milvus 함수 (최종 수정)
-
 def index_pdf_to_milvus(
     job_id: str,
     file_path: str | None = None,
@@ -522,14 +520,7 @@ def index_pdf_to_milvus(
     except Exception as e:
         job_state.fail(job_id, str(e))
         raise
-
-
-# ============================================
-# 환경 변수 설정 (.env)
-# ============================================
-# RAG_ENABLE_EN_TECH_CHUNKER=1
-# RAG_EN_TARGET_TOKENS=800
-# RAG_OVERLAP_TOKENS=0  # 교정교열용이므로 0
+    
 def _content_disposition(disposition: str, filename: str) -> str:
     """
     latin-1 제한을 피하기 위해:
