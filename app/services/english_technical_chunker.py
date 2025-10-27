@@ -9,6 +9,22 @@ from __future__ import annotations
 import re
 from typing import List, Tuple, Dict, Optional, Callable
 
+EN_HEADER_RE = re.compile(
+    r"""^(
+        (?:\d+\.){1,4}\s+\S+                       # 1. , 1.1. , 2.1.3. Title
+      | [A-Z]\.\s+\S+                              # A. Title
+      | (?:APPENDIX|Appendix)\s+[A-Z0-9]+(?:\s*[:\-]\s*\S+)?  # Appendix A: ...
+      | (?:[1-9]\d*|I|II|III|IV|V|VI|VII|VIII|IX|X)\.\s+[A-Z][A-Z ,\-()’']+$  # ALL CAPS header
+    )$""", re.VERBOSE
+)
+
+EN_BULLET_RE = re.compile(
+    r'^\s*(?:[\-\u2013\u2014\*•]|(?:\(\d+|\([a-zA-Zivx]+\)|\d+\)|\d+\.\d*\)))\s+'
+)
+
+FOOTRULE_RE = re.compile(r'^[ _]{5,}$')  # 페이지 하단 긴 밑줄
+FOOTNOTE_LINE_RE = re.compile(r'^\s*\d+\s+.+')  # "1 some note..."
+
 
 class EnglishTechnicalChunker:
     """영어 기술 문서 전용 청킹 - 초고속"""
@@ -44,60 +60,114 @@ class EnglishTechnicalChunker:
         
         # ⭐ 간단한 문단 기반 청킹만 수행
         return self._fast_paragraph_chunking(pages_std)
-    
-    def _fast_paragraph_chunking(
-        self,
-        pages_std: List[Tuple[int, str]]
-    ) -> List[Tuple[str, Dict]]:
-        """초고속 문단 기반 청킹"""
-        chunks = []
-        
-        for page_no, text in pages_std:
-            if not text or not text.strip():
+    def _fast_paragraph_chunking(self, pages_std):
+        out = []
+        for page_no, raw in pages_std:
+            if not raw or not raw.strip():
                 continue
-            
-            # 문단 분리 (빈 줄 기준)
-            paragraphs = self._split_paragraphs(text)
-            
-            current_chunk = ""
-            current_tokens = 0
-            
-            for para in paragraphs:
-                # ⭐ 빠른 토큰 추정 (인코딩 안 함!)
-                para_tokens = len(para.split()) * 1.3
-                
-                if para_tokens > self.max_chunk_tokens:
-                    # 현재 청크 저장
-                    if current_chunk:
-                        chunks.append(self._create_chunk(current_chunk, page_no))
-                        current_chunk = ""
-                        current_tokens = 0
-                    
-                    # 큰 문단은 문장으로 분할
-                    sent_chunks = self._split_large_paragraph(para, page_no)
-                    chunks.extend(sent_chunks)
-                    
-                elif current_tokens + para_tokens <= self.target_tokens:
-                    # 현재 청크에 추가
-                    if current_chunk:
-                        current_chunk += "\n\n" + para
+            text = self._normalize_page_text(raw)
+            for block in self._split_blocks_by_headers(text):
+                paras = self._paragraphs_keep_bullets(block)
+
+                cur, cur_tokens = [], 0
+                for para in paras:
+                    t = int(len(para.split()) * 1.3)
+                    if t > self.max_chunk_tokens:
+                        # 너무 큰 문단은 문장 단위로 쪼개서 넣기
+                        out.extend(self._split_large_paragraph(para, page_no))
+                        continue
+
+                    if not cur:
+                        cur, cur_tokens = [para], t
+                        continue
+
+                    if cur_tokens + t <= self.target_tokens or EN_BULLET_RE.match(para):
+                        # 불릿은 같은 청크에 붙인다
+                        cur.append(para); cur_tokens += t
                     else:
-                        current_chunk = para
-                    current_tokens += para_tokens
-                    
-                else:
-                    # 현재 청크 완료
-                    if current_chunk:
-                        chunks.append(self._create_chunk(current_chunk, page_no))
-                    
-                    current_chunk = para
-                    current_tokens = para_tokens
-            
-            # 마지막 청크
-            if current_chunk:
-                chunks.append(self._create_chunk(current_chunk, page_no))
-        
-        return self._finalize_chunks(chunks)
+                        out.append(self._create_chunk("\n\n".join(cur), page_no))
+                        cur, cur_tokens = [para], t
+
+                if cur:
+                    out.append(self._create_chunk("\n\n".join(cur), page_no))
+
+        return self._finalize_chunks(out)
+
+    def _normalize_page_text(self, text: str) -> str:
+        # 하단 각주 블록 제거 (밑줄 이후 짧은 각주들)
+        lines = text.splitlines()
+        cleaned = []
+        footnote_mode = False
+        for i, ln in enumerate(lines):
+            if FOOTRULE_RE.match(ln.strip()):
+                footnote_mode = True
+                continue
+            if footnote_mode:
+                # 각주: 보통 숫자 + 짧은 문장, 페이지 끝까지 skip
+                if FOOTNOTE_LINE_RE.match(ln) or not ln.strip():
+                    continue
+            cleaned.append(ln)
+        text = "\n".join(cleaned).strip()
+
+        # 단어 중간 하이픈 줄바꿈 수선 (Non-\nProliferation -> Non-Proliferation)
+        text = re.sub(r'(\w)-\n(\w)', r'\1-\2', text)         # 진짜 하이픈 단어
+        text = re.sub(r'(\w)\n(\w)', r'\1 \2', text)          # 단순 줄바꿈은 공백
+
+        # 단락 내 불필요 공백 정리
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r' +$', '', text, flags=re.MULTILINE)
+        return text
+    
+    def _split_blocks_by_headers(self, text: str) -> list[str]:
+        """헤더를 만나면 새 블록 시작 (1., 1.1., ALL-CAPS 등)"""
+        lines = [l for l in text.split("\n") if l.strip()]
+        blocks, cur = [], []
+        for ln in lines:
+            if EN_HEADER_RE.match(ln.strip()):
+                if cur:
+                    blocks.append("\n".join(cur).strip()); cur = []
+            cur.append(ln)
+        if cur:
+            blocks.append("\n".join(cur).strip())
+        return blocks or [text]
+
+    def _paragraphs_keep_bullets(self, block: str) -> list[str]:
+        """빈 줄이 없어도 '문장 경계'와 불릿을 이용해 문단 복구"""
+        raw_lines = [l.strip() for l in block.split("\n") if l.strip()]
+
+        # 1) 불릿 덩어리 유지
+        paras, buf = [], []
+        def flush():
+            nonlocal buf, paras
+            if buf:
+                paras.append(" ".join(buf).strip()); buf = []
+
+        for ln in raw_lines:
+            if EN_BULLET_RE.match(ln):
+                # 앞 문단과 붙여 동일 청크로 유지 (헤더/문단 다음에 연속 불릿 가능)
+                if buf and not EN_BULLET_RE.match(buf[-1]):
+                    buf.append("\n\n")  # 문단 경계 표시 (나중 join 시 두 줄 공백으로 바뀜)
+                buf.append(ln)
+                continue
+            # 문장 경계 휴리스틱: 끝이 .?! or .)” 등이고, 다음이 대문자로 시작하면 단락 후보
+            if buf:
+                prev = buf[-1]
+                if re.search(r'[.!?]["\')]*$', prev):
+                    # 새 문단 시작
+                    flush()
+            buf.append(ln)
+        flush()
+
+        # 2) 헤더 첫 줄은 다음 문단과 합쳐 섹션 단위 유지
+        if paras:
+            first_line = raw_lines[0]
+            if EN_HEADER_RE.match(first_line):
+                # 첫 문단이 헤더만 있으면 다음 것과 합쳐줌
+                if len(paras) >= 2 and len(paras[0].split()) <= 12:
+                    paras[1] = first_line + "\n\n" + paras[1]
+                    paras = paras[1:]
+        return [p.replace("\n\n", "\n\n") for p in paras]
+
     
     def _split_paragraphs(self, text: str) -> List[str]:
         """문단 분리 - 빈 줄 기준"""
