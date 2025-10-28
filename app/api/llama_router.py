@@ -1191,17 +1191,47 @@ def purge_files(
     return {"status": "ok", "prefix": prefix, "matched": matched, "deleted": deleted, "failed": failed, "errors": errors}
 
 # ========= Debug / Inspection =========
-@router.get("/debug/milvus/info")
-def debug_milvus_info():
-    """ Milvus 상태 정보 조회"""
-    try:
-        model = get_embedding_model()
-        store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
-        return store.stats()
-    except Exception as e:
-        raise HTTPException(500, f"Milvus info 조회 실패: {e}")
+from pymilvus import connections, Collection, utility
 
-@router.get("/debug/milvus/peek")
+@router.get("/milvus/info",tags=["milvus"])
+def milvus_info():
+    try:
+        # --------------------------
+        # 1️⃣ 환경변수에서 컬렉션 이름 가져오기
+        # --------------------------
+        col_name = os.getenv("MILVUS_COLLECTION", "rag_chunks_v2")
+
+        # --------------------------
+        # 2️⃣ Milvus 연결
+        # --------------------------
+        connections.connect("default", host=os.getenv("MILVUS_HOST", "milvus"), port=os.getenv("MILVUS_PORT", "19530"))
+
+        # --------------------------
+        # 3️⃣ 컬렉션 존재 여부 확인
+        # --------------------------
+        if not utility.has_collection(col_name):
+            return {"collection": col_name, "exists": False, "num_entities": 0, "indexes": [], "schema_fields": []}
+
+        col = Collection(col_name)
+        col.load()
+
+        # --------------------------
+        # 4️⃣ 인덱스 정보, 필드명, 엔티티 수 반환
+        # --------------------------
+        info = {
+            "collection": col_name,
+            "exists": True,
+            "num_entities": col.num_entities,
+            "indexes": col.indexes,
+            "schema_fields": [f.name for f in col.schema.fields],
+        }
+        return info
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Milvus info 조회 실패: {e}")
+
+
+@router.get("/debug/milvus/peek",tags=["milvus"])
 def debug_milvus_peek(limit: int = 100, full: bool = True, max_chars:int|None = None):
     """ Milvus 컬렉션의 일부 데이터 미리보기 """
     try:
@@ -1215,7 +1245,7 @@ def debug_milvus_peek(limit: int = 100, full: bool = True, max_chars:int|None = 
     except Exception as e:
         raise HTTPException(500, f"Milvus peek 실패: {e}")
 
-@router.get("/debug/milvus/by-doc")
+@router.get("/debug/milvus/by-doc",tags=["milvus"])
 def debug_milvus_by_doc(
     doc_id: str,
     limit: int = 100,
@@ -1256,7 +1286,7 @@ def debug_milvus_by_doc(
         # 여기서는 로컬 변수 참조 금지!
         raise HTTPException(500, f"Milvus by-doc 실패: {e}")
 
-@router.get("/debug/search")
+@router.get("/debug/search",tags=["milvus"])
 def debug_vector_search(q: str, k: int = 5):
     try:
         model = get_embedding_model()

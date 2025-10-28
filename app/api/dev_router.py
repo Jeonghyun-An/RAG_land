@@ -245,7 +245,7 @@ async def process_dev_convert_and_index(
         from app.services.milvus_store_v2 import MilvusStoreV2
         
         mvs = MilvusStoreV2()
-        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "nuclear_rag")
+        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "rag_chunks_v2")
         
         # 기존 문서 삭제 (개발 모드에서 재테스트 시)
         print(f"[DEV-CHUNK] Deleting existing doc (if any): {data_id}")

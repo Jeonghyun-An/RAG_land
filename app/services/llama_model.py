@@ -18,7 +18,7 @@ USE_VLLM = os.getenv("USE_VLLM", "1") == "1"
 SERVED_NAME_MAP: Dict[str, str] = json.loads(os.getenv("SERVED_NAME_MAP", "{}"))
 
 # 선택: 기본 모델 별칭(.env에서 바꿀 수 있음)
-DEFAULT_MODEL_ALIAS = os.getenv("DEFAULT_MODEL_ALIAS", "llama-3.2-1b")
+DEFAULT_MODEL_ALIAS = os.getenv("DEFAULT_MODEL_ALIAS", "llama-3.2-3b")
 
 LOADED_MODELS: Dict[str, Tuple[AutoModelForCausalLM, AutoTokenizer]] = {}
 

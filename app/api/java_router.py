@@ -217,7 +217,7 @@ async def process_convert_and_index_prod(
         from app.services.milvus_store_v2 import MilvusStoreV2
         
         mvs = MilvusStoreV2()
-        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "nuclear_rag")
+        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "rag_chunks_v2")
         
         # 기존 문서 삭제 (재인덱싱 시)
         print(f"[PROD-CHUNK] Deleting existing doc (if any): {data_id}")
@@ -410,7 +410,7 @@ async def process_manual_ocr_and_index(
         from app.services.milvus_store_v2 import MilvusStoreV2
         
         mvs = MilvusStoreV2()
-        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "nuclear_rag")
+        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "rag_chunks_v2")
         
         # 기존 문서 삭제 (재인덱싱 or 수정 작업)
         print(f"[MANUAL-OCR-CHUNK] Deleting existing doc: {data_id}")
@@ -504,7 +504,6 @@ async def process_manual_ocr_and_index(
             await send_webhook(callback_url, payload, SHARED_SECRET)
         
         raise
-
 
 # ==================== Routes ====================
 @router.post("/convert-and-index", response_model=ConvertAndIndexResponse)

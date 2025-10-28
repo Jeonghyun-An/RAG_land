@@ -164,7 +164,7 @@ services:
       MINIO_SECRET_KEY: "minioadmin"
       MILVUS_HOST: "milvus"
       MILVUS_PORT: "19530"
-      MILVUS_COLLECTION: "rag_chunks_m3_v2"
+      MILVUS_COLLECTION: "rag_chunks_v2"
       RAG_JOB_STATE_PERSIST: "minio"
       MILVUS_SECTION_MAX: "512"
       MILVUS_DOCID_MAX: "256"

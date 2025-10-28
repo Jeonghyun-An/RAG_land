@@ -155,7 +155,7 @@ services:
       # Milvus 접속 정보
       MILVUS_HOST: "milvus"
       MILVUS_PORT: "19530"
-      MILVUS_COLLECTION: "rag_chunks_m3_v2"
+      MILVUS_COLLECTION: "rag_chunks_v2"
       RAG_JOB_STATE_PERSIST: "minio"
       # Milvus 스키마/인덱스/검색 파라미터
       MILVUS_SECTION_MAX: "512" # 섹션 최대 문자 수
@@ -168,7 +168,7 @@ services:
       MILVUS_METRIC_TYPE: "IP" # IP=cosine, L2=L2, HAMMING=해밍, JACCARD=자카드
       MILVUS_HNSW_M: "16"
       MILVUS_HNSW_EFCON: "200"
-      MILVUS_EF_SEARCH: 384
+      MILVUS_EF_SEARCH: "384"
       MILVUS_EF_PER_K: "8"
       MILVUS_EF_MAX: "2048"
       # 검색/하이브리드/리랭크
