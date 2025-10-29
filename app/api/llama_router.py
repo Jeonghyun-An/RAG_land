@@ -570,6 +570,60 @@ def extract_keywords(q: str) -> list[str]:
             seen.add(tl); out.append(t)
     return out
 
+def _detect_lang(text: str) -> str:
+    """아주 단순한 한글 감지. 한글 포함되면 'ko', 아니면 'en'."""
+    if any('\uac00' <= ch <= '\ud7a3' for ch in (text or "")):
+        return "ko"
+    return "en"
+
+def _t(lang: str, ko: str, en: str) -> str:
+    return ko if lang == "ko" else en
+
+def _build_prompt(context: str, question: str, lang: str) -> str:
+    if lang == "ko":
+        return f"""다음 문서 내용을 바탕으로 질문에 답하세요.
+
+[중요 규칙]
+- 문서에 명확한 근거가 있는 경우에만 답변하세요
+- 추측이나 일반적인 지식으로 답하지 마세요
+- 답변은 2-3문장으로 간결하게 작성하세요
+- 같은 내용을 반복하지 마세요
+- 문서에서 찾을 수 없으면 "문서에서 해당 내용을 찾을 수 없습니다"라고 답하세요
+
+[참고 문서]
+{context}
+
+[질문]
+{question}
+
+[답변 형식]
+1. 정의: [문서에서 찾은 정의]
+2. 주요 내용: [구체적 절차나 규정]
+3. 관련 조항: [해당되는 경우]
+
+[답변](한국어로)"""
+    else:
+        return f"""Answer the question strictly based on the provided documents.
+
+[Rules]
+- Only answer if the documents provide clear evidence.
+- Do not guess or use outside knowledge.
+- Keep your answer concise (2–3 sentences).
+- Do not repeat the same points.
+- If the answer cannot be found, say: "I cannot find this in the documents."
+
+[Context]
+{context}
+
+[Question]
+{question}
+
+[Answer format]
+1. Definition: [definition found in the docs]
+2. Key points: [specific procedure or rule]
+3. Related clauses: [if applicable]
+
+[Answer] (in English)"""
 # ---------- Routes ----------
 @router.get("/test")
 def test():
@@ -719,6 +773,9 @@ def ask_question(req: AskReq):
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
 
+        # 언어 감지(ko/en)
+        lang = _detect_lang(req.question)
+
         # 1) 질문 전처리(쿼리 보강) + 초기 넉넉히 검색
         query_for_search = normalize_query(req.question)
         raw_topk = max(20, req.top_k * 5)
@@ -726,12 +783,14 @@ def ask_question(req: AskReq):
 
         if not cands:
             return AskResp(
-                answer="업로드된 문서에서 관련 내용을 찾을 수 없습니다. 문서가 올바르게 인덱싱되었는지 확인해주세요.",
+                answer=_t(lang,
+                          "업로드된 문서에서 관련 내용을 찾을 수 없습니다. 문서가 올바르게 인덱싱되었는지 확인해주세요.",
+                          "No relevant content was found in the uploaded documents. Please verify the documents were indexed correctly."),
                 used_chunks=0,
                 sources=[]
             )
 
-        # 2) 키워드 부스트
+        # 2) 키워드 부스트 (한국어 질문의 '제 n 조' 부스트만 유지)
         kws = extract_keywords(req.question)
         def _kw_boost_score(c: dict) -> int:
             txt = _strip_meta_line(c.get("chunk", "")).lower()
@@ -740,15 +799,16 @@ def ask_question(req: AskReq):
             c["kw_boost"] = _kw_boost_score(c)
 
         ARTICLE_BOOST = float(os.getenv("RAG_ARTICLE_BOOST", "2.5"))
-        m = re.search(r"제\s*(\d+)\s*조", req.question)
-        if m:
-            art = m.group(1)
-            patt = re.compile(rf"제\s*{art}\s*조")
-            for c in cands:
-                sec = c.get("section") or ""
-                txt = c.get("chunk") or ""
-                if patt.search(sec) or patt.search(txt):
-                    c["kw_boost"] = c.get("kw_boost", 0.0) + ARTICLE_BOOST
+        if lang == "ko":
+            m = re.search(r"제\s*(\d+)\s*조", req.question)
+            if m:
+                art = m.group(1)
+                patt = re.compile(rf"제\s*{art}\s*조")
+                for c in cands:
+                    sec = c.get("section") or ""
+                    txt = c.get("chunk") or ""
+                    if patt.search(sec) or patt.search(txt):
+                        c["kw_boost"] = c.get("kw_boost", 0.0) + ARTICLE_BOOST
 
         cands.sort(key=lambda x: (x.get("kw_boost", 0), x.get("score", 0.0)), reverse=True)
 
@@ -756,7 +816,9 @@ def ask_question(req: AskReq):
         topk = rerank(req.question, cands, top_k=req.top_k)
         if not topk:
             return AskResp(
-                answer="문서에서 신뢰할 수 있는 관련 내용을 찾지 못했습니다.",
+                answer=_t(lang,
+                          "문서에서 신뢰할 수 있는 관련 내용을 찾지 못했습니다.",
+                          "Could not find sufficiently reliable supporting content in the documents."),
                 used_chunks=0,
                 sources=[]
             )
@@ -765,7 +827,9 @@ def ask_question(req: AskReq):
         THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
         if "re_score" in topk[0] and topk[0]["re_score"] < THRESH:
             return AskResp(
-                answer="문서에서 해당 질문에 대한 확실한 답변을 찾기 어렵습니다.",
+                answer=_t(lang,
+                          "문서에서 해당 질문에 대한 확실한 답변을 찾기 어렵습니다.",
+                          "It is hard to find a definitive answer to this question in the documents."),
                 used_chunks=0,
                 sources=[]
             )
@@ -788,39 +852,28 @@ def ask_question(req: AskReq):
             })
         context = "\n\n".join(context_lines)
 
-        # 6) 프롬프트
-        prompt = f"""다음 문서 내용을 바탕으로 질문에 답하세요.
-
-[중요 규칙]
-- 문서에 명확한 근거가 있는 경우에만 답변하세요
-- 추측이나 일반적인 지식으로 답하지 마세요
-- 답변은 2-3문장으로 간결하게 작성하세요
-- 같은 내용을 반복하지 마세요
-- 문서에서 찾을 수 없으면 "문서에서 해당 내용을 찾을 수 없습니다"라고 답하세요
-
-[참고 문서]
-{context}
-
-[질문]
-{req.question}
-
-[답변 형식]
-1. 정의: [문서에서 찾은 정의]
-2. 주요 내용: [구체적 절차나 규정]
-3. 관련 조항: [해당되는 경우]
-
-[답변]"""
+        # 6) 프롬프트 (언어별)
+        prompt = _build_prompt(context=context, question=req.question, lang=lang)
 
         answer = generate_answer_unified(prompt, req.model_name)
         answer = _clean_repetitive_answer(answer)
+
         return AskResp(answer=answer, used_chunks=len(topk), sources=sources)
 
     except HTTPException:
         raise
     except RuntimeError as milvus_error:
-        raise HTTPException(503, f"Milvus 연결 대기/검색 실패: {milvus_error}")
+        # 에러 메시지도 언어 맞춤
+        lang = _detect_lang(getattr(req, "question", "") or "")
+        raise HTTPException(503, _t(lang,
+                                    f"Milvus 연결 대기/검색 실패: {milvus_error}",
+                                    f"Milvus connection/search failed: {milvus_error}"))
     except Exception as e:
-        raise HTTPException(500, f"질의 처리 중 오류: {e}")
+        lang = _detect_lang(getattr(req, "question", "") or "")
+        raise HTTPException(500, _t(lang,
+                                    f"질의 처리 중 오류: {e}",
+                                    f"Error while processing the query: {e}"))
+
 
 
 def _clean_repetitive_answer(answer: str) -> str:
@@ -1196,28 +1249,14 @@ from pymilvus import connections, Collection, utility
 @router.get("/milvus/info",tags=["milvus"])
 def milvus_info():
     try:
-        # --------------------------
-        # 1️⃣ 환경변수에서 컬렉션 이름 가져오기
-        # --------------------------
         col_name = os.getenv("MILVUS_COLLECTION", "rag_chunks_v2")
-
-        # --------------------------
-        # 2️⃣ Milvus 연결
-        # --------------------------
         connections.connect("default", host=os.getenv("MILVUS_HOST", "milvus"), port=os.getenv("MILVUS_PORT", "19530"))
 
-        # --------------------------
-        # 3️⃣ 컬렉션 존재 여부 확인
-        # --------------------------
         if not utility.has_collection(col_name):
             return {"collection": col_name, "exists": False, "num_entities": 0, "indexes": [], "schema_fields": []}
 
         col = Collection(col_name)
-        col.load()
-
-        # --------------------------
-        # 4️⃣ 인덱스 정보, 필드명, 엔티티 수 반환
-        # --------------------------
+        col.load()  # ✅ 강제 로드 (peek에서 release 되어도 다시 로드)
         info = {
             "collection": col_name,
             "exists": True,
@@ -1226,7 +1265,6 @@ def milvus_info():
             "schema_fields": [f.name for f in col.schema.fields],
         }
         return info
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Milvus info 조회 실패: {e}")
 

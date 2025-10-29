@@ -79,7 +79,7 @@ class MilvusStoreV2:
         if not connections.has_connection("default"):
             connections.connect(alias="default", host=host, port=port)
 
-        force_reset = os.getenv("RAG_RESET_COLLECTION", "1") == "1"
+        force_reset = os.getenv("RAG_RESET_COLLECTION", "0") == "1"
 
         # 컬렉션 존재 여부 확인
         if utility.has_collection(self.collection_name):
