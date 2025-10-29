@@ -1,6 +1,7 @@
 # app/api/llama_router.py
 from __future__ import annotations
 
+import functools
 import mimetypes
 import hashlib, tempfile
 import os, re
@@ -14,8 +15,8 @@ from pydantic import BaseModel
 import asyncio, json
 import numpy as np
 from sse_starlette.sse import EventSourceResponse  # ✅ 요구사항: sse-starlette
-from app.services import job_state, milvus_store
-from datetime import datetime, timedelta, timezone
+
+from datetime import datetime, time, timedelta, timezone
 
 from app.services.file_parser import (
     parse_pdf,                    # (local path) -> [(page_no, text)]
@@ -23,12 +24,14 @@ from app.services.file_parser import (
     parse_any_bytes,              # (filename, bytes) -> {"kind":"pdf", "pages":[...], "blocks":[...]}
     parse_pdf_blocks_from_bytes,  # (bytes) -> [(page_no, [ {text,bbox}, ... ])]
 )
+from app.services import job_state, milvus_store
 from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
 from app.services.pdf_converter import convert_stream_to_pdf_bytes, convert_to_pdf,convert_bytes_to_pdf_bytes, ConvertError
 from app.services.milvus_store_v2 import MilvusStoreV2
 from app.services.embedding_model import get_embedding_model, embed
 from app.services.reranker import rerank
+from app.services.llm_client import get_openai_client
 
 router = APIRouter(tags=["llama"])
 
@@ -624,6 +627,52 @@ def _build_prompt(context: str, question: str, lang: str) -> str:
 3. Related clauses: [if applicable]
 
 [Answer] (in English)"""
+
+# ---- ko -> en 번역기 (로컬 vLLM 사용) ---------------------------------------
+# ON/OFF 토글: RAG_TRANSLATE_QUERY=1 (default 1)
+USE_Q_TRANSL = os.getenv("RAG_TRANSLATE_QUERY", "1").strip() != "0"
+# 타임아웃(초): 무한 대기 방지
+TRANSLATE_TIMEOUT = float(os.getenv("RAG_TRANSLATE_TIMEOUT", "6.0"))
+
+@functools.lru_cache(maxsize=512)
+def _cached_ko_to_en(key: str) -> str:
+    """간단 캐시: 동일 질문 반복 시 번역 호출 줄이기"""
+    # key는 이미 질문 원문 그대로 쓴다(짧은 캐시)
+    return _ko_to_en_call(key)
+
+def _ko_to_en_call(text: str) -> str:
+    """로컬 OpenAI 호환(vLLM)로 번역. 실패 시 원문 반환(강건성)."""
+    try:
+        client = get_openai_client()
+        prompt = (
+            "Translate the following Korean user question into precise, domain-accurate English. "
+            "Keep technical terms and proper nouns as commonly used in English. "
+            "Return ONLY the translation.\n\n"
+            f"{text}"
+        )
+        st = time.time()
+        resp = client.chat.completions.create(
+            model=os.getenv("DEFAULT_MODEL_ALIAS", os.getenv("MODEL_ALIAS", "llama-3.2-3b")),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=256,
+        )
+        # 타임아웃 수동 체크(스트리밍 미사용이므로 안전망)
+        if time.time() - st > TRANSLATE_TIMEOUT:
+            return text  # 안전하게 원문으로 진행
+        out = (resp.choices[0].message.content or "").strip()
+        return out or text
+    except Exception:
+        return text  # 번역 실패 시 원문 유지
+
+def _maybe_translate_query_for_search(question: str, lang: str) -> str:
+    q = normalize_query(question)
+    if not USE_Q_TRANSL or lang != "ko":
+        return q
+    # 한국 법식 "제 12 조" → 영어 "Article 12" 보정(있으면)
+    q = re.sub(r"제\s*(\d+)\s*조", r"Article \1", q)
+    # 캐시된 번역 사용
+    return _cached_ko_to_en(q)
 # ---------- Routes ----------
 @router.get("/test")
 def test():
@@ -776,8 +825,10 @@ def ask_question(req: AskReq):
         # 언어 감지(ko/en)
         lang = _detect_lang(req.question)
 
-        # 1) 질문 전처리(쿼리 보강) + 초기 넉넉히 검색
-        query_for_search = normalize_query(req.question)
+        # 1) 검색용 질의 준비(한국어면 ko->en 변환)
+        query_for_search = _maybe_translate_query_for_search(req.question, lang)
+
+        # 초기 넉넉히 검색
         raw_topk = max(20, req.top_k * 5)
         cands = store.search(query_for_search, embed_fn=embed, topk=raw_topk)
 
@@ -790,7 +841,7 @@ def ask_question(req: AskReq):
                 sources=[]
             )
 
-        # 2) 키워드 부스트 (한국어 질문의 '제 n 조' 부스트만 유지)
+        # 2) 키워드 부스트 (질문 원문 기준으로 키워드 추출)
         kws = extract_keywords(req.question)
         def _kw_boost_score(c: dict) -> int:
             txt = _strip_meta_line(c.get("chunk", "")).lower()
@@ -812,8 +863,8 @@ def ask_question(req: AskReq):
 
         cands.sort(key=lambda x: (x.get("kw_boost", 0), x.get("score", 0.0)), reverse=True)
 
-        # 3) 리랭크
-        topk = rerank(req.question, cands, top_k=req.top_k)
+        # 3) 리랭크도 영어 변환 질의로 수행(검색과 동일한 질의 사용)
+        topk = rerank(query_for_search, cands, top_k=req.top_k)
         if not topk:
             return AskResp(
                 answer=_t(lang,
@@ -852,7 +903,7 @@ def ask_question(req: AskReq):
             })
         context = "\n\n".join(context_lines)
 
-        # 6) 프롬프트 (언어별)
+        # 6) 프롬프트 (언어별: 질문 원문 언어를 따른다)
         prompt = _build_prompt(context=context, question=req.question, lang=lang)
 
         answer = generate_answer_unified(prompt, req.model_name)
@@ -863,7 +914,6 @@ def ask_question(req: AskReq):
     except HTTPException:
         raise
     except RuntimeError as milvus_error:
-        # 에러 메시지도 언어 맞춤
         lang = _detect_lang(getattr(req, "question", "") or "")
         raise HTTPException(503, _t(lang,
                                     f"Milvus 연결 대기/검색 실패: {milvus_error}",
@@ -873,7 +923,6 @@ def ask_question(req: AskReq):
         raise HTTPException(500, _t(lang,
                                     f"질의 처리 중 오류: {e}",
                                     f"Error while processing the query: {e}"))
-
 
 
 def _clean_repetitive_answer(answer: str) -> str:

@@ -41,3 +41,12 @@ def list_vllm_models(base_url: Optional[str] = None) -> List[str]:
         return [m.id for m in getattr(out, "data", [])]
     except Exception:
         return []
+    
+
+def get_openai_client(base_url: Optional[str] = None) -> OpenAI:
+    """
+    vLLM(OpenAI 호환 API) 클라이언트 헬퍼
+    - /ask 라우터 등에서 직접 호출하기 위해 공개 래퍼로 제공
+    """
+    return _client(base_url)
+
