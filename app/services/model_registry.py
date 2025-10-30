@@ -16,16 +16,18 @@ REGISTRY: Dict[str, ModelSpec] = {
     # 별칭(권장)
     "llama-3.2-1b":   ModelSpec("vllm", "meta-llama/Llama-3.2-1B-Instruct"),
     "llama-3.2-3b":   ModelSpec("vllm", "meta-llama/Llama-3.2-3B-Instruct"),
+    "llama-3.1-8b":   ModelSpec("vllm", "meta-llama/Llama-3.1-8B-Instruct"),
     "ko-llama3-8b":   ModelSpec("vllm", "saltlux/Ko-Llama3-Luxia-8B"),
 
     # 실제 HF ID(그대로 받아도 로컬 로딩 가능)
     "meta-llama/Llama-3.2-1B-Instruct": ModelSpec("vllm", "meta-llama/Llama-3.2-1B-Instruct"),
     "meta-llama/Llama-3.2-3B-Instruct": ModelSpec("vllm", "meta-llama/Llama-3.2-3B-Instruct"),
+    "meta-llama/Llama-3.1-8B-Instruct": ModelSpec("vllm", "meta-llama/Llama-3.1-8B-Instruct"),
     "saltlux/Ko-Llama3-Luxia-8B":       ModelSpec("vllm", "saltlux/Ko-Llama3-Luxia-8B"),
 }
 
 # 데모 기본값(원하면 .env에서 DEFAULT_ALIAS 오버라이드 해도 됨)
-DEFAULT_ALIAS = "llama-3.2-3b"
+DEFAULT_ALIAS = "llama-3.1-8b"
 
 def resolve(model_name: Optional[str]) -> ModelSpec:
     """요청값이 별칭이든 실제 ID든 받아서 스펙으로 통일."""

@@ -257,11 +257,13 @@ services:
       OPENAI_API_KEY: "not-used"
       MODEL_ALIASES: >
         {"llama-3.2-3b":"meta-llama/Llama-3.2-3B-Instruct",
-         "llama-3.2-1b":"meta-llama/Llama-3.2-1B-Instruct"}
+         "llama-3.2-1b":"meta-llama/Llama-3.2-1B-Instruct",
+         "llama-3.1-8b":"meta-llama/Llama-3.1-8B-Instruct"}
       USE_VLLM: "1"
       HF_HOME: "/models"
       OPENAI_ALIAS_URLS: >
-        {"llama-3.2-3b":"http://vllm-a4000:8000/v1"}
+        {"llama-3.2-3b":"http://vllm-a4000:8000/v1",
+        "llama-3.1-8b":"http://vllm-a4000:8000/v1"}
       DEFAULT_MODEL_ALIAS: "llama-3.2-3b"
     networks: [ragnet]
     depends_on:
