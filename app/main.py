@@ -13,6 +13,8 @@ from app.api.llama_router import router as llama_router
 from app.api.db_router import router as db_router
 from app.api.java_router import router as java_router  # 운영용
 from app.api.dev_router import router as dev_router    # 개발용
+from app.services.embedding_model import get_embedding_model
+get_embedding_model()  # 앱 시작 시 미리 로드
 
 API_BASE = "/llama"
 
