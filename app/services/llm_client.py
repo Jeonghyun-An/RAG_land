@@ -12,24 +12,40 @@ OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "60"))  # 초
 def _client(base_url: Optional[str] = None) -> OpenAI:
     return OpenAI(base_url=base_url or DEFAULT_BASE, api_key=API_KEY, timeout=OPENAI_TIMEOUT)
 
-def chat_complete(model_name: str, prompt: str, temperature: float = 0.2, max_tokens: int = 512) -> str:
+GEN_TEMP = float(os.getenv("GEN_TEMP", "0.0"))
+GEN_TOP_P = float(os.getenv("GEN_TOP_P", "0.9"))
+GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "320"))
+GEN_REP_PEN = float(os.getenv("GEN_REP_PEN", "1.12"))  # vLLM이 무시해도 안전
+
+def chat_complete(model_name: str, prompt: str,
+                  temperature: float = GEN_TEMP,
+                  max_tokens: int = GEN_MAX_TOKENS,
+                  top_p: float = GEN_TOP_P,
+                  stop: list[str] | None = None) -> str:
     c = _client()
     r = c.chat.completions.create(
         model=model_name,
         messages=[{"role":"user","content":prompt}],
         temperature=temperature,
         max_tokens=max_tokens,
+        top_p=top_p,
+        stop=stop
     )
     return r.choices[0].message.content
 
 def chat_complete_on(base_url: str, model_name: str, prompt: str,
-                     temperature: float = 0.2, max_tokens: int = 512) -> str:
+                     temperature: float = GEN_TEMP,
+                     max_tokens: int = GEN_MAX_TOKENS,
+                     top_p: float = GEN_TOP_P,
+                     stop: list[str] | None = None) -> str:
     c = _client(base_url)
     r = c.chat.completions.create(
         model=model_name,
         messages=[{"role":"user","content":prompt}],
         temperature=temperature,
         max_tokens=max_tokens,
+        top_p=top_p,
+        stop=stop
     )
     return r.choices[0].message.content
 

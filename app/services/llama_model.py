@@ -86,10 +86,11 @@ def generate_answer(
     prompt: str,
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    max_new_tokens: int = 256,
-    temperature: float = 0.7,
+    max_new_tokens: int = 320,     # ⬅ 기본 길이 축소/고정
+    temperature: float = 0.0,      # ⬅ 디폴트 0 (결정론)
     top_p: float = 0.9,
-    top_k: int = 50,
+    top_k: int = 40,
+    do_sample: bool = False        # ⬅ 샘플링 끔
 ) -> str:
     try:
         messages = [{"role": "user", "content": prompt}]
@@ -110,13 +111,14 @@ def generate_answer(
         output_ids = model.generate(
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
-            do_sample=True,
+            do_sample=do_sample,      # ⬅ 반영
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             eos_token_id=eos_id,
             pad_token_id=pad_id,
             use_cache=True,
+            repetition_penalty=1.12,
         )
     gen_ids = output_ids[0, input_ids.shape[-1]:]
     return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
@@ -135,29 +137,58 @@ def generate_answer_unified(prompt: str, name_or_id: Optional[str]):
     alias = (name_or_id or "").strip() or DEFAULT_MODEL_ALIAS
     hf_id = spec.model_id if _hf_or_path(spec.model_id) else _hf_or_path(alias) or spec.model_id
 
-    # 1) vLLM 경로 (옵션)
+    # 1) vLLM 경로 (가능하면 이쪽으로)
     if USE_VLLM and spec.provider == "vllm":
-        # alias 전용 서버가 있으면 우선
         per_alias_base = OPENAI_ALIAS_URLS.get(alias)
-        bases = [per_alias_base] if per_alias_base else [None]  # None => 기본 base_url
+        bases = [per_alias_base] if per_alias_base else [None]
         for base in bases:
             served = set(list_vllm_models(base))
             if served:
                 for candidate in _served_name_candidates(hf_id, alias):
                     if candidate in served:
-                        # base가 None이면 기본 서버로, 아니면 해당 서버로 전송
                         if base:
-                            return chat_complete_on(base, candidate, prompt)
+                            return chat_complete_on(
+                                base, candidate, prompt,
+                                temperature=float(os.getenv("GEN_TEMP","0.0")),
+                                max_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
+                                top_p=float(os.getenv("GEN_TOP_P","0.9")),
+                                stop=None
+                            )
                         else:
-                            return chat_complete(candidate, prompt)
-        # served 목록 조회 실패했거나 후보가 없으면 마지막으로 "그냥 호출"도 한 번 시도
+                            return chat_complete(
+                                candidate, prompt,
+                                temperature=float(os.getenv("GEN_TEMP","0.0")),
+                                max_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
+                                top_p=float(os.getenv("GEN_TOP_P","0.9")),
+                                stop=None
+                            )
         try:
             if per_alias_base:
-                return chat_complete_on(per_alias_base, alias, prompt)
-            return chat_complete(hf_id, prompt)
+                return chat_complete_on(
+                    per_alias_base, alias, prompt,
+                    temperature=float(os.getenv("GEN_TEMP","0.0")),
+                    max_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
+                    top_p=float(os.getenv("GEN_TOP_P","0.9")),
+                    stop=None
+                )
+            return chat_complete(
+                hf_id, prompt,
+                temperature=float(os.getenv("GEN_TEMP","0.0")),
+                max_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
+                top_p=float(os.getenv("GEN_TOP_P","0.9")),
+                stop=None
+            )
         except Exception:
-            pass  # 폴백으로 진행
+            pass  # 폴백
 
-    # 2) Transformers 폴백
+    # 2) Transformers 폴백도 동일 톤으로
     model, tok = load_model(hf_id)
-    return generate_answer(prompt, model, tok)
+    return generate_answer(
+        prompt, model, tok,
+        max_new_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
+        temperature=float(os.getenv("GEN_TEMP","0.0")),
+        top_p=float(os.getenv("GEN_TOP_P","0.9")),
+        top_k=40,
+        do_sample=False
+    )
+
