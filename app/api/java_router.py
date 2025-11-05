@@ -13,7 +13,7 @@ import hashlib
 import hmac
 import uuid
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import List, Optional, Dict, Any
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Header, BackgroundTasks
@@ -78,6 +78,21 @@ class StatusResponse(BaseModel):
     parse_start_dt: Optional[str] = None
     parse_end_dt: Optional[str] = None
     milvus_doc_id: Optional[str] = None
+    
+class DeleteDocumentRequest(BaseModel):
+    """문서 삭제 요청"""
+    data_id: str
+    delete_from_minio: bool = True  # MinIO 파일도 삭제할지 여부
+    callback_url: Optional[str] = None
+
+
+class DeleteDocumentResponse(BaseModel):
+    """삭제 응답"""
+    status: str
+    data_id: str
+    deleted_chunks: int
+    deleted_files: List[str]
+    message: str
 
 
 # ==================== Helper Functions ====================
@@ -505,6 +520,128 @@ async def process_manual_ocr_and_index(
         
         raise
 
+# ==================== Background Task ====================
+async def process_delete_document(
+    data_id: str,
+    delete_from_minio: bool,
+    callback_url: Optional[str]
+):
+    """
+    문서 완전 삭제:
+    1. Milvus에서 청크 삭제
+    2. MinIO에서 파일 삭제 (옵션)
+    3. DB 상태 업데이트 (del_yn = 'Y')
+    """
+    db = DBConnector()
+    deleted_chunks = 0
+    deleted_files = []
+    
+    try:
+        print(f"[DELETE] Starting deletion for data_id={data_id}")
+        
+        # ========== Step 1: Milvus에서 청크 삭제 ==========
+        from app.services.milvus_store_v2 import MilvusStoreV2
+        
+        mvs = MilvusStoreV2()
+        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "rag_chunks_v2")
+        
+        print(f"[DELETE] Deleting chunks from Milvus: {data_id}")
+        deleted_chunks = mvs.delete_by_doc_id(collection_name, data_id)
+        print(f"[DELETE] ✅ Deleted {deleted_chunks} chunks from Milvus")
+        
+        # ========== Step 2: MinIO에서 파일 삭제 (옵션) ==========
+        if delete_from_minio:
+            from app.services.minio_store import MinIOStore
+            
+            minio = MinIOStore()
+            
+            # PDF 파일 삭제
+            pdf_key = f"uploaded/{data_id}.pdf"
+            if minio.exists(pdf_key):
+                minio.delete(pdf_key)
+                deleted_files.append(pdf_key)
+                print(f"[DELETE] ✅ Deleted PDF: {pdf_key}")
+            
+            # 원본 파일들 삭제 (uploaded/originals/{data_id}/ 폴더)
+            try:
+                originals_prefix = f"uploaded/originals/{data_id}/"
+                files = minio.list_objects(prefix=originals_prefix)
+                for file_key in files:
+                    minio.delete(file_key)
+                    deleted_files.append(file_key)
+                print(f"[DELETE] ✅ Deleted {len(files)} original files")
+            except Exception as e:
+                print(f"[DELETE] ⚠️  Failed to delete originals: {e}")
+            
+            # 해시 플래그 삭제
+            try:
+                hash_key = f"uploaded/__hash__/{data_id}.flag"
+                if minio.exists(hash_key):
+                    minio.delete(hash_key)
+                    deleted_files.append(hash_key)
+            except:
+                pass
+            
+            # 메타 파일 삭제
+            try:
+                meta_key = f"uploaded/__meta__/{data_id}.json"
+                if minio.exists(meta_key):
+                    minio.delete(meta_key)
+                    deleted_files.append(meta_key)
+            except:
+                pass
+        
+        # ========== Step 3: DB 상태 업데이트 ==========
+        print(f"[DELETE] Updating DB status")
+        
+        # osk_data 테이블의 del_yn을 'Y'로 설정
+        sql = """
+        UPDATE osk_data
+        SET del_yn = 'Y',
+            del_dt = SYSDATETIME,
+            del_nm = 'AI_SYSTEM',
+            rag_index_status = 'deleted'
+        WHERE data_id = ?
+        """
+        
+        try:
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, (data_id,))
+                cur.close()
+            print(f"[DELETE] ✅ Updated DB: del_yn='Y'")
+        except Exception as e:
+            print(f"[DELETE] ⚠️  DB update failed: {e}")
+        
+        # ========== Step 4: 완료 & Webhook ==========
+        if callback_url:
+            payload = WebhookPayload(
+                job_id="delete",
+                data_id=data_id,
+                status="deleted",
+                message=f"Document deleted: {deleted_chunks} chunks, {len(deleted_files)} files",
+                chunk_count=0
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+        
+        print(f"[DELETE] ✅ Deletion completed for data_id={data_id}")
+        
+    except Exception as e:
+        print(f"[DELETE] ❌ Error: {e}")
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id="delete",
+                data_id=data_id,
+                status="error",
+                message=f"Deletion failed: {e}"
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+        
+        raise
+
+
+
 # ==================== Routes ====================
 @router.post("/convert-and-index", response_model=ConvertAndIndexResponse)
 async def convert_and_index(
@@ -581,6 +718,125 @@ async def manual_ocr_and_index(
         message=f"processing manual OCR (rag_yn={request.rag_yn}, simple chunker)"
     )
 
+# ==================== Routes (추가) ====================
+@router.delete("/delete/{data_id}", response_model=DeleteDocumentResponse)
+async def delete_document(
+    data_id: str,
+    background_tasks: BackgroundTasks,
+    delete_from_minio: bool = True,
+    callback_url: Optional[str] = None,
+    x_internal_token: Optional[str] = Header(None)
+):
+    """
+    문서 완전 삭제 API (운영용)
+    
+    Parameters:
+    - data_id: 삭제할 문서 ID
+    - delete_from_minio: MinIO 파일도 삭제할지 여부 (기본: True)
+    - callback_url: 완료 시 호출할 Webhook URL
+    
+    삭제 내용:
+    1. Milvus: 해당 data_id의 모든 청크
+    2. MinIO: PDF 파일 및 원본 파일들 (옵션)
+    3. DB: del_yn = 'Y', rag_index_status = 'deleted'
+    
+    Example:
+    ```
+    DELETE /llama/java/delete/DOC001?delete_from_minio=true
+    Headers:
+      X-Internal-Token: {SECRET}
+    ```
+    """
+    if not verify_internal_token(x_internal_token):
+        raise HTTPException(401, "Unauthorized - Invalid token")
+    
+    # 문서 존재 확인
+    db = DBConnector()
+    existing = db.get_file_by_id(data_id)
+    
+    if not existing:
+        raise HTTPException(404, f"Document not found: {data_id}")
+    
+    # 이미 삭제된 문서인지 확인
+    if existing.get('del_yn') == 'Y':
+        return DeleteDocumentResponse(
+            status="already_deleted",
+            data_id=data_id,
+            deleted_chunks=0,
+            deleted_files=[],
+            message="Document already marked as deleted"
+        )
+    
+    # 백그라운드 삭제 작업
+    background_tasks.add_task(
+        process_delete_document,
+        data_id=data_id,
+        delete_from_minio=delete_from_minio,
+        callback_url=callback_url
+    )
+    
+    return DeleteDocumentResponse(
+        status="deleting",
+        data_id=data_id,
+        deleted_chunks=0,  # 백그라운드에서 처리
+        deleted_files=[],
+        message="Deletion in progress"
+    )
+
+
+@router.post("/delete-batch", response_model=Dict[str, Any])
+async def delete_documents_batch(
+    data_ids: List[str],
+    background_tasks: BackgroundTasks,
+    delete_from_minio: bool = True,
+    callback_url: Optional[str] = None,
+    x_internal_token: Optional[str] = Header(None)
+):
+    """
+    여러 문서 일괄 삭제 API
+    
+    Parameters:
+    - data_ids: 삭제할 문서 ID 리스트
+    - delete_from_minio: MinIO 파일도 삭제할지 여부
+    - callback_url: 완료 시 호출할 Webhook URL
+    
+    Example:
+    ```
+    POST /llama/java/delete-batch
+    Headers:
+      X-Internal-Token: {SECRET}
+    Body:
+    {
+      "data_ids": ["DOC001", "DOC002", "DOC003"],
+      "delete_from_minio": true,
+      "callback_url": "https://java-server/webhook"
+    }
+    ```
+    """
+    if not verify_internal_token(x_internal_token):
+        raise HTTPException(401, "Unauthorized - Invalid token")
+    
+    if not data_ids:
+        raise HTTPException(400, "data_ids cannot be empty")
+    
+    if len(data_ids) > 100:
+        raise HTTPException(400, "Maximum 100 documents per batch")
+    
+    # 각 문서별로 백그라운드 작업 생성
+    for data_id in data_ids:
+        background_tasks.add_task(
+            process_delete_document,
+            data_id=data_id,
+            delete_from_minio=delete_from_minio,
+            callback_url=callback_url
+        )
+    
+    return {
+        "status": "deleting",
+        "count": len(data_ids),
+        "data_ids": data_ids,
+        "message": f"Batch deletion started for {len(data_ids)} documents"
+    }
 
 @router.get("/status/{data_id}", response_model=StatusResponse)
 def get_status(data_id: str, x_internal_token: Optional[str] = Header(None)):
