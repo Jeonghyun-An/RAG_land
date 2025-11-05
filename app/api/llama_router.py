@@ -14,9 +14,13 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks,
 from pydantic import BaseModel
 import asyncio, json
 import numpy as np
+import logging
+logger = logging.getLogger("uvicorn.error")  # uvicorn 출력에 섞기
+
 from sse_starlette.sse import EventSourceResponse  # ✅ 요구사항: sse-starlette
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
+import time as pytime
 
 from app.services.file_parser import (
     parse_pdf,                    # (local path) -> [(page_no, text)]
@@ -34,17 +38,18 @@ from app.services.reranker import rerank
 from app.services.llm_client import get_openai_client
 
 router = APIRouter(tags=["llama"])
+logger.info("[ask] router loaded v2025-10-29a")
 
 UPLOAD_DIR = "data"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ---------- Schemas ----------
 class GenerateReq(BaseModel):
     prompt: str
-    model_name: str = "llama-3.2-3b"
+    model_name: str = "llama-3.1-8b"
 
 class AskReq(BaseModel):
     question: str
-    model_name: str = "llama-3.2-3b"
+    model_name: str = "llama-3.1-8b"
     top_k: int = 3
 
 class UploadResp(BaseModel):
@@ -584,14 +589,19 @@ def _t(lang: str, ko: str, en: str) -> str:
 
 def _build_prompt(context: str, question: str, lang: str) -> str:
     if lang == "ko":
-        return f"""다음 문서 내용을 바탕으로 질문에 답하세요.
+        return f"""당신은 국제원자력기구(IAEA) 공식 문서를 바탕으로 답변하는 전문 분석가입니다.
+외부 지식이나 추측은 사용하지 말고, 문서 내용만 근거로 자연스럽게 작성하세요.
+답변은 한두 개의 단락으로 명확하게 표현하세요. 필요할 때만 불릿을 사용하세요.
 
-[중요 규칙]
-- 문서에 명확한 근거가 있는 경우에만 답변하세요
-- 추측이나 일반적인 지식으로 답하지 마세요
-- 답변은 2-3문장으로 간결하게 작성하세요
-- 같은 내용을 반복하지 마세요
-- 문서에서 찾을 수 없으면 "문서에서 해당 내용을 찾을 수 없습니다"라고 답하세요
+[작성 지침]
+- 자연스러운 설명체로 2~4문장 이내로 작성합니다.
+- 불릿(-)은 **여러 조치를 나열하거나 절차를 요약할 때만** 사용합니다. 
+  (예: “주요 절차는 다음과 같습니다.” 이후에 리스트 작성)
+- 가능한 한 일반 문장형으로 설명하고, 형식적인 번호(1), 2))는 피하세요.
+- 문서의 원문 용어(예: Source material, Safeguards, PIV, PIT)는 그대로 사용합니다.
+- 인용, 링크, 각주([p.xx], [1], URL 등)는 사용하지 마세요.
+- 문서에서 근거를 찾지 못하면 정확히 아래 문장만 출력하세요:  
+  `문서에서 해당 내용을 찾을 수 없습니다.`
 
 [참고 문서]
 {context}
@@ -599,21 +609,21 @@ def _build_prompt(context: str, question: str, lang: str) -> str:
 [질문]
 {question}
 
-[답변 형식]
-1. 정의: [문서에서 찾은 정의]
-2. 주요 내용: [구체적 절차나 규정]
-3. 관련 조항: [해당되는 경우]
-
-[답변](한국어로)"""
+[답변]
+"""
     else:
-        return f"""Answer the question strictly based on the provided documents.
+        return f"""You are an expert analyst who answers based strictly on IAEA official documents.
+Do not use outside knowledge or speculation. Write your answer as a short, fluent paragraph.
+Use bullet points only when summarizing multiple steps or key points.
 
-[Rules]
-- Only answer if the documents provide clear evidence.
-- Do not guess or use outside knowledge.
-- Keep your answer concise (2–3 sentences).
-- Do not repeat the same points.
-- If the answer cannot be found, say: "I cannot find this in the documents."
+[Instructions]
+- Write 2–4 concise sentences in a natural, explanatory tone.
+- Use **dash(-)** bullets only when listing multiple items (e.g., procedures, conditions).
+- Prefer paragraph-style explanations for single ideas.
+- Keep original technical terms (e.g. Source material, Safeguards, PIV, PIT).
+- Do not include page numbers, citations ([p.xx], [1]), or URLs.
+- If the answer cannot be found, write exactly:  
+  `I cannot find this in the documents.`
 
 [Context]
 {context}
@@ -621,49 +631,52 @@ def _build_prompt(context: str, question: str, lang: str) -> str:
 [Question]
 {question}
 
-[Answer format]
-1. Definition: [definition found in the docs]
-2. Key points: [specific procedure or rule]
-3. Related clauses: [if applicable]
-
-[Answer] (in English)"""
+[Answer]
+"""
 
 # ---- ko -> en 번역기 (로컬 vLLM 사용) ---------------------------------------
 # ON/OFF 토글: RAG_TRANSLATE_QUERY=1 (default 1)
 USE_Q_TRANSL = os.getenv("RAG_TRANSLATE_QUERY", "1").strip() != "0"
 # 타임아웃(초): 무한 대기 방지
-TRANSLATE_TIMEOUT = float(os.getenv("RAG_TRANSLATE_TIMEOUT", "6.0"))
+TRANSLATE_TIMEOUT = float(os.getenv("RAG_TRANSLATE_TIMEOUT", "8.0"))
+
+
+def _has_hangul(s: str) -> bool:
+    return any('\uac00' <= ch <= '\ud7a3' for ch in s or "")
 
 @functools.lru_cache(maxsize=512)
-def _cached_ko_to_en(key: str) -> str:
-    """간단 캐시: 동일 질문 반복 시 번역 호출 줄이기"""
-    # key는 이미 질문 원문 그대로 쓴다(짧은 캐시)
-    return _ko_to_en_call(key)
+def _cached_ko_to_en(text: str) -> str:
+    return _ko_to_en_call(text)
 
 def _ko_to_en_call(text: str) -> str:
-    """로컬 OpenAI 호환(vLLM)로 번역. 실패 시 원문 반환(강건성)."""
     try:
         client = get_openai_client()
-        prompt = (
-            "Translate the following Korean user question into precise, domain-accurate English. "
-            "Keep technical terms and proper nouns as commonly used in English. "
-            "Return ONLY the translation.\n\n"
-            f"{text}"
-        )
-        st = time.time()
+        sys = "You are a professional translator. Output ONLY the English translation. No quotes. No notes."
+        st = pytime.time()
         resp = client.chat.completions.create(
-            model=os.getenv("DEFAULT_MODEL_ALIAS", os.getenv("MODEL_ALIAS", "llama-3.2-3b")),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=256,
+            model=os.getenv("DEFAULT_MODEL_ALIAS", "llama-3.1-8b"),
+            messages=[{"role":"system","content":sys},{"role":"user","content":text}],
+            temperature=0.0, max_tokens=256,
         )
-        # 타임아웃 수동 체크(스트리밍 미사용이므로 안전망)
-        if time.time() - st > TRANSLATE_TIMEOUT:
-            return text  # 안전하게 원문으로 진행
+        if pytime.time() - st > TRANSLATE_TIMEOUT:
+            raise TimeoutError("translate timeout")
         out = (resp.choices[0].message.content or "").strip()
-        return out or text
-    except Exception:
-        return text  # 번역 실패 시 원문 유지
+        # 한글 섞이면 한 번 더 강제
+        if _has_hangul(out):
+            sys2 = "Translate to English. Output ONLY ASCII English. No Korean letters. No quotes."
+            resp2 = client.chat.completions.create(
+                model=os.getenv("DEFAULT_MODEL_ALIAS", "llama-3.1-8b"),
+                messages=[{"role":"system","content":sys2},{"role":"user","content":text}],
+                temperature=0.0, max_tokens=256,
+            )
+            out = (resp2.choices[0].message.content or "").strip()
+        if not out or _has_hangul(out):
+            logger.warning("[ask] translation contains Hangul or empty; fallback to original")
+            return text
+        return out
+    except Exception as e:
+        logger.warning(f"[ask] translate failed: {e}")
+        return text
 
 def _maybe_translate_query_for_search(question: str, lang: str) -> str:
     q = normalize_query(question)
@@ -827,10 +840,35 @@ def ask_question(req: AskReq):
 
         # 1) 검색용 질의 준비(한국어면 ko->en 변환)
         query_for_search = _maybe_translate_query_for_search(req.question, lang)
+        logger.info("[ask] lang=%s | q_before=%s", lang, req.question[:120])
+        logger.info("[ask] q_search=%s", query_for_search[:120])
 
         # 초기 넉넉히 검색
-        raw_topk = max(20, req.top_k * 5)
-        cands = store.search(query_for_search, embed_fn=embed, topk=raw_topk)
+        raw_topk = max(40, req.top_k * 6)
+        def _dedup_key(c):
+            return (c.get("doc_id"), c.get("page"), _strip_meta_line(c.get("chunk",""))[:80])
+
+        def _merge_dedup(a, b):
+            seen, out = set(), []
+            for x in (a + b):
+                k = _dedup_key(x)
+                if k in seen: 
+                    continue
+                seen.add(k); out.append(x)
+            return out
+
+        if lang == "ko" and _has_hangul(query_for_search):
+            # 번역 실패로 판단 → 한/영 양방향 검색
+            logger.warning("[ask] q_search still contains Hangul; doing bilingual search fallback")
+            cands_ko = store.search(normalize_query(req.question), embed_fn=embed, topk=raw_topk//2)
+            # 강제 번역(한 번 더)
+            forced_en = _cached_ko_to_en(normalize_query(req.question))
+            cands_en = store.search(forced_en, embed_fn=embed, topk=raw_topk//2)
+            cands = _merge_dedup(cands_ko, cands_en)
+        else:
+            cands = store.search(query_for_search, embed_fn=embed, topk=raw_topk)
+
+        logger.info("[ask] cands=%d (raw_topk=%d)", len(cands), raw_topk)
 
         if not cands:
             return AskResp(
@@ -862,9 +900,24 @@ def ask_question(req: AskReq):
                         c["kw_boost"] = c.get("kw_boost", 0.0) + ARTICLE_BOOST
 
         cands.sort(key=lambda x: (x.get("kw_boost", 0), x.get("score", 0.0)), reverse=True)
+        rerank_pool = cands[:max(30, req.top_k * 6)] 
 
-        # 3) 리랭크도 영어 변환 질의로 수행(검색과 동일한 질의 사용)
-        topk = rerank(query_for_search, cands, top_k=req.top_k)
+        # --- (1) THRESH 완화: 기본 0.1 권장 ---
+        THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.1"))
+
+        # --- (2) re_score 없거나 낮아도 임베딩 점수로 보완 ---
+        def _is_confident(hit: dict, thr: float) -> bool:
+            re_s = hit.get("re_score")  # bge-reranker 점수(있을 수도/없을 수도)
+            emb_s = hit.get("score", 0.0)  # 임베딩 유사도
+            # 규칙:
+            #  - re_score가 있으면 그걸 우선 보되, 너무 낮아도 임베딩 점수가 높으면 통과
+            #  - re_score가 없으면 임베딩 점수만으로 판단
+            if re_s is not None:
+                return (re_s >= thr) or (emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.28")))
+            return emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.28"))
+
+        # ... rerank() 이후
+        topk = rerank(query_for_search, rerank_pool, top_k=req.top_k)
         if not topk:
             return AskResp(
                 answer=_t(lang,
@@ -873,10 +926,23 @@ def ask_question(req: AskReq):
                 used_chunks=0,
                 sources=[]
             )
+        #  항상 찍히는 요약 로그 (분기 여부와 무관)
+        try:
+            dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
+            logger.info("[ask] rerank-top3 (re,emb)=%s | keep=%d | THRESH=%.3f",
+                        dbg, len(topk), THRESH)
+        except Exception as e:
+            logger.warning("[ask] debug summarize failed: %s", e)
 
-        # 4) 스코어 컷오프
-        THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
-        if "re_score" in topk[0] and topk[0]["re_score"] < THRESH:
+        # --- (3) 컷오프 로직 대체 ---
+        best = topk[0]
+        if not _is_confident(best, THRESH):
+            try:
+                dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
+                logger.info("[ask] LOW-CONF; top3 (re,emb)=%s | q_search=%s",
+                    dbg, query_for_search[:120])
+            except Exception as e:
+                logger.warning(f"[ask] debug print failed: {e}")
             return AskResp(
                 answer=_t(lang,
                           "문서에서 해당 질문에 대한 확실한 답변을 찾기 어렵습니다.",
@@ -891,7 +957,6 @@ def ask_question(req: AskReq):
         for i, c in enumerate(topk, 1):
             sec = (c.get("section") or "").strip()
             chunk_body = _strip_meta_line(c.get("chunk", ""))
-            body_only = f"{sec}\n{chunk_body}" if sec and not chunk_body.startswith(sec) else chunk_body
             context_lines.append(f"[{i}] (doc:{c['doc_id']} p.{c['page']})\n{chunk_body}")
             sources.append({
                 "id": i,
