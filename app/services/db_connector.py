@@ -262,7 +262,7 @@ class DBConnector:
         except Exception as e:
             print(f"[DB] get_simulated_yn failed: {e}")
             return None
-# ==================== 기본 조회 ====================
+    # ==================== 기본 조회 ====================
     def get_file_by_id(self, data_id: str | int) -> Optional[Dict[str, Any]]:
         """data_master 레코드 조회"""
         try:
@@ -322,4 +322,74 @@ class DBConnector:
         except Exception as e:
             print(f"[DB] mark_ocr_start failed (simulate_remote?): {e}")
 
-    #
+
+    # ==================== OCR 텍스트 가져오기 (Manual OCR용) ====================
+    def get_ocr_text_by_data_id(self, data_id: str | int) -> List[Tuple[int, str]]:
+        """
+        data_id에 해당하는 OCR 텍스트를 DB에서 가져오기
+        자바가 osk_ocr_data에 저장한 수동 OCR 결과 조회
+        
+        Args:
+            data_id: 문서 ID
+        
+        Returns:
+            [(page_no, text), ...] 형태의 페이지별 텍스트 리스트
+            페이지 번호 순으로 정렬됨
+        """
+        try:
+            sql = """
+            SELECT page, text
+            FROM osk_ocr_data
+            WHERE data_id = ?
+            ORDER BY page ASC
+            """
+            with self.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, (data_id,))
+                rows = cur.fetchall()
+                cur.close()
+            
+            if not rows:
+                print(f"[DB] ⚠️  No OCR text found for data_id={data_id}")
+                return []
+            
+            result = [(int(row[0]), str(row[1] or '').strip()) for row in rows]
+            print(f"[DB] ✅ Retrieved {len(result)} pages of OCR text for data_id={data_id}")
+            return result
+            
+        except Exception as e:
+            print(f"[DB] ❌ get_ocr_text_by_data_id failed: {e}")
+            return []
+    
+    def get_ocr_page_count(self, data_id: str | int) -> int:
+        """
+        data_id의 OCR 페이지 수 조회
+        
+        Returns:
+            페이지 수
+        """
+        try:
+            sql = """
+            SELECT COUNT(*) 
+            FROM osk_ocr_data
+            WHERE data_id = ?
+            """
+            with self.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, (data_id,))
+                count = cur.fetchone()[0]
+                cur.close()
+            return int(count)
+        except Exception as e:
+            print(f"[DB] get_ocr_page_count failed: {e}")
+            return 0
+    
+    def verify_ocr_data_exists(self, data_id: str | int) -> bool:
+        """
+        OCR 데이터가 DB에 존재하는지 확인
+        
+        Returns:
+            True if exists, False otherwise
+        """
+        count = self.get_ocr_page_count(data_id)
+        return count > 0
