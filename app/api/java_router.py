@@ -3,8 +3,7 @@
 Java 시스템 연동 라우터 (운영용)
 - 서버 파일시스템 사용
 - DB 완전 연동
-- manual-ocr-and-index 엔드포인트: rag_yn 파라미터 추가
-- 단순 청커(simple_proofreading_chunker) 사용
+- manual-ocr-and-index: DB에서 OCR 텍스트 가져와서 청킹/임베딩
 """
 from __future__ import annotations
 
@@ -13,7 +12,7 @@ import hashlib
 import hmac
 import uuid
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Header, BackgroundTasks
@@ -37,7 +36,7 @@ class ConvertAndIndexRequest(BaseModel):
     data_id: str
     path: str  # 서버 파일시스템 상대 경로
     file_id: str
-    callback_url: Optional[str] = None  # ✅ callback_url로 변경
+    callback_url: Optional[str] = None
 
 
 class ManualOCRAndIndexRequest(BaseModel):
@@ -46,7 +45,7 @@ class ManualOCRAndIndexRequest(BaseModel):
     path: str  # 서버 파일시스템 상대 경로
     file_id: str
     callback_url: Optional[str] = None
-    rag_yn: str = "N"  # ✅ 신규 파라미터: "N" (신규 작업), "Y" (기존 작업 수정)
+    rag_yn: str = "N"  # "N" (신규 작업), "Y" (기존 작업 수정)
 
 
 class ConvertAndIndexResponse(BaseModel):
@@ -78,11 +77,12 @@ class StatusResponse(BaseModel):
     parse_start_dt: Optional[str] = None
     parse_end_dt: Optional[str] = None
     milvus_doc_id: Optional[str] = None
+
     
 class DeleteDocumentRequest(BaseModel):
     """문서 삭제 요청"""
     data_id: str
-    delete_from_minio: bool = True  # MinIO 파일도 삭제할지 여부
+    delete_from_minio: bool = True
     callback_url: Optional[str] = None
 
 
@@ -97,35 +97,26 @@ class DeleteDocumentResponse(BaseModel):
 
 # ==================== Helper Functions ====================
 def verify_internal_token(token: Optional[str]) -> bool:
-    if not token:
-        return False
-    return token == SHARED_SECRET
-
-
-def generate_hmac_signature(payload: str, secret: str) -> str:
-    return hmac.new(
-        secret.encode('utf-8'),
-        payload.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
+    """내부 토큰 검증"""
+    if not SHARED_SECRET:
+        return True  # 토큰 미설정 시 허용 (개발 환경)
+    return hmac.compare_digest(token or "", SHARED_SECRET)
 
 
 async def send_webhook(url: str, payload: WebhookPayload, secret: str):
+    """자바 서버로 완료 웹훅 전송"""
     try:
-        payload_json = payload.model_dump_json()
-        signature = generate_hmac_signature(payload_json, secret)
-        
-        headers = {
-            'Content-Type': 'application/json',
-            'X-Webhook-Signature': signature
-        }
+        sig = hmac.new(secret.encode(), payload.model_dump_json().encode(), hashlib.sha256).hexdigest()
         
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, content=payload_json, headers=headers)
-            response.raise_for_status()
-            print(f"[PROD-WEBHOOK] ✅ Sent to {url}")
+            resp = await client.post(
+                url,
+                json=payload.model_dump(),
+                headers={"X-Webhook-Signature": sig}
+            )
+            print(f"[WEBHOOK] Sent to {url}: {resp.status_code}")
     except Exception as e:
-        print(f"[PROD-WEBHOOK] ❌ Failed: {e}")
+        print(f"[WEBHOOK] Failed to send: {e}")
 
 
 # ==================== Background Task (convert-and-index) ====================
@@ -138,14 +129,13 @@ async def process_convert_and_index_prod(
 ):
     """
     운영용 백그라운드 처리 - convert-and-index
-    - parse_yn: L → S
     - 단순 청킹 적용
     """
     db = DBConnector()
     start_time = datetime.utcnow()
     
     job_state.start(job_id, data_id=data_id, file_id=file_id)
-    db.mark_ocr_start(data_id)  # parse_yn = 'L', parse_start_dt 설정
+    db.mark_ocr_start(data_id)
     
     try:
         # ========== Step 1: 서버 파일 로드 ==========
@@ -159,17 +149,22 @@ async def process_convert_and_index_prod(
         print(f"[PROD] Using server file: {full_path}")
         
         # ========== Step 2: PDF 변환 (필요시) ==========
-        job_state.update(job_id, status="parsing", step="Converting to PDF if needed")
-        
         is_already_pdf = file_id.lower().endswith('.pdf')
-        converted_pdf_path = full_path
         
-        if not is_already_pdf:
-            try:
-                converted_pdf_path = convert_to_pdf(full_path)
-                print(f"[PROD] ✅ PDF converted: {converted_pdf_path}")
-            except ConvertError as ce:
-                raise RuntimeError(f"PDF 변환 실패: {ce}")
+        if is_already_pdf:
+            converted_pdf_path = full_path
+            print(f"[PROD] Already PDF: {converted_pdf_path}")
+        else:
+            job_state.update(job_id, status="converting", step="Converting to PDF")
+            print(f"[PROD] Converting to PDF: {file_id}")
+            
+            converted_pdf_path = convert_to_pdf(full_path)
+            
+            if not converted_pdf_path or not os.path.exists(converted_pdf_path):
+                raise ConvertError("PDF 변환 실패")
+            
+            print(f"[PROD] Conversion completed: {converted_pdf_path}")
+            # 참고: DB 파일 경로는 자바 시스템에서 이미 관리하므로 여기서 업데이트 불필요
         
         # ========== Step 3: 단순 청킹 & 인덱싱 ==========
         job_state.update(job_id, status="processing", step="Simple chunking for proofreading")
@@ -230,37 +225,31 @@ async def process_convert_and_index_prod(
         job_state.update(job_id, status="indexing", step="Indexing to Milvus")
         
         from app.services.milvus_store_v2 import MilvusStoreV2
+        from app.services.embedding_model import get_sentence_embedding_dimension
         
-        mvs = MilvusStoreV2()
-        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "rag_chunks_v2")
+        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
         
         # 기존 문서 삭제 (재인덱싱 시)
         print(f"[PROD-CHUNK] Deleting existing doc (if any): {data_id}")
-        mvs.delete_by_doc_id(collection_name, data_id)
+        try:
+            deleted = mvs._delete_by_doc_id(data_id)
+            print(f"[PROD-CHUNK] Deleted {deleted} existing chunks")
+        except Exception as e:
+            print(f"[PROD-CHUNK] Warning during delete: {e}")
         
-        # 청크 삽입
+        # 청크 삽입 (insert 메서드 사용)
         print(f"[PROD-CHUNK] Inserting {len(chunks)} chunks to Milvus")
         
-        for i, (emb, text, meta) in enumerate(zip(embeddings, chunk_texts, chunk_metas)):
-            mvs.insert_one(
-                collection_name,
-                doc_id=data_id,
-                chunk_id=f"{data_id}_chunk_{i}",
-                chunk_index=i,
-                text=text,
-                embedding=emb.tolist() if hasattr(emb, 'tolist') else emb,
-                page=meta.get('page', 1),
-                pages=meta.get('pages', [meta.get('page', 1)]),
-                metadata={
-                    "type": meta.get('type', 'proofreading_chunk'),
-                    "token_count": meta.get('token_count', 0),
-                    "char_count": meta.get('char_count', 0),
-                    "file_id": file_id,
-                    "data_id": data_id
-                }
-            )
+        # insert 메서드가 기대하는 형식: [(text, metadata), ...]
+        chunks_for_insert = [(text, meta) for text, meta in zip(chunk_texts, chunk_metas)]
         
-        print(f"[PROD-CHUNK] ✅ Successfully indexed {len(chunks)} chunks")
+        result = mvs.insert(
+            doc_id=data_id,
+            chunks=chunks_for_insert,
+            embed_fn=embed
+        )
+        
+        print(f"[PROD-CHUNK] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
         
         # ========== Step 4: 결과 조회 및 DB 업데이트 ==========
         pages = len(pages_std)
@@ -268,7 +257,7 @@ async def process_convert_and_index_prod(
         
         print(f"[PROD] ✅ Indexing completed: {pages} pages, {chunk_count} chunks")
         
-        # DB 업데이트: RAG 인덱싱 완료 (parse_yn = 'S')
+        # DB 업데이트
         db.update_rag_completed(
             data_id,
             chunks=chunk_count,
@@ -290,14 +279,14 @@ async def process_convert_and_index_prod(
                 job_id=job_id,
                 data_id=data_id,
                 status="done",
-                converted=not is_already_pdf,
+                converted=not file_id.lower().endswith('.pdf'),
                 metrics={"pages": pages, "chunks": chunk_count},
                 chunk_count=chunk_count,
                 timestamps={
                     "start": start_time.isoformat(), 
                     "end": end_time.isoformat()
                 },
-                message="converted and indexed with simple proofreading chunker" if not is_already_pdf else "indexed with simple proofreading chunker"
+                message="indexed successfully"
             )
             await send_webhook(callback_url, payload, SHARED_SECRET)
     
@@ -329,9 +318,9 @@ async def process_manual_ocr_and_index(
 ):
     """
     운영용 백그라운드 처리 - manual-ocr-and-index
+    - DB의 osk_ocr_data 테이블에서 OCR 텍스트를 가져와서 청킹/임베딩
     - rag_yn = "N": 신규 작업 (parse_yn: L → S)
     - rag_yn = "Y": 기존 작업 수정 (기존 청크 삭제 후 재인덱싱)
-    - 단순 청킹 적용
     """
     db = DBConnector()
     start_time = datetime.utcnow()
@@ -348,37 +337,22 @@ async def process_manual_ocr_and_index(
         print(f"[MANUAL-OCR] 기존 작업 수정: data_id={data_id}, rag_yn=Y")
     
     try:
-        # ========== Step 1: 서버 파일 로드 ==========
-        job_state.update(job_id, status="uploaded", step="Loading file from server")
+        # ========== Step 1: DB에서 OCR 텍스트 가져오기 ==========
+        job_state.update(job_id, status="loading", step="Loading OCR text from DB")
         
-        full_path = os.path.join(SERVER_BASE_PATH, path, file_id)
+        print(f"[MANUAL-OCR] Loading OCR text from DB for data_id={data_id}")
         
-        if not os.path.exists(full_path):
-            raise FileNotFoundError(f"서버 파일 없음: {full_path}")
-        
-        print(f"[MANUAL-OCR] Using server file: {full_path}")
-        
-        # ========== Step 2: PDF 확인 (이미 PDF여야 함) ==========
-        if not file_id.lower().endswith('.pdf'):
-            raise ValueError("manual-ocr-and-index는 PDF 파일만 지원합니다")
-        
-        converted_pdf_path = full_path
-        
-        # ========== Step 3: 단순 청킹 & 인덱싱 ==========
-        job_state.update(job_id, status="processing", step="Simple chunking for manual OCR")
-        
-        # 3-1) PDF 텍스트 추출
-        from app.services.file_parser import parse_pdf
-        
-        print(f"[MANUAL-OCR-CHUNK] Extracting text from: {converted_pdf_path}")
-        pages_std = parse_pdf(converted_pdf_path, by_page=True)
+        # DB에서 페이지별 OCR 텍스트 조회
+        pages_std = db.get_ocr_text_by_data_id(data_id)
         
         if not pages_std:
-            raise RuntimeError("텍스트 추출 실패")
+            raise RuntimeError(f"DB에 OCR 텍스트가 없습니다: data_id={data_id}")
         
-        print(f"[MANUAL-OCR-CHUNK] Extracted {len(pages_std)} pages")
+        print(f"[MANUAL-OCR] Loaded {len(pages_std)} pages from DB")
         
-        # 3-2) 단순 청킹
+        # ========== Step 2: 청킹 ==========
+        job_state.update(job_id, status="chunking", step="Chunking OCR text")
+        
         from app.services.simple_proofreading_chunker import simple_chunk_by_paragraph
         from app.services.embedding_model import get_embedding_model
         
@@ -398,7 +372,7 @@ async def process_manual_ocr_and_index(
         
         print(f"[MANUAL-OCR-CHUNK] Created {len(chunks)} chunks")
         
-        # 3-3) 임베딩
+        # ========== Step 3: 임베딩 ==========
         job_state.update(job_id, status="embedding", step=f"Embedding {len(chunks)} chunks")
         
         from app.services.embedding_model import embed
@@ -419,44 +393,37 @@ async def process_manual_ocr_and_index(
         print(f"[MANUAL-OCR-CHUNK] Embedding {len(chunk_texts)} chunks...")
         embeddings = embed(chunk_texts)
         
-        # 3-4) Milvus 저장
+        # ========== Step 4: Milvus 저장 ==========
         job_state.update(job_id, status="indexing", step="Indexing to Milvus")
         
         from app.services.milvus_store_v2 import MilvusStoreV2
+        from app.services.embedding_model import get_sentence_embedding_dimension
         
-        mvs = MilvusStoreV2()
-        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "rag_chunks_v2")
+        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
         
-        # 기존 문서 삭제 (재인덱싱 or 수정 작업)
-        print(f"[MANUAL-OCR-CHUNK] Deleting existing doc: {data_id}")
-        mvs.delete_by_doc_id(collection_name, data_id)
+        # 기존 문서 삭제 (재인덱싱 시)
+        print(f"[MANUAL-OCR-CHUNK] Deleting existing doc (if any): {data_id}")
+        try:
+            deleted = mvs._delete_by_doc_id(data_id)
+            print(f"[MANUAL-OCR-CHUNK] Deleted {deleted} existing chunks")
+        except Exception as e:
+            print(f"[MANUAL-OCR-CHUNK] Warning during delete: {e}")
         
-        # 청크 삽입
+        # 청크 삽입 (insert 메서드 사용)
         print(f"[MANUAL-OCR-CHUNK] Inserting {len(chunks)} chunks to Milvus")
         
-        for i, (emb, text, meta) in enumerate(zip(embeddings, chunk_texts, chunk_metas)):
-            mvs.insert_one(
-                collection_name,
-                doc_id=data_id,
-                chunk_id=f"{data_id}_chunk_{i}",
-                chunk_index=i,
-                text=text,
-                embedding=emb.tolist() if hasattr(emb, 'tolist') else emb,
-                page=meta.get('page', 1),
-                pages=meta.get('pages', [meta.get('page', 1)]),
-                metadata={
-                    "type": meta.get('type', 'manual_ocr_chunk'),
-                    "token_count": meta.get('token_count', 0),
-                    "char_count": meta.get('char_count', 0),
-                    "file_id": file_id,
-                    "data_id": data_id,
-                    "rag_yn": rag_yn
-                }
-            )
+        # insert 메서드가 기대하는 형식: [(text, metadata), ...]
+        chunks_for_insert = [(text, meta) for text, meta in zip(chunk_texts, chunk_metas)]
         
-        print(f"[MANUAL-OCR-CHUNK] ✅ Successfully indexed {len(chunks)} chunks")
+        result = mvs.insert(
+            doc_id=data_id,
+            chunks=chunks_for_insert,
+            embed_fn=embed
+        )
         
-        # ========== Step 4: 결과 조회 및 DB 업데이트 ==========
+        print(f"[MANUAL-OCR-CHUNK] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
+        
+        # ========== Step 5: 결과 조회 및 DB 업데이트 ==========
         pages = len(pages_std)
         chunk_count = len(chunks)
         
@@ -485,7 +452,7 @@ async def process_manual_ocr_and_index(
             chunks=chunk_count
         )
         
-        # ========== Step 5: 완료 & Webhook ==========
+        # ========== Step 6: 완료 & Webhook ==========
         end_time = datetime.utcnow()
         
         if callback_url:
@@ -520,7 +487,8 @@ async def process_manual_ocr_and_index(
         
         raise
 
-# ==================== Background Task ====================
+
+# ==================== Background Task (delete) ====================
 async def process_delete_document(
     data_id: str,
     delete_from_minio: bool,
@@ -530,76 +498,60 @@ async def process_delete_document(
     문서 완전 삭제:
     1. Milvus에서 청크 삭제
     2. MinIO에서 파일 삭제 (옵션)
-    3. DB 상태 업데이트 (del_yn = 'Y')
+    3. DB 업데이트 (del_yn='Y')
     """
     db = DBConnector()
-    deleted_chunks = 0
-    deleted_files = []
     
     try:
         print(f"[DELETE] Starting deletion for data_id={data_id}")
         
-        # ========== Step 1: Milvus에서 청크 삭제 ==========
+        # ========== Step 1: Milvus 청크 삭제 ==========
         from app.services.milvus_store_v2 import MilvusStoreV2
+        from app.services.embedding_model import get_sentence_embedding_dimension
         
-        mvs = MilvusStoreV2()
-        collection_name = os.getenv("MILVUS_COLLECTION_NAME", "rag_chunks_v2")
+        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
         
-        print(f"[DELETE] Deleting chunks from Milvus: {data_id}")
-        deleted_chunks = mvs.delete_by_doc_id(collection_name, data_id)
-        print(f"[DELETE] ✅ Deleted {deleted_chunks} chunks from Milvus")
+        deleted_chunks = mvs._delete_by_doc_id(data_id)
+        print(f"[DELETE] Deleted {deleted_chunks} chunks from Milvus")
         
-        # ========== Step 2: MinIO에서 파일 삭제 (옵션) ==========
+        # ========== Step 2: MinIO 파일 삭제 (옵션) ==========
+        deleted_files = []
+        
         if delete_from_minio:
             from app.services.minio_store import MinIOStore
             
             minio = MinIOStore()
             
-            # PDF 파일 삭제
-            pdf_key = f"uploaded/{data_id}.pdf"
-            if minio.exists(pdf_key):
-                minio.delete(pdf_key)
-                deleted_files.append(pdf_key)
-                print(f"[DELETE] ✅ Deleted PDF: {pdf_key}")
+            # 메타데이터 조회
+            meta = db.get_file_by_id(data_id)
             
-            # 원본 파일들 삭제 (uploaded/originals/{data_id}/ 폴더)
-            try:
-                originals_prefix = f"uploaded/originals/{data_id}/"
-                files = minio.list_objects(prefix=originals_prefix)
-                for file_key in files:
-                    minio.delete(file_key)
-                    deleted_files.append(file_key)
-                print(f"[DELETE] ✅ Deleted {len(files)} original files")
-            except Exception as e:
-                print(f"[DELETE] ⚠️  Failed to delete originals: {e}")
-            
-            # 해시 플래그 삭제
-            try:
-                hash_key = f"uploaded/__hash__/{data_id}.flag"
-                if minio.exists(hash_key):
-                    minio.delete(hash_key)
-                    deleted_files.append(hash_key)
-            except:
-                pass
-            
-            # 메타 파일 삭제
-            try:
-                meta_key = f"uploaded/__meta__/{data_id}.json"
-                if minio.exists(meta_key):
-                    minio.delete(meta_key)
-                    deleted_files.append(meta_key)
-            except:
-                pass
+            if meta:
+                pdf_key = meta.get('minio_pdf_key')
+                original_key = meta.get('minio_original_key')
+                
+                # PDF 삭제
+                if pdf_key:
+                    try:
+                        minio.delete_file(pdf_key)
+                        deleted_files.append(pdf_key)
+                        print(f"[DELETE] Deleted PDF: {pdf_key}")
+                    except Exception as e:
+                        print(f"[DELETE] Failed to delete PDF: {e}")
+                
+                # 원본 파일 삭제
+                if original_key and original_key != pdf_key:
+                    try:
+                        minio.delete_file(original_key)
+                        deleted_files.append(original_key)
+                        print(f"[DELETE] Deleted original: {original_key}")
+                    except Exception as e:
+                        print(f"[DELETE] Failed to delete original: {e}")
         
-        # ========== Step 3: DB 상태 업데이트 ==========
-        print(f"[DELETE] Updating DB status")
-        
-        # osk_data 테이블의 del_yn을 'Y'로 설정
+        # ========== Step 3: DB 업데이트 ==========
         sql = """
-        UPDATE osk_data
+        UPDATE data_master
         SET del_yn = 'Y',
-            del_dt = SYSDATETIME,
-            del_nm = 'AI_SYSTEM',
+            del_dt = SYS_DATETIME,
             rag_index_status = 'deleted'
         WHERE data_id = ?
         """
@@ -639,7 +591,6 @@ async def process_delete_document(
             await send_webhook(callback_url, payload, SHARED_SECRET)
         
         raise
-
 
 
 # ==================== Routes ====================
@@ -694,6 +645,7 @@ async def manual_ocr_and_index(
 ):
     """
     자바 → AI 트리거 API (운영용) - manual-ocr-and-index
+    DB의 osk_ocr_data 테이블에서 OCR 텍스트를 가져와서 청킹/임베딩
     rag_yn: "N" (신규), "Y" (수정)
     """
     if not verify_internal_token(x_internal_token):
@@ -715,10 +667,10 @@ async def manual_ocr_and_index(
         status="accepted",
         job_id=job_id,
         data_id=request.data_id,
-        message=f"processing manual OCR (rag_yn={request.rag_yn}, simple chunker)"
+        message=f"processing manual OCR from DB (rag_yn={request.rag_yn}, simple chunker)"
     )
 
-# ==================== Routes (추가) ====================
+
 @router.delete("/delete/{data_id}", response_model=DeleteDocumentResponse)
 async def delete_document(
     data_id: str,
@@ -729,23 +681,6 @@ async def delete_document(
 ):
     """
     문서 완전 삭제 API (운영용)
-    
-    Parameters:
-    - data_id: 삭제할 문서 ID
-    - delete_from_minio: MinIO 파일도 삭제할지 여부 (기본: True)
-    - callback_url: 완료 시 호출할 Webhook URL
-    
-    삭제 내용:
-    1. Milvus: 해당 data_id의 모든 청크
-    2. MinIO: PDF 파일 및 원본 파일들 (옵션)
-    3. DB: del_yn = 'Y', rag_index_status = 'deleted'
-    
-    Example:
-    ```
-    DELETE /llama/java/delete/DOC001?delete_from_minio=true
-    Headers:
-      X-Internal-Token: {SECRET}
-    ```
     """
     if not verify_internal_token(x_internal_token):
         raise HTTPException(401, "Unauthorized - Invalid token")
@@ -794,24 +729,6 @@ async def delete_documents_batch(
 ):
     """
     여러 문서 일괄 삭제 API
-    
-    Parameters:
-    - data_ids: 삭제할 문서 ID 리스트
-    - delete_from_minio: MinIO 파일도 삭제할지 여부
-    - callback_url: 완료 시 호출할 Webhook URL
-    
-    Example:
-    ```
-    POST /llama/java/delete-batch
-    Headers:
-      X-Internal-Token: {SECRET}
-    Body:
-    {
-      "data_ids": ["DOC001", "DOC002", "DOC003"],
-      "delete_from_minio": true,
-      "callback_url": "https://java-server/webhook"
-    }
-    ```
     """
     if not verify_internal_token(x_internal_token):
         raise HTTPException(401, "Unauthorized - Invalid token")
@@ -837,6 +754,7 @@ async def delete_documents_batch(
         "data_ids": data_ids,
         "message": f"Batch deletion started for {len(data_ids)} documents"
     }
+
 
 @router.get("/status/{data_id}", response_model=StatusResponse)
 def get_status(data_id: str, x_internal_token: Optional[str] = Header(None)):
@@ -867,5 +785,6 @@ def health_check():
     return {
         "status": "ok", 
         "service": "java-router-production",
-        "chunker": "simple_proofreading_chunker"
+        "chunker": "simple_proofreading_chunker",
+        "manual_ocr": "DB-based (osk_ocr_data)"
     }
