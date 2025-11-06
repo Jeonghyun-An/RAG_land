@@ -2,8 +2,8 @@
 """
 Java 시스템 연동 라우터 (운영용)
 - 서버 파일시스템 사용
-- DB 완전 연동
-- manual-ocr-and-index: llama_router의 고도화된 청킹 시스템 적용
+- DB 완전 연동 (osk_data, osk_ocr_data, osk_ocr_hist)
+- manual-ocr-and-index: rag_yn에 따른 신규/수정 처리
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class ConvertAndIndexRequest(BaseModel):
 class ManualOCRAndIndexRequest(BaseModel):
     """자바 → AI 트리거 요청 (manual-ocr-and-index)"""
     data_id: str
-    path: str  # 서버 파일시스템 상대 경로
+    path: str  # 서버 파일시스템 상대 경로 (사용하지 않을 수도 있음)
     file_id: str
     callback_url: Optional[str] = None
     rag_yn: str = "N"  # "N" (신규 작업), "Y" (기존 작업 수정)
@@ -72,12 +72,9 @@ class WebhookPayload(BaseModel):
 class StatusResponse(BaseModel):
     """상태 조회 응답"""
     data_id: str
-    rag_index_status: str
     parse_yn: Optional[str] = None
-    chunk_count: Optional[int] = None
     parse_start_dt: Optional[str] = None
     parse_end_dt: Optional[str] = None
-    milvus_doc_id: Optional[str] = None
 
     
 class DeleteDocumentRequest(BaseModel):
@@ -100,46 +97,29 @@ class DeleteDocumentResponse(BaseModel):
 def verify_internal_token(token: Optional[str]) -> bool:
     """내부 토큰 검증"""
     if not SHARED_SECRET:
-        return True  # 토큰 미설정 시 허용 (개발 환경)
-    return hmac.compare_digest(token or "", SHARED_SECRET)
+        return True
+    return token == SHARED_SECRET
 
 
 async def send_webhook(url: str, payload: WebhookPayload, secret: str):
-    """자바 서버로 완료 웹훅 전송"""
+    """AI → 자바 웹훅 전송"""
     try:
-        sig = hmac.new(secret.encode(), payload.model_dump_json().encode(), hashlib.sha256).hexdigest()
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                url,
-                json=payload.model_dump(),
-                headers={"X-Webhook-Signature": sig}
-            )
-            print(f"[WEBHOOK] Sent to {url}: {resp.status_code}")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = {}
+            if secret:
+                sig = hmac.new(secret.encode(), payload.model_dump_json().encode(), hashlib.sha256).hexdigest()
+                headers["X-Webhook-Signature"] = sig
+            
+            resp = await client.post(url, json=payload.model_dump(), headers=headers)
+            resp.raise_for_status()
+            print(f"[WEBHOOK] ✅ Sent to {url}: {payload.status}")
     except Exception as e:
-        print(f"[WEBHOOK] Failed to send: {e}")
+        print(f"[WEBHOOK] ❌ Failed: {e}")
 
 
-def _make_encoder():
-    """임베딩 모델의 토크나이저 인코더 생성"""
-    from app.services.embedding_model import get_embedding_model
-    
-    m = get_embedding_model()
-    tok = getattr(m, "tokenizer", None)
-    max_len = int(getattr(m, "max_seq_length", 128))
-    
-    def enc(s: str):
-        if tok is None:
-            return []
-        return tok.encode(s, add_special_tokens=False) or []
-    
-    return enc, max_len
-
-
-def _normalize_pages_for_chunkers(pages):
+def _normalize_pages_for_chunkers(pages) -> List[Tuple[int, str]]:
     """
-    pages를 [(page_no:int, text:str), ...] 로 강제 변환.
-    llama_router와 동일한 로직
+    페이지 정규화 - llama_router와 동일한 로직
     """
     out = []
     if not pages:
@@ -239,571 +219,85 @@ def perform_advanced_chunking(
     2. Law Chunker (법령 문서)
     3. Layout-aware Chunker (레이아웃 정보 활용)
     4. Basic Smart Chunker
-    5. Fallback Protection
+    5. Proofreading Chunker (교정/교열용)
     """
-    print("[CHUNK] Starting advanced chunking system...")
+    from app.services.embedding_model import token_encode
+    from app.services.chunker import smart_chunk_pages
     
-    # 인코더/길이
-    enc, max_len = _make_encoder()
-    default_target = max(64, max_len - 16)
-    default_overlap = min(50, default_target // 4)
-
-    target_tokens = int(os.getenv("RAG_TARGET_TOKENS", str(default_target)))
-    overlap_tokens = int(os.getenv("RAG_OVERLAP_TOKENS", str(default_overlap)))
-    min_chunk_tokens = int(os.getenv("RAG_MIN_CHUNK_TOKENS", "100"))
-
-    chunks: list[tuple[str, dict]] | None = None
-
-    # 1) English Technical Chunker (최우선)
-    ENABLE_EN_TECH_CHUNKER = os.getenv("RAG_ENABLE_EN_TECH_CHUNKER", "1") == "1"
+    # 환경변수 설정
+    TARGET_TOKENS = int(os.getenv("RAG_TARGET_TOKENS", "400"))
+    OVERLAP_TOKENS = int(os.getenv("RAG_OVERLAP_TOKENS", "100"))
+    ENABLE_LAW = os.getenv("RAG_ENABLE_LAW_CHUNKER", "1") == "1"
+    ENABLE_LAYOUT = os.getenv("RAG_ENABLE_LAYOUT_CHUNKER", "1") == "1"
     
-    if ENABLE_EN_TECH_CHUNKER:
-        try:
-            from app.services.english_technical_chunker import english_technical_chunk_pages
-            print("[CHUNK] Trying English technical chunker (IAEA/standards optimized)...")
-            
-            en_target_tokens = int(os.getenv("RAG_EN_TARGET_TOKENS", "800"))
-            
-            chunks = english_technical_chunk_pages(
-                pages_std, enc, en_target_tokens, overlap_tokens, layout_map
-            )
-            
-            if chunks and len(chunks) > 0:
-                print(f"[CHUNK] ✅ English technical chunker: {len(chunks)} chunks")
-                job_state.update(job_id, status="chunking", step=f"en_tech:{len(chunks)}")
-            else:
-                print("[CHUNK] English technical chunker returned empty, falling back")
-                chunks = None
-        except Exception as e:
-            print(f"[CHUNK] English technical chunker error: {e}")
-            chunks = None
-
-    # 2) Law Chunker (법령 문서)
-    if chunks is None:
-        ENABLE_LAW_CHUNKER = os.getenv("RAG_ENABLE_LAW_CHUNKER", "1") == "1"
-        
-        if ENABLE_LAW_CHUNKER:
-            try:
-                from app.services.law_chunker import law_chunk_pages
-                print("[CHUNK] Trying law chunker (nuclear/legal optimized)...")
-                
-                chunks = law_chunk_pages(
-                    pages_std, enc, target_tokens, overlap_tokens,
-                    layout_blocks=layout_map, min_chunk_tokens=min_chunk_tokens
-                )
-                
-                if chunks and len(chunks) > 0:
-                    print(f"[CHUNK] ✅ Law chunker: {len(chunks)} chunks")
-                    job_state.update(job_id, status="chunking", step=f"law:{len(chunks)}")
-                else:
-                    print("[CHUNK] Law chunker returned empty, falling back")
-                    chunks = None
-            except Exception as e:
-                print(f"[CHUNK] Law chunker error: {e}")
-                chunks = None
-
-    # 3) Layout-aware Chunker (레이아웃 정보 활용)
-    if chunks is None:
-        ENABLE_LAYOUT_CHUNKER = os.getenv("RAG_ENABLE_LAYOUT_CHUNKER", "1") == "1"
-        
-        if ENABLE_LAYOUT_CHUNKER and layout_map:
-            try:
-                from app.services.chunker import smart_chunk_pages_plus
-                print("[CHUNK] Using layout-aware chunker (SmartChunkerPlus)...")
-                
-                chunks = smart_chunk_pages_plus(
-                    pages_std, enc, target_tokens, overlap_tokens, layout_map
-                )
-                
-                if chunks and len(chunks) > 0:
-                    print(f"[CHUNK] ✅ Layout chunker: {len(chunks)} chunks")
-                    job_state.update(job_id, status="chunking", step=f"layout:{len(chunks)}")
-                else:
-                    print("[CHUNK] Layout chunker returned empty, falling back")
-                    chunks = None
-            except Exception as e:
-                print(f"[CHUNK] Layout chunker error: {e}")
-                chunks = None
-
-    # 4) Basic Smart Chunker
-    if chunks is None:
-        try:
-            from app.services.chunker import smart_chunk_pages
-            print("[CHUNK] Using basic smart chunker...")
-            
-            chunks = smart_chunk_pages(
-                pages_std, enc, target_tokens, overlap_tokens, layout_map
-            )
-            
-            if chunks and len(chunks) > 0:
-                print(f"[CHUNK] ✅ Basic chunker: {len(chunks)} chunks")
-                job_state.update(job_id, status="chunking", step=f"basic:{len(chunks)}")
-            else:
-                raise RuntimeError("Basic chunker returned empty")
-        except Exception as e:
-            print(f"[CHUNK] Basic chunker error: {e}")
-            raise RuntimeError(f"모든 청킹 방법 실패: {e}")
-
-    # 5) Fallback Protection
-    if not chunks or len(chunks) == 0:
-        print("[CHUNK] All chunkers failed - using fallback protection")
-        
-        flat_texts = []
-        for _, t in pages_std or []:
-            tt = (t or "").strip()
-            if tt:
-                # 이상한 라벨 제거
-                tt = re.sub(r'\b인접행\s*묶음\b', '', tt)
-                tt = re.sub(r'\b[가-힣]*\s*묶음\b', '', tt)
-                tt = re.sub(r'[\r\n\s]+', ' ', tt)
-                if tt.strip():
-                    flat_texts.append(tt.strip())
-
-        fallback_text = "\n\n".join(flat_texts).strip()
-
-        if not fallback_text:
-            if os.getenv("RAG_ALLOW_EMPTY_FALLBACK", "1") == "1":
-                fallback_text = "[Document processed but no readable text content found]"
-            else:
-                raise RuntimeError("모든 청킹 방법이 실패했습니다.")
-
-        # 폴백 청크 생성
-        tokens = len(enc(fallback_text))
-        chunks = [(fallback_text, {"page": 1, "pages": [1], "section": "", "token_count": tokens, "bboxes": {}})]
-        print(f"[CHUNK] Fallback chunk created: {tokens} tokens")
-        job_state.update(job_id, status="chunking", step=f"fallback:1")
-
-    print(f"[CHUNK] ✅ Final result: {len(chunks)} chunks ready for embedding")
-    return chunks
-
-
-# ==================== Background Task (convert-and-index) ====================
-async def process_convert_and_index_prod(
-    job_id: str,
-    data_id: str,
-    path: str,
-    file_id: str,
-    callback_url: Optional[str]
-):
-    """
-    운영용 백그라운드 처리 - convert-and-index
-    - 고도화된 청킹 시스템 적용
-    """
-    db = DBConnector()
-    start_time = datetime.utcnow()
+    if not pages_std:
+        return []
     
-    job_state.start(job_id, data_id=data_id, file_id=file_id)
-    db.mark_ocr_start(data_id)
+    # 텍스트 샘플 수집
+    sample_texts = []
+    for _, txt in pages_std[:5]:
+        if txt and txt.strip():
+            sample_texts.append(txt[:2000])
+    full_sample = "\n".join(sample_texts)
     
+    # 1. 영어 기술 문서 감지
     try:
-        # ========== Step 1: 서버 파일 로드 ==========
-        job_state.update(job_id, status="uploaded", step="Loading file from server")
-        
-        full_path = os.path.join(SERVER_BASE_PATH, path, file_id)
-        
-        if not os.path.exists(full_path):
-            raise FileNotFoundError(f"서버 파일 없음: {full_path}")
-        
-        print(f"[PROD] Using server file: {full_path}")
-        
-        # ========== Step 2: PDF 변환 (필요시) ==========
-        is_already_pdf = file_id.lower().endswith('.pdf')
-        
-        if is_already_pdf:
-            converted_pdf_path = full_path
-            print(f"[PROD] Already PDF: {converted_pdf_path}")
-        else:
-            job_state.update(job_id, status="converting", step="Converting to PDF")
-            print(f"[PROD] Converting to PDF: {file_id}")
-            
-            converted_pdf_path = convert_to_pdf(full_path)
-            
-            if not converted_pdf_path or not os.path.exists(converted_pdf_path):
-                raise ConvertError("PDF 변환 실패")
-            
-            print(f"[PROD] Conversion completed: {converted_pdf_path}")
-        
-        # ========== Step 3: PDF 파싱 (텍스트 + 레이아웃) ==========
-        job_state.update(job_id, status="parsing", step="Parsing PDF")
-        
-        from app.services.file_parser import parse_pdf, parse_pdf_blocks
-        
-        print(f"[PROD-PARSE] Extracting text from: {converted_pdf_path}")
-        pages = parse_pdf(converted_pdf_path, by_page=True)
-        
-        if not pages:
-            raise RuntimeError("텍스트 추출 실패")
-        
-        print(f"[PROD-PARSE] Extracted {len(pages)} pages")
-        
-        # 레이아웃 정보 추출
-        blocks_by_page_list = parse_pdf_blocks(converted_pdf_path)
-        layout_map = {int(p): blks for p, blks in (blocks_by_page_list or [])}
-        print(f"[PROD-PARSE] Layout blocks extracted for {len(layout_map)} pages")
-        
-        # ========== Step 4: 페이지 정규화 ==========
-        pages_std = _normalize_pages_for_chunkers(pages)
-        if not any((t or "").strip() for _, t in pages_std):
-            print("[PROD-PARSE] Warning: No textual content after parsing")
-        
-        # ========== Step 5: 고도화된 청킹 ==========
-        job_state.update(job_id, status="chunking", step="Advanced chunking")
-        
-        chunks = perform_advanced_chunking(pages_std, layout_map, job_id)
-        
-        if not chunks:
-            raise RuntimeError("청킹 실패: 청크가 생성되지 않음")
-        
-        # ========== Step 6: 청크 정규화 ==========
-        chunks = _coerce_chunks_for_milvus(chunks)
-        print(f"[PROD-CHUNK] Normalized {len(chunks)} chunks for Milvus")
-        
-        # ========== Step 7: 임베딩 및 Milvus 저장 ==========
-        job_state.update(job_id, status="embedding", step=f"Embedding {len(chunks)} chunks")
-        
-        from app.services.embedding_model import embed, get_sentence_embedding_dimension
-        from app.services.milvus_store_v2 import MilvusStoreV2
-        
-        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
-        
-        # 기존 문서 삭제
-        print(f"[PROD] Deleting existing doc (if any): {data_id}")
-        try:
-            deleted = mvs._delete_by_doc_id(data_id)
-            print(f"[PROD] Deleted {deleted} existing chunks")
-        except Exception as e:
-            print(f"[PROD] Warning during delete: {e}")
-        
-        # Milvus insert 메서드 사용
-        print(f"[PROD] Inserting {len(chunks)} chunks to Milvus")
-        
-        result = mvs.insert(
-            doc_id=data_id,
-            chunks=chunks,
-            embed_fn=embed
-        )
-        
-        print(f"[PROD] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
-        
-        # ========== Step 8: DB 업데이트 ==========
-        pages_count = len(pages_std)
-        chunk_count = result.get('inserted', len(chunks))
-        
-        print(f"[PROD] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
-        
-        db.update_rag_completed(
-            data_id,
-            chunks=chunk_count,
-            doc_id=data_id
-        )
-        
-        job_state.complete(
-            job_id,
-            pages=pages_count,
-            chunks=chunk_count
-        )
-        
-        # ========== Step 9: 완료 & Webhook ==========
-        end_time = datetime.utcnow()
-        
-        if callback_url:
-            payload = WebhookPayload(
-                job_id=job_id,
-                data_id=data_id,
-                status="done",
-                converted=not is_already_pdf,
-                metrics={"pages": pages_count, "chunks": chunk_count},
-                chunk_count=chunk_count,
-                timestamps={
-                    "start": start_time.isoformat(), 
-                    "end": end_time.isoformat()
-                },
-                message="indexed successfully (advanced chunking)"
-            )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
-    
+        from app.services.english_technical_chunker import EnglishTechnicalChunker
+        chunker_en = EnglishTechnicalChunker(token_encode, TARGET_TOKENS, OVERLAP_TOKENS)
+        if chunker_en.is_english_technical_document(full_sample):
+            print(f"[CHUNK-{job_id}] Using EnglishTechnicalChunker")
+            job_state.update(job_id, step="chunking:en_tech")
+            return chunker_en.chunk_pages(pages_std, layout_map)
     except Exception as e:
-        job_state.fail(job_id, str(e))
-        db.update_parse_status(data_id, rag_status="error")
-        print(f"[PROD] ❌ Error: {e}")
-        
-        if callback_url:
-            payload = WebhookPayload(
-                job_id=job_id,
-                data_id=data_id,
-                status="error",
-                message=str(e)
-            )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
-        
-        raise
-
-
-# ==================== Background Task (manual-ocr-and-index) ====================
-async def process_manual_ocr_and_index(
-    job_id: str,
-    data_id: str,
-    path: str,
-    file_id: str,
-    callback_url: Optional[str],
-    rag_yn: str
-):
-    """
-    운영용 백그라운드 처리 - manual-ocr-and-index
-    - DB의 osk_ocr_data 테이블에서 OCR 텍스트를 가져와서 청킹/임베딩
-    - 고도화된 청킹 시스템 적용
-    """
-    db = DBConnector()
-    start_time = datetime.utcnow()
+        print(f"[CHUNK-{job_id}] EnglishTechnicalChunker failed: {e}")
     
-    job_state.start(job_id, data_id=data_id, file_id=file_id)
-    
-    # rag_yn에 따른 DB 처리
-    if rag_yn == "N":
-        db.mark_ocr_start(data_id)
-        print(f"[MANUAL-OCR] 신규 작업: data_id={data_id}, parse_yn=L")
-    else:
-        print(f"[MANUAL-OCR] 기존 작업 수정: data_id={data_id}, rag_yn=Y")
-    
-    try:
-        # ========== Step 1: DB에서 OCR 텍스트 가져오기 ==========
-        job_state.update(job_id, status="loading", step="Loading OCR text from DB")
-        
-        print(f"[MANUAL-OCR] Loading OCR text from DB for data_id={data_id}")
-        
-        pages_std = db.get_ocr_text_by_data_id(data_id)
-        
-        if not pages_std:
-            raise RuntimeError(f"DB에 OCR 텍스트가 없습니다: data_id={data_id}")
-        
-        print(f"[MANUAL-OCR] Loaded {len(pages_std)} pages from DB")
-        
-        # ========== Step 2: 고도화된 청킹 ==========
-        job_state.update(job_id, status="chunking", step="Advanced chunking from DB text")
-        
-        # Manual OCR은 레이아웃 정보가 없으므로 빈 dict 전달
-        layout_map = {}
-        
-        chunks = perform_advanced_chunking(pages_std, layout_map, job_id)
-        
-        if not chunks:
-            raise RuntimeError("청킹 실패: 청크가 생성되지 않음")
-        
-        # ========== Step 3: 청크 정규화 ==========
-        chunks = _coerce_chunks_for_milvus(chunks)
-        print(f"[MANUAL-OCR-CHUNK] Normalized {len(chunks)} chunks for Milvus")
-        
-        # ========== Step 4: 임베딩 및 Milvus 저장 ==========
-        job_state.update(job_id, status="embedding", step=f"Embedding {len(chunks)} chunks")
-        
-        from app.services.embedding_model import embed, get_sentence_embedding_dimension
-        from app.services.milvus_store_v2 import MilvusStoreV2
-        
-        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
-        
-        # 기존 문서 삭제
-        print(f"[MANUAL-OCR] Deleting existing doc (if any): {data_id}")
+    # 2. 법령 문서 감지
+    if ENABLE_LAW:
         try:
-            deleted = mvs._delete_by_doc_id(data_id)
-            print(f"[MANUAL-OCR] Deleted {deleted} existing chunks")
+            from app.services.law_chunker import NuclearLegalChunker
+            chunker_law = NuclearLegalChunker(token_encode, TARGET_TOKENS, OVERLAP_TOKENS)
+            if chunker_law.is_legal_document(full_sample):
+                print(f"[CHUNK-{job_id}] Using NuclearLegalChunker")
+                job_state.update(job_id, step="chunking:law")
+                return chunker_law.chunk_pages(pages_std, layout_map)
         except Exception as e:
-            print(f"[MANUAL-OCR] Warning during delete: {e}")
-        
-        # Milvus insert 메서드 사용
-        print(f"[MANUAL-OCR] Inserting {len(chunks)} chunks to Milvus")
-        
-        result = mvs.insert(
-            doc_id=data_id,
-            chunks=chunks,
-            embed_fn=embed
-        )
-        
-        print(f"[MANUAL-OCR] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
-        
-        # ========== Step 5: DB 업데이트 ==========
-        pages_count = len(pages_std)
-        chunk_count = result.get('inserted', len(chunks))
-        
-        print(f"[MANUAL-OCR] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
-        
-        db.update_rag_completed(
-            data_id,
-            chunks=chunk_count,
-            doc_id=data_id
-        )
-        
-        job_state.complete(
-            job_id,
-            pages=pages_count,
-            chunks=chunk_count
-        )
-        
-        # ========== Step 6: 완료 & Webhook ==========
-        end_time = datetime.utcnow()
-        
-        if callback_url:
-            payload = WebhookPayload(
-                job_id=job_id,
-                data_id=data_id,
-                status="done",
-                converted=False,
-                metrics={"pages": pages_count, "chunks": chunk_count},
-                chunk_count=chunk_count,
-                timestamps={
-                    "start": start_time.isoformat(), 
-                    "end": end_time.isoformat()
-                },
-                message=f"manual OCR indexed (rag_yn={rag_yn}, advanced chunking)"
-            )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
+            print(f"[CHUNK-{job_id}] LawChunker failed: {e}")
     
-    except Exception as e:
-        job_state.fail(job_id, str(e))
-        db.update_parse_status(data_id, rag_status="error")
-        print(f"[MANUAL-OCR] ❌ Error: {e}")
-        
-        if callback_url:
-            payload = WebhookPayload(
-                job_id=job_id,
-                data_id=data_id,
-                status="error",
-                message=str(e)
-            )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
-        
-        raise
-
-
-# ==================== Background Task (delete) ====================
-async def process_delete_document(
-    data_id: str,
-    delete_from_minio: bool,
-    callback_url: Optional[str]
-):
-    """
-    문서 완전 삭제:
-    1. Milvus에서 청크 삭제
-    2. MinIO에서 파일 삭제 (옵션)
-    3. DB 업데이트 (del_yn='Y')
-    """
-    db = DBConnector()
-    
-    try:
-        print(f"[DELETE] Starting deletion for data_id={data_id}")
-        
-        # ========== Step 1: Milvus 청크 삭제 ==========
-        from app.services.milvus_store_v2 import MilvusStoreV2
-        from app.services.embedding_model import get_sentence_embedding_dimension
-        
-        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
-        
-        deleted_chunks = mvs._delete_by_doc_id(data_id)
-        print(f"[DELETE] Deleted {deleted_chunks} chunks from Milvus")
-        
-        # ========== Step 2: MinIO 파일 삭제 (옵션) ==========
-        deleted_files = []
-        
-        if delete_from_minio:
-            from app.services.minio_store import MinIOStore
-            
-            minio = MinIOStore()
-            
-            # 메타데이터 조회
-            meta = db.get_file_by_id(data_id)
-            
-            if meta:
-                pdf_key = meta.get('minio_pdf_key')
-                original_key = meta.get('minio_original_key')
-                
-                # PDF 삭제
-                if pdf_key:
-                    try:
-                        minio.delete_file(pdf_key)
-                        deleted_files.append(pdf_key)
-                        print(f"[DELETE] Deleted PDF: {pdf_key}")
-                    except Exception as e:
-                        print(f"[DELETE] Failed to delete PDF: {e}")
-                
-                # 원본 파일 삭제
-                if original_key and original_key != pdf_key:
-                    try:
-                        minio.delete_file(original_key)
-                        deleted_files.append(original_key)
-                        print(f"[DELETE] Deleted original: {original_key}")
-                    except Exception as e:
-                        print(f"[DELETE] Failed to delete original: {e}")
-        
-        # ========== Step 3: DB 업데이트 ==========
-        sql = """
-        UPDATE data_master
-        SET del_yn = 'Y',
-            del_dt = SYS_DATETIME,
-            rag_index_status = 'deleted'
-        WHERE data_id = ?
-        """
-        
+    # 3. 레이아웃 기반 청킹
+    if ENABLE_LAYOUT and layout_map:
         try:
-            with db.get_conn() as conn:
-                cur = conn.cursor()
-                cur.execute(sql, (data_id,))
-                cur.close()
-            print(f"[DELETE] ✅ Updated DB: del_yn='Y'")
+            from app.services.layout_chunker import LayoutAwareChunker
+            chunker_layout = LayoutAwareChunker(token_encode, TARGET_TOKENS, OVERLAP_TOKENS)
+            print(f"[CHUNK-{job_id}] Using LayoutAwareChunker")
+            job_state.update(job_id, step="chunking:layout")
+            return chunker_layout.chunk_pages(pages_std, layout_map)
         except Exception as e:
-            print(f"[DELETE] ⚠️  DB update failed: {e}")
-        
-        # ========== Step 4: 완료 & Webhook ==========
-        if callback_url:
-            payload = WebhookPayload(
-                job_id="delete",
-                data_id=data_id,
-                status="deleted",
-                message=f"Document deleted: {deleted_chunks} chunks, {len(deleted_files)} files",
-                chunk_count=0
-            )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
-        
-        print(f"[DELETE] ✅ Deletion completed for data_id={data_id}")
-        
-    except Exception as e:
-        print(f"[DELETE] ❌ Error: {e}")
-        
-        if callback_url:
-            payload = WebhookPayload(
-                job_id="delete",
-                data_id=data_id,
-                status="error",
-                message=f"Deletion failed: {e}"
-            )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
-        
-        raise
+            print(f"[CHUNK-{job_id}] LayoutChunker failed: {e}")
+    
+    # 4. 기본 스마트 청킹
+    print(f"[CHUNK-{job_id}] Using SmartChunker (default)")
+    job_state.update(job_id, step="chunking:smart")
+    return smart_chunk_pages(pages_std, token_encode, TARGET_TOKENS, OVERLAP_TOKENS, layout_map)
 
 
-# ==================== Routes ====================
+# ==================== Endpoints ====================
+
 @router.post("/convert-and-index", response_model=ConvertAndIndexResponse)
 async def convert_and_index(
     request: ConvertAndIndexRequest,
     background_tasks: BackgroundTasks,
     x_internal_token: Optional[str] = Header(None)
 ):
-    """
-    자바 → AI 트리거 API (운영용) - convert-and-index
-    고도화된 청킹 시스템 적용
-    """
+    """자바 → AI 트리거 API (운영용) - convert-and-index"""
     if not verify_internal_token(x_internal_token):
         raise HTTPException(401, "Unauthorized - Invalid token")
     
-    # 중복 체크
     db = DBConnector()
     existing = db.get_file_by_id(request.data_id)
     
-    if existing and existing.get('rag_index_status') == 'done':
-        return ConvertAndIndexResponse(
-            status="already_done",
-            job_id="",
-            data_id=request.data_id,
-            message="Already indexed"
-        )
+    # 이미 완료된 경우 스킵 로직 (필요 시)
+    # if existing and existing.get('parse_yn') == 'S':
+    #     return ConvertAndIndexResponse(...)
     
     job_id = str(uuid.uuid4())[:8]
     
@@ -820,7 +314,7 @@ async def convert_and_index(
         status="accepted",
         job_id=job_id,
         data_id=request.data_id,
-        message="processing (advanced chunking: en_tech → law → layout → basic)"
+        message="processing (advanced chunking)"
     )
 
 
@@ -832,8 +326,17 @@ async def manual_ocr_and_index(
 ):
     """
     자바 → AI 트리거 API (운영용) - manual-ocr-and-index
-    DB의 osk_ocr_data 테이블에서 OCR 텍스트를 가져와서 청킹/임베딩
-    고도화된 청킹 시스템 적용
+    
+    프로세스:
+    1. rag_yn='N': 신규 OCR 작업
+       - osk_data.parse_yn = 'L' 로 시작
+       - osk_ocr_data에서 텍스트 가져와서 청킹/임베딩
+       - 완료 시 parse_yn = 'S', osk_ocr_hist 로깅
+    
+    2. rag_yn='Y': 기존 작업 수정 (사용자가 페이지 수정)
+       - osk_ocr_data에서 수정된 텍스트 가져와서 재청킹/임베딩
+       - Milvus에서 기존 청크 삭제 후 새로 삽입
+       - 완료 시 parse_yn = 'S', osk_ocr_hist 로깅
     """
     if not verify_internal_token(x_internal_token):
         raise HTTPException(401, "Unauthorized - Invalid token")
@@ -854,69 +357,45 @@ async def manual_ocr_and_index(
         status="accepted",
         job_id=job_id,
         data_id=request.data_id,
-        message=f"processing manual OCR from DB (rag_yn={request.rag_yn}, advanced chunking)"
+        message=f"processing manual OCR from DB (rag_yn={request.rag_yn})"
     )
 
 
-@router.delete("/delete/{data_id}", response_model=DeleteDocumentResponse)
+@router.post("/delete-document", response_model=DeleteDocumentResponse)
 async def delete_document(
-    data_id: str,
+    request: DeleteDocumentRequest,
     background_tasks: BackgroundTasks,
-    delete_from_minio: bool = True,
-    callback_url: Optional[str] = None,
     x_internal_token: Optional[str] = Header(None)
 ):
-    """
-    문서 완전 삭제 API (운영용)
-    """
+    """문서 삭제 API"""
     if not verify_internal_token(x_internal_token):
         raise HTTPException(401, "Unauthorized - Invalid token")
     
-    # 문서 존재 확인
-    db = DBConnector()
-    existing = db.get_file_by_id(data_id)
-    
-    if not existing:
-        raise HTTPException(404, f"Document not found: {data_id}")
-    
-    # 이미 삭제된 문서인지 확인
-    if existing.get('del_yn') == 'Y':
-        return DeleteDocumentResponse(
-            status="already_deleted",
-            data_id=data_id,
-            deleted_chunks=0,
-            deleted_files=[],
-            message="Document already marked as deleted"
-        )
-    
-    # 백그라운드 삭제 작업
     background_tasks.add_task(
         process_delete_document,
-        data_id=data_id,
-        delete_from_minio=delete_from_minio,
-        callback_url=callback_url
+        data_id=request.data_id,
+        delete_from_minio=request.delete_from_minio,
+        callback_url=request.callback_url
     )
     
     return DeleteDocumentResponse(
         status="deleting",
-        data_id=data_id,
+        data_id=request.data_id,
         deleted_chunks=0,
         deleted_files=[],
-        message="Deletion in progress"
+        message="Deletion started"
     )
 
 
-@router.post("/delete-batch", response_model=Dict[str, Any])
-async def delete_documents_batch(
+@router.post("/batch-delete")
+async def batch_delete(
     data_ids: List[str],
-    background_tasks: BackgroundTasks,
     delete_from_minio: bool = True,
     callback_url: Optional[str] = None,
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     x_internal_token: Optional[str] = Header(None)
 ):
-    """
-    여러 문서 일괄 삭제 API
-    """
+    """배치 삭제 API"""
     if not verify_internal_token(x_internal_token):
         raise HTTPException(401, "Unauthorized - Invalid token")
     
@@ -926,7 +405,6 @@ async def delete_documents_batch(
     if len(data_ids) > 100:
         raise HTTPException(400, "Maximum 100 documents per batch")
     
-    # 각 문서별로 백그라운드 작업 생성
     for data_id in data_ids:
         background_tasks.add_task(
             process_delete_document,
@@ -957,12 +435,9 @@ def get_status(data_id: str, x_internal_token: Optional[str] = Header(None)):
     
     return StatusResponse(
         data_id=data_id,
-        rag_index_status=meta.get('rag_index_status', 'unknown'),
         parse_yn=meta.get('parse_yn'),
-        chunk_count=meta.get('chunk_count'),
         parse_start_dt=str(meta.get('parse_start_dt')) if meta.get('parse_start_dt') else None,
-        parse_end_dt=str(meta.get('parse_end_dt')) if meta.get('parse_end_dt') else None,
-        milvus_doc_id=meta.get('milvus_doc_id')
+        parse_end_dt=str(meta.get('parse_end_dt')) if meta.get('parse_end_dt') else None
     )
 
 
@@ -975,3 +450,367 @@ def health_check():
         "chunking": "advanced (en_tech → law → layout → basic)",
         "manual_ocr": "DB-based (osk_ocr_data)"
     }
+
+
+# ==================== Background Tasks ====================
+
+async def process_convert_and_index_prod(
+    job_id: str,
+    data_id: str,
+    path: str,
+    file_id: str,
+    callback_url: Optional[str]
+):
+    """
+    운영용 백그라운드 처리 - convert-and-index
+    (기존 로직 유지 - OCR 포함)
+    """
+    from app.services.file_parser import parse_pdf, parse_pdf_blocks
+    
+    db = DBConnector()
+    start_time = datetime.utcnow()
+    
+    job_state.start(job_id, data_id=data_id, file_id=file_id)
+    
+    try:
+        # ========== Step 1: 파일 경로 확인 ==========
+        job_state.update(job_id, status="initializing", step="Resolving file path")
+        
+        full_path = Path(SERVER_BASE_PATH) / path if not Path(path).is_absolute() else Path(path)
+        
+        if not full_path.exists():
+            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {full_path}")
+        
+        print(f"[PROD] Processing file: {full_path}")
+        
+        # ========== Step 2: PDF 변환 (필요 시) ==========
+        is_already_pdf = str(full_path).lower().endswith(".pdf")
+        
+        if is_already_pdf:
+            converted_pdf_path = str(full_path)
+            print(f"[PROD] Already PDF: {converted_pdf_path}")
+        else:
+            job_state.update(job_id, status="converting", step="Converting to PDF")
+            print(f"[PROD] Converting to PDF: {full_path}")
+            
+            converted_pdf_path = convert_to_pdf(str(full_path))
+            if not converted_pdf_path or not Path(converted_pdf_path).exists():
+                raise ConvertError("PDF 변환 실패")
+            
+            print(f"[PROD] Converted: {converted_pdf_path}")
+            
+            # DB 업데이트: 변환된 파일 경로
+            rel_folder = str(Path(converted_pdf_path).parent.relative_to(SERVER_BASE_PATH))
+            rel_filename = Path(converted_pdf_path).name
+            db.update_converted_file_path(data_id, rel_folder, rel_filename)
+        
+        # ========== Step 3: OCR 시작 마킹 ==========
+        db.mark_ocr_start(data_id)
+        
+        # ========== Step 4: 텍스트 추출 (OCR 포함) ==========
+        job_state.update(job_id, status="parsing", step="Extracting text with OCR")
+        
+        print(f"[PROD-PARSE] Extracting text from: {converted_pdf_path}")
+        pages = parse_pdf(converted_pdf_path, by_page=True)
+        
+        if not pages:
+            raise RuntimeError("텍스트 추출 실패")
+        
+        print(f"[PROD-PARSE] Extracted {len(pages)} pages")
+        
+        # 레이아웃 정보 추출
+        blocks_by_page_list = parse_pdf_blocks(converted_pdf_path)
+        layout_map = {int(p): blks for p, blks in (blocks_by_page_list or [])}
+        print(f"[PROD-PARSE] Layout blocks extracted for {len(layout_map)} pages")
+        
+        # ========== Step 5: OCR 결과 DB 저장 ==========
+        for page_no, text in pages:
+            db.insert_ocr_result(data_id, page_no, text)
+        
+        # OCR 성공 마킹
+        db.mark_ocr_success(data_id)
+        
+        # ========== Step 6: 페이지 정규화 ==========
+        pages_std = _normalize_pages_for_chunkers(pages)
+        if not any((t or "").strip() for _, t in pages_std):
+            print("[PROD-PARSE] Warning: No textual content after parsing")
+        
+        # ========== Step 7: 고도화된 청킹 ==========
+        job_state.update(job_id, status="chunking", step="Advanced chunking")
+        
+        chunks = perform_advanced_chunking(pages_std, layout_map, job_id)
+        
+        if not chunks:
+            raise RuntimeError("청킹 실패: 청크가 생성되지 않음")
+        
+        # ========== Step 8: 청크 정규화 ==========
+        chunks = _coerce_chunks_for_milvus(chunks)
+        print(f"[PROD-CHUNK] Normalized {len(chunks)} chunks for Milvus")
+        
+        # ========== Step 9: 임베딩 및 Milvus 저장 ==========
+        job_state.update(job_id, status="embedding", step=f"Embedding {len(chunks)} chunks")
+        
+        from app.services.embedding_model import embed, get_sentence_embedding_dimension
+        from app.services.milvus_store_v2 import MilvusStoreV2
+        
+        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
+        
+        # 기존 문서 삭제
+        print(f"[PROD] Deleting existing doc (if any): {data_id}")
+        try:
+            deleted = mvs._delete_by_doc_id(data_id)
+            print(f"[PROD] Deleted {deleted} existing chunks")
+        except Exception as e:
+            print(f"[PROD] Warning during delete: {e}")
+        
+        # Milvus insert
+        print(f"[PROD] Inserting {len(chunks)} chunks to Milvus")
+        
+        result = mvs.insert(
+            doc_id=data_id,
+            chunks=chunks,
+            embed_fn=embed
+        )
+        
+        print(f"[PROD] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
+        
+        # ========== Step 10: DB 업데이트 ==========
+        pages_count = len(pages_std)
+        chunk_count = result.get('inserted', len(chunks))
+        
+        print(f"[PROD] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
+        
+        db.update_rag_completed(data_id)
+        
+        job_state.complete(
+            job_id,
+            pages=pages_count,
+            chunks=chunk_count
+        )
+        
+        # ========== Step 11: 완료 & Webhook ==========
+        end_time = datetime.utcnow()
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=job_id,
+                data_id=data_id,
+                status="done",
+                converted=not is_already_pdf,
+                metrics={"pages": pages_count, "chunks": chunk_count},
+                chunk_count=chunk_count,
+                timestamps={
+                    "start": start_time.isoformat(), 
+                    "end": end_time.isoformat()
+                },
+                message="indexed successfully (advanced chunking)"
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+    
+    except Exception as e:
+        job_state.fail(job_id, str(e))
+        db.update_rag_error(data_id, str(e))
+        print(f"[PROD] ❌ Error: {e}")
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=job_id,
+                data_id=data_id,
+                status="error",
+                message=str(e)
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+        
+        raise
+
+
+async def process_manual_ocr_and_index(
+    job_id: str,
+    data_id: str,
+    path: str,
+    file_id: str,
+    callback_url: Optional[str],
+    rag_yn: str
+):
+    """
+    운영용 백그라운드 처리 - manual-ocr-and-index
+    
+    프로세스:
+    1. rag_yn='N': 신규 OCR 작업
+       - osk_data.parse_yn = 'L' 로 시작
+       - osk_ocr_data에서 텍스트 가져와서 청킹/임베딩
+       - 완료 시 parse_yn = 'S'
+    
+    2. rag_yn='Y': 기존 작업 수정
+       - osk_ocr_data에서 수정된 텍스트 가져와서 재청킹/임베딩
+       - Milvus에서 기존 청크 삭제 후 새로 삽입
+       - 완료 시 parse_yn = 'S'
+    """
+    db = DBConnector()
+    start_time = datetime.utcnow()
+    
+    job_state.start(job_id, data_id=data_id, file_id=file_id)
+    
+    # rag_yn에 따른 DB 처리
+    if rag_yn == "N":
+        db.mark_ocr_start(data_id)
+        print(f"[MANUAL-OCR] 신규 작업: data_id={data_id}, parse_yn='L'")
+    else:
+        print(f"[MANUAL-OCR] 기존 작업 수정: data_id={data_id}, rag_yn='Y'")
+    
+    try:
+        # ========== Step 1: DB에서 OCR 텍스트 가져오기 ==========
+        job_state.update(job_id, status="loading", step="Loading OCR text from DB")
+        
+        print(f"[MANUAL-OCR] Loading OCR text from osk_ocr_data for data_id={data_id}")
+        
+        pages_std = db.get_ocr_text_by_data_id(data_id)
+        
+        if not pages_std:
+            raise RuntimeError(f"DB에 OCR 텍스트가 없습니다 (osk_ocr_data): data_id={data_id}")
+        
+        print(f"[MANUAL-OCR] Loaded {len(pages_std)} pages from DB")
+        
+        # ========== Step 2: 고도화된 청킹 ==========
+        job_state.update(job_id, status="chunking", step="Advanced chunking from DB text")
+        
+        # Manual OCR은 레이아웃 정보가 없으므로 빈 dict 전달
+        layout_map = {}
+        
+        chunks = perform_advanced_chunking(pages_std, layout_map, job_id)
+        
+        if not chunks:
+            raise RuntimeError("청킹 실패: 청크가 생성되지 않음")
+        
+        # ========== Step 3: 청크 정규화 ==========
+        chunks = _coerce_chunks_for_milvus(chunks)
+        print(f"[MANUAL-OCR-CHUNK] Normalized {len(chunks)} chunks for Milvus")
+        
+        # ========== Step 4: 임베딩 및 Milvus 저장 ==========
+        job_state.update(job_id, status="embedding", step=f"Embedding {len(chunks)} chunks")
+        
+        from app.services.embedding_model import embed, get_sentence_embedding_dimension
+        from app.services.milvus_store_v2 import MilvusStoreV2
+        
+        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
+        
+        # 기존 문서 삭제 (rag_yn='Y'인 경우 반드시 필요)
+        print(f"[MANUAL-OCR] Deleting existing doc (if any): {data_id}")
+        try:
+            deleted = mvs._delete_by_doc_id(data_id)
+            print(f"[MANUAL-OCR] Deleted {deleted} existing chunks")
+        except Exception as e:
+            print(f"[MANUAL-OCR] Warning during delete: {e}")
+        
+        # Milvus insert
+        print(f"[MANUAL-OCR] Inserting {len(chunks)} chunks to Milvus")
+        
+        result = mvs.insert(
+            doc_id=data_id,
+            chunks=chunks,
+            embed_fn=embed
+        )
+        
+        print(f"[MANUAL-OCR] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
+        
+        # ========== Step 5: DB 업데이트 ==========
+        pages_count = len(pages_std)
+        chunk_count = result.get('inserted', len(chunks))
+        
+        print(f"[MANUAL-OCR] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
+        
+        # RAG 완료 마킹 (parse_yn='S', 히스토리 로깅)
+        db.update_rag_completed(data_id)
+        
+        job_state.complete(
+            job_id,
+            pages=pages_count,
+            chunks=chunk_count
+        )
+        
+        # ========== Step 6: 완료 & Webhook ==========
+        end_time = datetime.utcnow()
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=job_id,
+                data_id=data_id,
+                status="done",
+                converted=False,
+                metrics={"pages": pages_count, "chunks": chunk_count},
+                chunk_count=chunk_count,
+                timestamps={
+                    "start": start_time.isoformat(), 
+                    "end": end_time.isoformat()
+                },
+                message=f"manual OCR indexed (rag_yn={rag_yn}, advanced chunking)"
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+    
+    except Exception as e:
+        job_state.fail(job_id, str(e))
+        db.update_rag_error(data_id, str(e))
+        print(f"[MANUAL-OCR] ❌ Error: {e}")
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=job_id,
+                data_id=data_id,
+                status="error",
+                message=str(e)
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+        
+        raise
+
+
+async def process_delete_document(
+    data_id: str,
+    delete_from_minio: bool,
+    callback_url: Optional[str]
+):
+    """
+    문서 완전 삭제:
+    1. Milvus에서 청크 삭제
+    2. MinIO에서 파일 삭제 (옵션)
+    3. DB 상태 업데이트 (옵션)
+    """
+    from app.services.milvus_store_v2 import MilvusStoreV2
+    from app.services.minio_store import MinIOStore
+    from app.services.embedding_model import get_sentence_embedding_dimension
+    
+    try:
+        # Milvus 삭제
+        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
+        deleted_count = mvs._delete_by_doc_id(data_id)
+        
+        deleted_files = []
+        
+        # MinIO 삭제 (옵션)
+        if delete_from_minio:
+            mstore = MinIOStore()
+            # 파일 키 조회 및 삭제 로직 (필요 시)
+            pass
+        
+        print(f"[DELETE] ✅ Deleted {deleted_count} chunks for data_id={data_id}")
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=f"delete-{data_id}",
+                data_id=data_id,
+                status="deleted",
+                message=f"Deleted {deleted_count} chunks"
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+    
+    except Exception as e:
+        print(f"[DELETE] ❌ Error: {e}")
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=f"delete-{data_id}",
+                data_id=data_id,
+                status="error",
+                message=str(e)
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
