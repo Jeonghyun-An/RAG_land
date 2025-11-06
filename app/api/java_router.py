@@ -212,72 +212,11 @@ def perform_advanced_chunking(
     job_id: str
 ) -> List[Tuple[str, Dict]]:
     """
-    llama_router의 고도화된 청킹 시스템 적용
-    
-    우선순위:
-    1. English Technical Chunker (영어 기술 문서)
-    2. Law Chunker (법령 문서)
-    3. Layout-aware Chunker (레이아웃 정보 활용)
-    4. Basic Smart Chunker
-    5. Proofreading Chunker (교정/교열용)
+    공용 청킹 파이프라인 호출 (llama_router와 동일)
     """
-    from app.services.embedding_model import token_encode
-    from app.services.chunker import smart_chunk_pages
-    
-    # 환경변수 설정
-    TARGET_TOKENS = int(os.getenv("RAG_TARGET_TOKENS", "400"))
-    OVERLAP_TOKENS = int(os.getenv("RAG_OVERLAP_TOKENS", "100"))
-    ENABLE_LAW = os.getenv("RAG_ENABLE_LAW_CHUNKER", "1") == "1"
-    ENABLE_LAYOUT = os.getenv("RAG_ENABLE_LAYOUT_CHUNKER", "1") == "1"
-    
-    if not pages_std:
-        return []
-    
-    # 텍스트 샘플 수집
-    sample_texts = []
-    for _, txt in pages_std[:5]:
-        if txt and txt.strip():
-            sample_texts.append(txt[:2000])
-    full_sample = "\n".join(sample_texts)
-    
-    # 1. 영어 기술 문서 감지
-    try:
-        from app.services.english_technical_chunker import EnglishTechnicalChunker
-        chunker_en = EnglishTechnicalChunker(token_encode, TARGET_TOKENS, OVERLAP_TOKENS)
-        if chunker_en.is_english_technical_document(full_sample):
-            print(f"[CHUNK-{job_id}] Using EnglishTechnicalChunker")
-            job_state.update(job_id, step="chunking:en_tech")
-            return chunker_en.chunk_pages(pages_std, layout_map)
-    except Exception as e:
-        print(f"[CHUNK-{job_id}] EnglishTechnicalChunker failed: {e}")
-    
-    # 2. 법령 문서 감지
-    if ENABLE_LAW:
-        try:
-            from app.services.law_chunker import NuclearLegalChunker
-            chunker_law = NuclearLegalChunker(token_encode, TARGET_TOKENS, OVERLAP_TOKENS)
-            if chunker_law.is_legal_document(full_sample):
-                print(f"[CHUNK-{job_id}] Using NuclearLegalChunker")
-                job_state.update(job_id, step="chunking:law")
-                return chunker_law.chunk_pages(pages_std, layout_map)
-        except Exception as e:
-            print(f"[CHUNK-{job_id}] LawChunker failed: {e}")
-    
-    # 3. 레이아웃 기반 청킹
-    if ENABLE_LAYOUT and layout_map:
-        try:
-            from app.services.layout_chunker import LayoutAwareChunker
-            chunker_layout = LayoutAwareChunker(token_encode, TARGET_TOKENS, OVERLAP_TOKENS)
-            print(f"[CHUNK-{job_id}] Using LayoutAwareChunker")
-            job_state.update(job_id, step="chunking:layout")
-            return chunker_layout.chunk_pages(pages_std, layout_map)
-        except Exception as e:
-            print(f"[CHUNK-{job_id}] LayoutChunker failed: {e}")
-    
-    # 4. 기본 스마트 청킹
-    print(f"[CHUNK-{job_id}] Using SmartChunker (default)")
-    job_state.update(job_id, step="chunking:smart")
-    return smart_chunk_pages(pages_std, token_encode, TARGET_TOKENS, OVERLAP_TOKENS, layout_map)
+    from app.services.chunking_unified import build_chunks
+    job_state.update(job_id, step="chunking:unified")
+    return build_chunks(pages_std, layout_map, job_id=job_id)
 
 
 # ==================== Endpoints ====================
@@ -476,11 +415,15 @@ async def process_convert_and_index_prod(
         # ========== Step 1: 파일 경로 확인 ==========
         job_state.update(job_id, status="initializing", step="Resolving file path")
         
-        full_path = Path(SERVER_BASE_PATH) / path if not Path(path).is_absolute() else Path(path)
-        
+        raw_path = Path(path)
+        base = raw_path if raw_path.is_absolute() else Path(SERVER_BASE_PATH) / raw_path
+
+        # base가 폴더이거나 확장자가 없으면 file_id를 붙여 실제 파일 경로 구성
+        full_path = base if base.suffix else (base / file_id)
+
         if not full_path.exists():
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {full_path}")
-        
+         
         print(f"[PROD] Processing file: {full_path}")
         
         # ========== Step 2: PDF 변환 (필요 시) ==========
@@ -518,24 +461,29 @@ async def process_convert_and_index_prod(
         
         print(f"[PROD-PARSE] Extracted {len(pages)} pages")
         
-        # 레이아웃 정보 추출
+        # ========== Step 5: OCR 결과 DB 저장 ==========
+        # 자바 요구사항: OCR 추출 종료 시 osk_ocr_data에 INSERT
+        job_state.update(job_id, status="saving_ocr", step="Saving OCR results to DB")
+        
+        for page_no, text in pages:
+            db.insert_ocr_result(data_id, page_no, text)
+            print(f"[PROD-OCR-DB] Saved page {page_no} to osk_ocr_data")
+        
+        # OCR 성공 마킹 (parse_yn='S')
+        db.mark_ocr_success(data_id)
+        print(f"[PROD-OCR-DB] ✅ OCR completed and saved to DB: {len(pages)} pages")
+        
+        # ========== Step 6: 레이아웃 정보 추출 ==========
         blocks_by_page_list = parse_pdf_blocks(converted_pdf_path)
         layout_map = {int(p): blks for p, blks in (blocks_by_page_list or [])}
         print(f"[PROD-PARSE] Layout blocks extracted for {len(layout_map)} pages")
         
-        # ========== Step 5: OCR 결과 DB 저장 ==========
-        for page_no, text in pages:
-            db.insert_ocr_result(data_id, page_no, text)
-        
-        # OCR 성공 마킹
-        db.mark_ocr_success(data_id)
-        
-        # ========== Step 6: 페이지 정규화 ==========
+        # ========== Step 7: 페이지 정규화 ==========
         pages_std = _normalize_pages_for_chunkers(pages)
         if not any((t or "").strip() for _, t in pages_std):
             print("[PROD-PARSE] Warning: No textual content after parsing")
         
-        # ========== Step 7: 고도화된 청킹 ==========
+        # ========== Step 8: 고도화된 청킹 ==========
         job_state.update(job_id, status="chunking", step="Advanced chunking")
         
         chunks = perform_advanced_chunking(pages_std, layout_map, job_id)
@@ -543,11 +491,11 @@ async def process_convert_and_index_prod(
         if not chunks:
             raise RuntimeError("청킹 실패: 청크가 생성되지 않음")
         
-        # ========== Step 8: 청크 정규화 ==========
+        # ========== Step 9: 청크 정규화 ==========
         chunks = _coerce_chunks_for_milvus(chunks)
         print(f"[PROD-CHUNK] Normalized {len(chunks)} chunks for Milvus")
         
-        # ========== Step 9: 임베딩 및 Milvus 저장 ==========
+        # ========== Step 10: 임베딩 및 Milvus 저장 ==========
         job_state.update(job_id, status="embedding", step=f"Embedding {len(chunks)} chunks")
         
         from app.services.embedding_model import embed, get_sentence_embedding_dimension
@@ -574,12 +522,13 @@ async def process_convert_and_index_prod(
         
         print(f"[PROD] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
         
-        # ========== Step 10: DB 업데이트 ==========
+        # ========== Step 11: RAG 완료 처리 ==========
         pages_count = len(pages_std)
         chunk_count = result.get('inserted', len(chunks))
         
         print(f"[PROD] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
         
+        # RAG 완료 마킹 (parse_yn='S' 유지, 히스토리 로깅)
         db.update_rag_completed(data_id)
         
         job_state.complete(
@@ -588,7 +537,7 @@ async def process_convert_and_index_prod(
             chunks=chunk_count
         )
         
-        # ========== Step 11: 완료 & Webhook ==========
+        # ========== Step 12: 완료 & Webhook ==========
         end_time = datetime.utcnow()
         
         if callback_url:
