@@ -534,13 +534,28 @@ async def process_convert_and_index_prod(
         try:
             SYNC_TO_MINIO = os.getenv("JAVA_SYNC_TO_MINIO", "1") == "1"
             if SYNC_TO_MINIO:
-                doc_id = str(data_id)  # 프론트 doc_id와 맞춤
-                pdf_path_for_upload = converted_pdf_path  # 이미 확정된 경로
+                doc_id = str(data_id)
+                pdf_path_for_upload = converted_pdf_path
+
+                # 🔹 DB에서 제목/코드 등 메타 읽기
+                row = None
+                try:
+                    row = db.get_file_by_id(data_id)  # { data_title, data_code, ... }
+                except Exception as _e:
+                    row = None
+
+                # 표시용 타이틀 결정: DB data_title 우선, 없으면 파일명
+                display_title = None
+                if isinstance(row, dict):
+                    display_title = (row.get("data_title") or "").strip() or None
+                if not display_title:
+                    display_title = Path(pdf_path_for_upload).name  # fallback
+
                 if pdf_path_for_upload and Path(pdf_path_for_upload).exists():
                     m = MinIOStore()
                     object_pdf = f"uploaded/{doc_id}.pdf"
 
-                    # 파일 -> bytes 업로드 (upload_file 대신 upload_bytes 사용)
+                    # 파일 → bytes 업로드
                     with open(pdf_path_for_upload, "rb") as f:
                         data = f.read()
                     m.upload_bytes(
@@ -558,27 +573,38 @@ async def process_convert_and_index_prod(
                     except Exception:
                         meta = {}
 
+                    # 🔹 DB 메타를 함께 저장(필터에 쓰고 싶으면 프론트에서 활용 가능)
+                    extra_meta = {}
+                    if isinstance(row, dict):
+                        for k in [
+                            "data_id","data_title","data_code","data_code_detail","data_code_detail_sub",
+                            "file_folder","file_id","reg_nm","reg_id","reg_dt","reg_type","parse_yn"
+                        ]:
+                            if k in row:
+                                extra_meta[k] = row[k]
+
                     meta.update({
                         "doc_id": doc_id,
-                        "title": Path(pdf_path_for_upload).name,
-                        "pdf_key": object_pdf,                      # llama_router가 기대하는 키
-                        "original_key": f"serverfs://{full_path}",  # 원본 참조용(옵션)
+                        "title": display_title,                 # ✅ DB data_title
+                        "pdf_key": object_pdf,                  # ✅ MinIO 변환 PDF
+                        "original_key": None,                   # ✅ MinIO 오브젝트가 아니면 None
+                        "original_fs_path": str(full_path),     # ✅ 로컬 경로는 별도 필드에
                         "original_name": Path(full_path).name,
                         "is_pdf_original": True,
                         "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "indexed": True,
                         "chunk_count": int(chunk_count),
                         "last_indexed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        **extra_meta,
                     })
                     m.put_json(META_KEY(doc_id), meta)
 
-                    print(f"[PROD-MINIO] ✅ synced: {object_pdf} (chunks={chunk_count})")
+                    print(f"[PROD-MINIO] ✅ synced: {object_pdf} (title='{display_title}', chunks={chunk_count})")
                 else:
                     print("[PROD-MINIO] ⚠️ skip: no local pdf to upload")
             else:
                 print("[PROD-MINIO] ⏭️ skip: JAVA_SYNC_TO_MINIO=0")
         except Exception as e:
-            # 동기화 실패해도 인덱싱 플로우는 유지
             print(f"[PROD-MINIO] ❌ sync failed: {e}")
 
         print(f"[PROD] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
