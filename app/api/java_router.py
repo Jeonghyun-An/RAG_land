@@ -23,6 +23,9 @@ import httpx
 from app.services.db_connector import DBConnector
 from app.services.pdf_converter import convert_to_pdf, ConvertError
 from app.services import job_state
+from app.services.minio_store import MinIOStore
+from datetime import timezone
+import mimetypes
 
 router = APIRouter(prefix="/java", tags=["java-production"])
 
@@ -30,6 +33,8 @@ router = APIRouter(prefix="/java", tags=["java-production"])
 SHARED_SECRET = os.getenv("JAVA_SHARED_SECRET", "")
 SERVER_BASE_PATH = os.getenv("SERVER_BASE_PATH", "/mnt/shared")
 
+def META_KEY(doc_id: str) -> str:
+    return f"uploaded/__meta__/{doc_id}/meta.json"
 
 # ==================== Schemas ====================
 class ConvertAndIndexRequest(BaseModel):
@@ -525,9 +530,58 @@ async def process_convert_and_index_prod(
         # ========== Step 11: RAG 완료 처리 ==========
         pages_count = len(pages_std)
         chunk_count = result.get('inserted', len(chunks))
-        
+        # ========== Step 11.5: MinIO 동기화 (프론트 목록 노출용) ==========
+        try:
+            SYNC_TO_MINIO = os.getenv("JAVA_SYNC_TO_MINIO", "1") == "1"
+            if SYNC_TO_MINIO:
+                doc_id = str(data_id)  # 프론트 doc_id와 맞춤
+                pdf_path_for_upload = converted_pdf_path  # 이미 확정된 경로
+                if pdf_path_for_upload and Path(pdf_path_for_upload).exists():
+                    m = MinIOStore()
+                    object_pdf = f"uploaded/{doc_id}.pdf"
+
+                    # 파일 -> bytes 업로드 (upload_file 대신 upload_bytes 사용)
+                    with open(pdf_path_for_upload, "rb") as f:
+                        data = f.read()
+                    m.upload_bytes(
+                        data,
+                        object_name=object_pdf,
+                        content_type="application/pdf",
+                        length=len(data),
+                    )
+
+                    # meta.json 갱신(존재하면 merge)
+                    meta = {}
+                    try:
+                        if m.exists(META_KEY(doc_id)):
+                            meta = m.get_json(META_KEY(doc_id)) or {}
+                    except Exception:
+                        meta = {}
+
+                    meta.update({
+                        "doc_id": doc_id,
+                        "title": Path(pdf_path_for_upload).name,
+                        "pdf_key": object_pdf,                      # llama_router가 기대하는 키
+                        "original_key": f"serverfs://{full_path}",  # 원본 참조용(옵션)
+                        "original_name": Path(full_path).name,
+                        "is_pdf_original": True,
+                        "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "indexed": True,
+                        "chunk_count": int(chunk_count),
+                        "last_indexed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    })
+                    m.put_json(META_KEY(doc_id), meta)
+
+                    print(f"[PROD-MINIO] ✅ synced: {object_pdf} (chunks={chunk_count})")
+                else:
+                    print("[PROD-MINIO] ⚠️ skip: no local pdf to upload")
+            else:
+                print("[PROD-MINIO] ⏭️ skip: JAVA_SYNC_TO_MINIO=0")
+        except Exception as e:
+            # 동기화 실패해도 인덱싱 플로우는 유지
+            print(f"[PROD-MINIO] ❌ sync failed: {e}")
+
         print(f"[PROD] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
-        
         # RAG 완료 마킹 (parse_yn='S' 유지, 히스토리 로깅)
         db.update_rag_completed(data_id)
         
