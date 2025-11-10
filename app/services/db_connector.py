@@ -2,6 +2,7 @@
 """
 CUBRID 데이터베이스 연결 및 작업 처리
 - osk_data, osk_ocr_data, osk_ocr_hist 테이블 사용
+- osk_data_sc 테이블 사용 (SC 문서용)
 - 페이지 단위 수정 지원
 """
 from __future__ import annotations
@@ -382,6 +383,88 @@ class DBConnector:
             print(f"[DB] ✅ RAG indexing error logged for data_id={data_id}")
         except Exception as e:
             print(f"[DB] ❌ update_rag_error failed: {e}")
+
+    # ==================== 11. SC 문서 조회 (신규 추가) ====================
+    def get_sc_document(self, data_id: str | int) -> Optional[Dict[str, Any]]:
+        """
+        osk_data_sc 테이블에서 SC 문서 조회
+        
+        Args:
+            data_id: 문서 ID
+        
+        Returns:
+            {
+                'sc_id': int,
+                'data_id': str,
+                'preface_text': str,
+                'contents_text': str,
+                'conclusion_text': str,
+                'upt_dt': datetime
+            }
+            문서가 없으면 None 반환
+        """
+        try:
+            sql = """
+            SELECT sc_id, data_id, preface_text, contents_text, conclusion_text, upt_dt
+            FROM osk_data_sc
+            WHERE data_id = ?
+            """
+            with self.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, (data_id,))
+                row = cur.fetchone()
+                cols = [d[0] for d in cur.description]
+                cur.close()
+            
+            if not row:
+                print(f"[DB] ⚠️  No SC document found for data_id={data_id}")
+                return None
+            
+            result = dict(zip(cols, row))
+            print(f"[DB] ✅ Retrieved SC document: sc_id={result.get('sc_id')}, data_id={data_id}")
+            return result
+            
+        except Exception as e:
+            print(f"[DB] ❌ get_sc_document failed: {e}")
+            return None
+    
+    def get_sc_combined_text(self, data_id: str | int) -> Optional[str]:
+        """
+        SC 문서의 preface + contents + conclusion을 하나로 합쳐서 반환
+        
+        Args:
+            data_id: 문서 ID
+        
+        Returns:
+            합쳐진 전체 텍스트 (없으면 None)
+        """
+        doc = self.get_sc_document(data_id)
+        if not doc:
+            return None
+        
+        # 3개 컬럼 합치기 (빈 문자열은 제외)
+        parts = []
+        
+        preface = (doc.get('preface_text') or '').strip()
+        if preface:
+            parts.append(preface)
+        
+        contents = (doc.get('contents_text') or '').strip()
+        if contents:
+            parts.append(contents)
+        
+        conclusion = (doc.get('conclusion_text') or '').strip()
+        if conclusion:
+            parts.append(conclusion)
+        
+        if not parts:
+            print(f"[DB] ⚠️  SC document has no text content: data_id={data_id}")
+            return None
+        
+        # 두 줄바꿈으로 구분하여 합치기
+        combined = "\n\n".join(parts)
+        print(f"[DB] ✅ Combined SC text: {len(combined)} chars from {len(parts)} sections")
+        return combined
 
     # ==================== 호환성 유지 메서드 ====================
     def update_parse_status(

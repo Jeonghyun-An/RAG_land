@@ -2,8 +2,10 @@
 """
 Java 시스템 연동 라우터 (운영용)
 - 서버 파일시스템 사용
-- DB 완전 연동 (osk_data, osk_ocr_data, osk_ocr_hist)
-- manual-ocr-and-index: rag_yn에 따른 신규/수정 처리
+- DB 완전 연동 (osk_data, osk_ocr_data, osk_ocr_hist, osk_data_sc)
+- convert-and-index: PDF 변환 + OCR + 청킹 + 임베딩
+- manual-ocr-and-index: DB 기반 수동 OCR 청킹 + 임베딩
+- sc-index: SC 문서 (preface + contents + conclusion) 단일 청크 처리
 """
 from __future__ import annotations
 
@@ -52,6 +54,12 @@ class ManualOCRAndIndexRequest(BaseModel):
     file_id: str
     callback_url: Optional[str] = None
     rag_yn: str = "N"  # "N" (신규 작업), "Y" (기존 작업 수정)
+
+
+class SCIndexRequest(BaseModel):
+    """자바 → AI 트리거 요청 (sc-index) - SC 문서 전용"""
+    data_id: str
+    callback_url: Optional[str] = None
 
 
 class ConvertAndIndexResponse(BaseModel):
@@ -305,6 +313,49 @@ async def manual_ocr_and_index(
     )
 
 
+@router.post("/sc-index", response_model=ConvertAndIndexResponse)
+async def sc_index(
+    request: SCIndexRequest,
+    background_tasks: BackgroundTasks,
+    x_internal_token: Optional[str] = Header(None)
+):
+    """
+    자바 → AI 트리거 API (운영용) - sc-index (SC 문서 전용)
+    
+    프로세스:
+    1. osk_data_sc 테이블에서 data_id 조회
+    2. preface_text + contents_text + conclusion_text 합치기
+    3. 단일 청크로 처리 (1~2 페이지 분량)
+    4. 임베딩 후 Milvus 저장
+    5. osk_data.parse_yn = 'S', osk_ocr_hist 로깅
+    """
+    if not verify_internal_token(x_internal_token):
+        raise HTTPException(401, "Unauthorized - Invalid token")
+    
+    # SC 문서 존재 여부 확인
+    db = DBConnector()
+    sc_doc = db.get_sc_document(request.data_id)
+    
+    if not sc_doc:
+        raise HTTPException(404, f"SC document not found: data_id={request.data_id}")
+    
+    job_id = str(uuid.uuid4())[:8]
+    
+    background_tasks.add_task(
+        process_sc_index,
+        job_id=job_id,
+        data_id=request.data_id,
+        callback_url=request.callback_url
+    )
+    
+    return ConvertAndIndexResponse(
+        status="accepted",
+        job_id=job_id,
+        data_id=request.data_id,
+        message="processing SC document (single chunk)"
+    )
+
+
 @router.post("/delete-document", response_model=DeleteDocumentResponse)
 async def delete_document(
     request: DeleteDocumentRequest,
@@ -392,7 +443,8 @@ def health_check():
         "status": "ok", 
         "service": "java-router-production",
         "chunking": "advanced (en_tech → law → layout → basic)",
-        "manual_ocr": "DB-based (osk_ocr_data)"
+        "manual_ocr": "DB-based (osk_ocr_data)",
+        "sc_index": "SC document single chunk (preface + contents + conclusion)"
     }
 
 
@@ -530,6 +582,7 @@ async def process_convert_and_index_prod(
         # ========== Step 11: RAG 완료 처리 ==========
         pages_count = len(pages_std)
         chunk_count = result.get('inserted', len(chunks))
+        
         # ========== Step 11.5: MinIO 동기화 (프론트 목록 노출용) ==========
         try:
             SYNC_TO_MINIO = os.getenv("JAVA_SYNC_TO_MINIO", "1") == "1"
@@ -624,7 +677,7 @@ async def process_convert_and_index_prod(
             payload = WebhookPayload(
                 job_id=job_id,
                 data_id=data_id,
-                status="done",
+                status="api_indexed",
                 converted=not is_already_pdf,
                 metrics={"pages": pages_count, "chunks": chunk_count},
                 chunk_count=chunk_count,
@@ -645,7 +698,7 @@ async def process_convert_and_index_prod(
             payload = WebhookPayload(
                 job_id=job_id,
                 data_id=data_id,
-                status="error",
+                status="api_error",
                 message=str(e)
             )
             await send_webhook(callback_url, payload, SHARED_SECRET)
@@ -724,7 +777,7 @@ async def process_manual_ocr_and_index(
         
         mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
         
-        # 기존 문서 삭제 (rag_yn='Y'인 경우 반드시 필요)
+        # 기존 문서 삭제
         print(f"[MANUAL-OCR] Deleting existing doc (if any): {data_id}")
         try:
             deleted = mvs._delete_by_doc_id(data_id)
@@ -743,13 +796,12 @@ async def process_manual_ocr_and_index(
         
         print(f"[MANUAL-OCR] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
         
-        # ========== Step 5: DB 업데이트 ==========
+        # ========== Step 5: RAG 완료 처리 ==========
         pages_count = len(pages_std)
         chunk_count = result.get('inserted', len(chunks))
         
         print(f"[MANUAL-OCR] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
-        
-        # RAG 완료 마킹 (parse_yn='S', 히스토리 로깅)
+        # RAG 완료 마킹 (parse_yn='S' 유지, 히스토리 로깅)
         db.update_rag_completed(data_id)
         
         job_state.complete(
@@ -765,7 +817,7 @@ async def process_manual_ocr_and_index(
             payload = WebhookPayload(
                 job_id=job_id,
                 data_id=data_id,
-                status="done",
+                status="corrected_indexed",
                 converted=False,
                 metrics={"pages": pages_count, "chunks": chunk_count},
                 chunk_count=chunk_count,
@@ -773,7 +825,7 @@ async def process_manual_ocr_and_index(
                     "start": start_time.isoformat(), 
                     "end": end_time.isoformat()
                 },
-                message=f"manual OCR indexed (rag_yn={rag_yn}, advanced chunking)"
+                message="indexed successfully from manual OCR (advanced chunking)"
             )
             await send_webhook(callback_url, payload, SHARED_SECRET)
     
@@ -786,7 +838,160 @@ async def process_manual_ocr_and_index(
             payload = WebhookPayload(
                 job_id=job_id,
                 data_id=data_id,
-                status="error",
+                status="corrected_error",
+                message=str(e)
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+        
+        raise
+
+
+async def process_sc_index(
+    job_id: str,
+    data_id: str,
+    callback_url: Optional[str]
+):
+    """
+    운영용 백그라운드 처리 - sc-index (SC 문서 전용)
+    
+    프로세스:
+    1. osk_data_sc 테이블에서 data_id 조회
+    2. preface_text + contents_text + conclusion_text 합치기
+    3. 단일 청크로 처리 (1~2 페이지 분량)
+    4. 임베딩 후 Milvus 저장
+    5. osk_data.parse_yn = 'S', osk_ocr_hist 로깅
+    """
+    db = DBConnector()
+    start_time = datetime.utcnow()
+    
+    job_state.start(job_id, data_id=data_id, file_id="sc_document")
+    
+    try:
+        # ========== Step 1: OCR 시작 마킹 ==========
+        db.mark_ocr_start(data_id)
+        print(f"[SC-INDEX] 신규 SC 문서 작업: data_id={data_id}, parse_yn='L'")
+        
+        # ========== Step 2: DB에서 SC 문서 텍스트 가져오기 ==========
+        job_state.update(job_id, status="loading", step="Loading SC document from DB")
+        
+        print(f"[SC-INDEX] Loading SC document from osk_data_sc for data_id={data_id}")
+        
+        combined_text = db.get_sc_combined_text(data_id)
+        
+        if not combined_text:
+            raise RuntimeError(f"SC 문서 텍스트가 비어있습니다: data_id={data_id}")
+        
+        print(f"[SC-INDEX] Loaded SC text: {len(combined_text)} characters")
+        
+        # ========== Step 3: 단일 청크 생성 ==========
+        job_state.update(job_id, status="chunking", step="Creating single chunk for SC document")
+        
+        # 토큰 수 계산
+        from app.services.embedding_model import get_embedding_model
+        embedding_model = get_embedding_model()
+        tokenizer = getattr(embedding_model, "tokenizer", None)
+        
+        if tokenizer:
+            token_count = len(tokenizer.encode(combined_text, add_special_tokens=False))
+        else:
+            token_count = len(combined_text) // 4  # 대략적인 추정
+        
+        print(f"[SC-INDEX] SC document token count: {token_count}")
+        
+        # 단일 청크 생성 (메타데이터 포함)
+        chunk = (
+            combined_text,
+            {
+                "page": 1,
+                "pages": [1],
+                "section": "SC Document",
+                "token_count": token_count,
+                "bboxes": {},
+                "type": "sc_document"
+            }
+        )
+        
+        chunks = [chunk]
+        
+        # ========== Step 4: 청크 정규화 ==========
+        chunks = _coerce_chunks_for_milvus(chunks)
+        print(f"[SC-INDEX] Normalized {len(chunks)} chunk for Milvus")
+        
+        # ========== Step 5: 임베딩 및 Milvus 저장 ==========
+        job_state.update(job_id, status="embedding", step=f"Embedding SC document")
+        
+        from app.services.embedding_model import embed, get_sentence_embedding_dimension
+        from app.services.milvus_store_v2 import MilvusStoreV2
+        
+        mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
+        
+        # 기존 문서 삭제
+        print(f"[SC-INDEX] Deleting existing doc (if any): {data_id}")
+        try:
+            deleted = mvs._delete_by_doc_id(data_id)
+            print(f"[SC-INDEX] Deleted {deleted} existing chunks")
+        except Exception as e:
+            print(f"[SC-INDEX] Warning during delete: {e}")
+        
+        # Milvus insert
+        print(f"[SC-INDEX] Inserting {len(chunks)} chunk to Milvus")
+        
+        result = mvs.insert(
+            doc_id=data_id,
+            chunks=chunks,
+            embed_fn=embed
+        )
+        
+        print(f"[SC-INDEX] ✅ Successfully indexed: {result.get('inserted', 0)} chunk")
+        
+        # ========== Step 6: OCR 성공 마킹 ==========
+        # SC 문서는 페이지 개념이 없으므로 osk_ocr_data에 저장하지 않음
+        # 바로 OCR 성공 처리
+        db.mark_ocr_success(data_id)
+        print(f"[SC-INDEX] ✅ Marked OCR success for SC document: data_id={data_id}")
+        
+        # ========== Step 7: RAG 완료 처리 ==========
+        chunk_count = result.get('inserted', 1)
+        
+        print(f"[SC-INDEX] ✅ Indexing completed: 1 SC document, {chunk_count} chunk")
+        # RAG 완료 마킹 (parse_yn='S' 유지, 히스토리 로깅)
+        db.update_rag_completed(data_id)
+        
+        job_state.complete(
+            job_id,
+            pages=1,
+            chunks=chunk_count
+        )
+        
+        # ========== Step 8: 완료 & Webhook ==========
+        end_time = datetime.utcnow()
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=job_id,
+                data_id=data_id,
+                status="sc_indexed",
+                converted=False,
+                metrics={"pages": 1, "chunks": chunk_count, "type": "sc_document"},
+                chunk_count=chunk_count,
+                timestamps={
+                    "start": start_time.isoformat(), 
+                    "end": end_time.isoformat()
+                },
+                message="indexed successfully (SC document single chunk)"
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+    
+    except Exception as e:
+        job_state.fail(job_id, str(e))
+        db.update_rag_error(data_id, str(e))
+        print(f"[SC-INDEX] ❌ Error: {e}")
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=job_id,
+                data_id=data_id,
+                status="sc_error",
                 message=str(e)
             )
             await send_webhook(callback_url, payload, SHARED_SECRET)
@@ -799,93 +1004,65 @@ async def process_delete_document(
     delete_from_minio: bool,
     callback_url: Optional[str]
 ):
-    """
-    문서 완전 삭제:
-    1. Milvus에서 청크 삭제
-    2. MinIO에서 파일 삭제 (옵션)
-    3. DB 상태 업데이트 (옵션)
-    """
-    from app.services.milvus_store_v2 import MilvusStoreV2
-    from app.services.minio_store import MinIOStore
-    from app.services.embedding_model import get_sentence_embedding_dimension
-    
+    """문서 삭제 백그라운드 처리"""
     try:
-        # Milvus 삭제
+        from app.services.milvus_store_v2 import MilvusStoreV2
+        from app.services.embedding_model import get_sentence_embedding_dimension
+        
         mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
-        deleted_count = mvs._delete_by_doc_id(data_id)
         
+        # Milvus에서 삭제
+        deleted_chunks = mvs._delete_by_doc_id(data_id)
+        print(f"[DELETE] Deleted {deleted_chunks} chunks from Milvus for data_id={data_id}")
+        
+        # MinIO에서 삭제
         deleted_files = []
-        
-        # MinIO 삭제 (옵션)
         if delete_from_minio:
-            mstore = MinIOStore()
-            # 파일 키 조회 및 삭제 로직 (필요 시)
-                        # 기본 키들
-            doc_id = str(data_id)
-            pdf_key_guess = f"uploaded/{doc_id}.pdf"
-            meta_key = META_KEY(doc_id)  # uploaded/__meta__/{doc_id}/meta.json
-            meta_prefix = f"uploaded/__meta__/{doc_id}/"
-
-            # 2-1) meta.json 로드해서 실제 키 확인 시도
-            meta = None
-            try:
-                if mstore.exists(meta_key):
-                    meta = mstore.get_json(meta_key) or {}
-            except Exception:
-                meta = None
-
-            # 2-2) PDF 키 후보들 취합
-            pdf_keys: list[str] = []
-            if isinstance(meta, dict):
-                if meta.get("pdf_key"):
-                    pdf_keys.append(str(meta["pdf_key"]))
-                # 혹시 변환 전 원본이 MinIO에 따로 올라갔다면 (보통은 FS 경로)
-                if meta.get("original_key") and str(meta["original_key"]).startswith(("uploaded/", "serverfs/")):
-                    pdf_keys.append(str(meta["original_key"]))
-            # fallback(메타 없을 때)
-            pdf_keys.append(pdf_key_guess)
-
-            # 중복 제거
-            seen = set()
-            pdf_keys = [k for k in pdf_keys if not (k in seen or seen.add(k))]
-
-            # 2-3) PDF/원본 후보들 삭제
-            for key in pdf_keys:
-                if not key or key.startswith("serverfs://"):  # 로컬 FS 경로는 MinIO 객체 아님
-                    continue
-                if mstore.delete_object_safe(key):
-                    deleted_files.append(key)
-                    print(f"[DELETE] ✅ MinIO object deleted: {key}")
-
-            # 2-4) meta.json 및 해당 프리픽스 삭제
-            # 먼저 meta.json 단건
-            if mstore.delete_object_safe(meta_key):
+            m = MinIOStore()
+            
+            # PDF 삭제
+            pdf_key = f"uploaded/{data_id}.pdf"
+            if m.exists(pdf_key):
+                m.delete(pdf_key)
+                deleted_files.append(pdf_key)
+            
+            # 메타 삭제
+            meta_key = META_KEY(data_id)
+            if m.exists(meta_key):
+                m.delete(meta_key)
                 deleted_files.append(meta_key)
-                print(f"[DELETE] ✅ MinIO object deleted: {meta_key}")
-            # 남아있을 수 있는 같은 프리픽스 하위 파일 전부 삭제
-            purged = mstore.delete_prefix(meta_prefix)
-            if purged:
-                print(f"[DELETE] ✅ MinIO prefix purged: {meta_prefix} (count={purged})")
+            
+            print(f"[DELETE] Deleted {len(deleted_files)} files from MinIO")
         
-        print(f"[DELETE] ✅ Deleted {deleted_count} chunks for data_id={data_id}")
-        
+        # Webhook 전송
         if callback_url:
-            payload = WebhookPayload(
-                job_id=f"delete-{data_id}",
-                data_id=data_id,
-                status="deleted",
-                message=f"Deleted {deleted_count} chunks"
-            )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
+            payload = {
+                "data_id": data_id,
+                "status": "deleted",
+                "deleted_chunks": deleted_chunks,
+                "deleted_files": deleted_files,
+                "message": "Document deleted successfully"
+            }
+            
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.post(callback_url, json=payload)
+                    print(f"[DELETE-WEBHOOK] ✅ Sent to {callback_url}")
+            except Exception as e:
+                print(f"[DELETE-WEBHOOK] ❌ Failed: {e}")
     
     except Exception as e:
         print(f"[DELETE] ❌ Error: {e}")
         
         if callback_url:
-            payload = WebhookPayload(
-                job_id=f"delete-{data_id}",
-                data_id=data_id,
-                status="error",
-                message=str(e)
-            )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
+            payload = {
+                "data_id": data_id,
+                "status": "error",
+                "message": str(e)
+            }
+            
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.post(callback_url, json=payload)
+            except Exception:
+                pass
