@@ -231,6 +231,64 @@ def perform_advanced_chunking(
     job_state.update(job_id, step="chunking:unified")
     return build_chunks(pages_std, layout_map, job_id=job_id)
 
+# --- add near top-level helpers (모듈 상단 어딘가) ---
+def _render_text_pdf(text: str, out_path: str) -> str:
+    """
+    주어진 text를 간단한 PDF로 렌더링해 out_path에 저장하고 경로를 반환.
+    reportlab이 없으면 ImportError 발생 -> 상위에서 처리.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    # 폰트 등록 (없어도 기본 폰트로 동작은 함)
+    try:
+        # 시스템에 NotoSansCJK 같은 폰트가 있으면 등록 (선택)
+        # pdfmetrics.registerFont(TTFont("NotoSans", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"))
+        pass
+    except Exception:
+        pass
+
+    c = canvas.Canvas(out_path, pagesize=A4)
+    width, height = A4
+
+    margin_x = 20 * mm
+    margin_y = 20 * mm
+    max_width = width - 2 * margin_x
+    y = height - margin_y
+
+    # 폰트 설정
+    try:
+        c.setFont("Helvetica", 10)
+    except Exception:
+        pass
+
+    # 아주 단순한 워드랩
+    import textwrap
+    lines = []
+    for para in (text or "").splitlines():
+        # 대략적인 폭 기준(영문 80~100자, 한글 섞이면 줄 조밀)
+        # 필요하면 reportlab의 stringWidth로 정확도 향상 가능
+        wrap = textwrap.wrap(para, width=95) or [""]
+        lines.extend(wrap)
+
+    line_height = 12  # pt
+    for line in lines:
+        if y <= margin_y:
+            c.showPage()
+            try:
+                c.setFont("Helvetica", 10)
+            except Exception:
+                pass
+            y = height - margin_y
+        c.drawString(margin_x, y, line)
+        y -= line_height
+
+    c.showPage()
+    c.save()
+    return out_path
 
 # ==================== Endpoints ====================
 
@@ -883,42 +941,114 @@ async def process_sc_index(
         
         print(f"[SC-INDEX] Loaded SC text: {len(combined_text)} characters")
         
-        # ========== Step 3: 단일 청크 생성 ==========
-        job_state.update(job_id, status="chunking", step="Creating single chunk for SC document")
+        # ========== Step 3: 청크 생성 (토큰 길이에 따라 분할) ==========
+        job_state.update(job_id, status="chunking", step="Creating chunks for SC document")
         
         # 토큰 수 계산
         from app.services.embedding_model import get_embedding_model
+        import os
+        
         embedding_model = get_embedding_model()
         tokenizer = getattr(embedding_model, "tokenizer", None)
         
+        # 임베딩 모델의 최대 토큰 길이 가져오기
+        max_seq_length = int(getattr(embedding_model, "max_seq_length", 1024))
+        embed_max_tokens = int(os.getenv("EMBED_MAX_TOKENS", "1024"))
+        # 둘 중 작은 값 사용 (안전 마진 20% 확보)
+        safe_max_tokens = int(min(max_seq_length, embed_max_tokens) * 0.8)
+        
+        print(f"[SC-INDEX] Max seq length: {max_seq_length}, EMBED_MAX_TOKENS: {embed_max_tokens}")
+        print(f"[SC-INDEX] Safe max tokens per chunk: {safe_max_tokens}")
+        
+        # 전체 토큰 수 계산
         if tokenizer:
-            token_count = len(tokenizer.encode(combined_text, add_special_tokens=False))
+            tokens = tokenizer.encode(combined_text, add_special_tokens=False)
+            total_token_count = len(tokens)
         else:
-            token_count = len(combined_text) // 4  # 대략적인 추정
+            # tokenizer 없으면 대략적 추정
+            total_token_count = len(combined_text) // 4
+            tokens = None
         
-        print(f"[SC-INDEX] SC document token count: {token_count}")
+        print(f"[SC-INDEX] SC document total token count: {total_token_count}")
         
-        # 단일 청크 생성 (메타데이터 포함)
-        chunk = (
-            combined_text,
-            {
-                "page": 1,
-                "pages": [1],
-                "section": "SC Document",
-                "token_count": token_count,
-                "bboxes": {},
-                "type": "sc_document"
-            }
-        )
+        chunks = []
         
-        chunks = [chunk]
+        # 토큰 수가 안전 범위 내면 단일 청크
+        if total_token_count <= safe_max_tokens:
+            print(f"[SC-INDEX] Creating single chunk (within token limit)")
+            chunk = (
+                combined_text,
+                {
+                    "page": 1,
+                    "pages": [1],
+                    "section": "SC Document",
+                    "token_count": total_token_count,
+                    "bboxes": {},
+                    "type": "sc_document"
+                }
+            )
+            chunks = [chunk]
+        else:
+            # 토큰 수 초과 시 분할
+            print(f"[SC-INDEX] Token count ({total_token_count}) exceeds limit ({safe_max_tokens}), splitting into multiple chunks")
+            
+            if tokenizer and tokens:
+                # tokenizer가 있으면 정확하게 토큰 기반 분할
+                num_chunks = (total_token_count + safe_max_tokens - 1) // safe_max_tokens
+                print(f"[SC-INDEX] Splitting into {num_chunks} chunks")
+                
+                for i in range(num_chunks):
+                    start_idx = i * safe_max_tokens
+                    end_idx = min((i + 1) * safe_max_tokens, total_token_count)
+                    chunk_tokens = tokens[start_idx:end_idx]
+                    chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+                    
+                    chunk = (
+                        chunk_text,
+                        {
+                            "page": i + 1,
+                            "pages": [i + 1],
+                            "section": f"SC Document (Part {i + 1}/{num_chunks})",
+                            "token_count": len(chunk_tokens),
+                            "bboxes": {},
+                            "type": "sc_document_part"
+                        }
+                    )
+                    chunks.append(chunk)
+                    print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: {len(chunk_tokens)} tokens")
+            else:
+                # tokenizer 없으면 문자 기반 분할 (대략적)
+                chars_per_chunk = safe_max_tokens * 4  # 1 토큰 ≈ 4자
+                num_chunks = (len(combined_text) + chars_per_chunk - 1) // chars_per_chunk
+                print(f"[SC-INDEX] Splitting into {num_chunks} chunks (character-based)")
+                
+                for i in range(num_chunks):
+                    start_idx = i * chars_per_chunk
+                    end_idx = min((i + 1) * chars_per_chunk, len(combined_text))
+                    chunk_text = combined_text[start_idx:end_idx]
+                    
+                    chunk = (
+                        chunk_text,
+                        {
+                            "page": i + 1,
+                            "pages": [i + 1],
+                            "section": f"SC Document (Part {i + 1}/{num_chunks})",
+                            "token_count": len(chunk_text) // 4,
+                            "bboxes": {},
+                            "type": "sc_document_part"
+                        }
+                    )
+                    chunks.append(chunk)
+                    print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: ~{len(chunk_text)} chars")
+        
+        print(f"[SC-INDEX] Total chunks created: {len(chunks)}")
         
         # ========== Step 4: 청크 정규화 ==========
         chunks = _coerce_chunks_for_milvus(chunks)
-        print(f"[SC-INDEX] Normalized {len(chunks)} chunk for Milvus")
+        print(f"[SC-INDEX] Normalized {len(chunks)} chunk(s) for Milvus")
         
         # ========== Step 5: 임베딩 및 Milvus 저장 ==========
-        job_state.update(job_id, status="embedding", step=f"Embedding SC document")
+        job_state.update(job_id, status="embedding", step=f"Embedding {len(chunks)} chunk(s)")
         
         from app.services.embedding_model import embed, get_sentence_embedding_dimension
         from app.services.milvus_store_v2 import MilvusStoreV2
@@ -934,7 +1064,7 @@ async def process_sc_index(
             print(f"[SC-INDEX] Warning during delete: {e}")
         
         # Milvus insert
-        print(f"[SC-INDEX] Inserting {len(chunks)} chunk to Milvus")
+        print(f"[SC-INDEX] Inserting {len(chunks)} chunk(s) to Milvus")
         
         result = mvs.insert(
             doc_id=data_id,
@@ -942,8 +1072,97 @@ async def process_sc_index(
             embed_fn=embed
         )
         
-        print(f"[SC-INDEX] ✅ Successfully indexed: {result.get('inserted', 0)} chunk")
-        
+        print(f"[SC-INDEX] ✅ Successfully indexed: {result.get('inserted', 0)} chunk(s)")
+
+        # ========== Step 6.5: MinIO sync (SC) ==========
+        try:
+            SYNC_TO_MINIO = os.getenv("JAVA_SYNC_TO_MINIO", "1") == "1"
+            if SYNC_TO_MINIO:
+                doc_id = str(data_id)
+                m = MinIOStore()
+
+                # 표시용 타이틀: osk_data.data_title 우선
+                row = None
+                try:
+                    row = db.get_file_by_id(data_id)  # { data_title, ... }
+                except Exception:
+                    row = None
+                display_title = None
+                if isinstance(row, dict):
+                    display_title = (row.get("data_title") or "").strip() or None
+                if not display_title:
+                    display_title = f"SC Document {doc_id}"
+
+                # SC 텍스트를 PDF로 생성 (임시 경로)
+                import tempfile
+                from pathlib import Path as _Path
+                tmpdir = tempfile.gettempdir()
+                local_pdf = _Path(tmpdir) / f"sc_{doc_id}.pdf"
+
+                try:
+                    _render_text_pdf(combined_text, str(local_pdf))
+                except ImportError as e:
+                    # reportlab 미설치 시 안내 로그
+                    raise RuntimeError(
+                        "reportlab이 설치되어 있지 않아 SC PDF 생성을 할 수 없습니다. "
+                        "컨테이너/환경에 'pip install reportlab'을 추가해 주세요."
+                    ) from e
+
+                # PDF 업로드
+                object_pdf = f"uploaded/{doc_id}.pdf"
+                with open(local_pdf, "rb") as f:
+                    data = f.read()
+                m.upload_bytes(
+                    data,
+                    object_name=object_pdf,
+                    content_type="application/pdf",
+                    length=len(data),
+                )
+
+                # meta.json merge
+                def META_KEY(doc_id: str) -> str:
+                    return f"uploaded/__meta__/{doc_id}/meta.json"
+
+                meta = {}
+                try:
+                    if m.exists(META_KEY(doc_id)):
+                        meta = m.get_json(META_KEY(doc_id)) or {}
+                except Exception:
+                    meta = {}
+
+                # DB 메타를 조금 더 넣고 싶다면 추가
+                extra_meta = {}
+                if isinstance(row, dict):
+                    for k in [
+                        "data_id","data_title","data_code","data_code_detail","data_code_detail_sub",
+                        "file_folder","file_id","reg_nm","reg_id","reg_dt","reg_type","parse_yn"
+                    ]:
+                        if k in row:
+                            extra_meta[k] = row[k]
+
+                meta.update({
+                    "doc_id": doc_id,
+                    "title": display_title,           # ✅ 프론트 목록/뷰어 제목
+                    "pdf_key": object_pdf,            # ✅ 프론트가 여는 키
+                    "original_key": None,             # 파일 원본 개념 없음
+                    "original_fs_path": None,
+                    "original_name": f"sc_{doc_id}.pdf",
+                    "is_pdf_original": True,
+                    "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "indexed": True,
+                    "chunk_count": int(result.get('inserted', 0)),
+                    "last_indexed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "type": "sc_document",
+                    **extra_meta,
+                })
+                m.put_json(META_KEY(doc_id), meta)
+
+                print(f"[SC-MINIO] ✅ synced: {object_pdf} (title='{display_title}', chunks={result.get('inserted', 0)})")
+            else:
+                print("[SC-MINIO] ⏭️ skip: JAVA_SYNC_TO_MINIO=0")
+        except Exception as e:
+            print(f"[SC-MINIO] ❌ sync failed: {e}")
+
         # ========== Step 6: OCR 성공 마킹 ==========
         # SC 문서는 페이지 개념이 없으므로 osk_ocr_data에 저장하지 않음
         # 바로 OCR 성공 처리
@@ -951,9 +1170,9 @@ async def process_sc_index(
         print(f"[SC-INDEX] ✅ Marked OCR success for SC document: data_id={data_id}")
         
         # ========== Step 7: RAG 완료 처리 ==========
-        chunk_count = result.get('inserted', 1)
+        chunk_count = result.get('inserted', len(chunks))
         
-        print(f"[SC-INDEX] ✅ Indexing completed: 1 SC document, {chunk_count} chunk")
+        print(f"[SC-INDEX] ✅ Indexing completed: 1 SC document, {chunk_count} chunk(s)")
         # RAG 완료 마킹 (parse_yn='S' 유지, 히스토리 로깅)
         db.update_rag_completed(data_id)
         
@@ -972,13 +1191,19 @@ async def process_sc_index(
                 data_id=data_id,
                 status="sc_indexed",
                 converted=False,
-                metrics={"pages": 1, "chunks": chunk_count, "type": "sc_document"},
+                metrics={
+                    "pages": 1, 
+                    "chunks": chunk_count, 
+                    "type": "sc_document",
+                    "was_split": chunk_count > 1,
+                    "total_tokens": total_token_count
+                },
                 chunk_count=chunk_count,
                 timestamps={
                     "start": start_time.isoformat(), 
                     "end": end_time.isoformat()
                 },
-                message="indexed successfully (SC document single chunk)"
+                message=f"indexed successfully (SC document {'split into ' + str(chunk_count) + ' chunks' if chunk_count > 1 else 'single chunk'})"
             )
             await send_webhook(callback_url, payload, SHARED_SECRET)
     
