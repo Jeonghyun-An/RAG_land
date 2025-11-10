@@ -679,6 +679,7 @@ async def process_manual_ocr_and_index(
     start_time = datetime.utcnow()
     
     job_state.start(job_id, data_id=data_id, file_id=file_id)
+    rag_yn = (rag_yn or "N").upper()
     
     # rag_yn에 따른 DB 처리
     if rag_yn == "N":
