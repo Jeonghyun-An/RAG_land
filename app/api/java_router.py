@@ -820,7 +820,52 @@ async def process_delete_document(
         if delete_from_minio:
             mstore = MinIOStore()
             # 파일 키 조회 및 삭제 로직 (필요 시)
-            pass
+                        # 기본 키들
+            doc_id = str(data_id)
+            pdf_key_guess = f"uploaded/{doc_id}.pdf"
+            meta_key = META_KEY(doc_id)  # uploaded/__meta__/{doc_id}/meta.json
+            meta_prefix = f"uploaded/__meta__/{doc_id}/"
+
+            # 2-1) meta.json 로드해서 실제 키 확인 시도
+            meta = None
+            try:
+                if mstore.exists(meta_key):
+                    meta = mstore.get_json(meta_key) or {}
+            except Exception:
+                meta = None
+
+            # 2-2) PDF 키 후보들 취합
+            pdf_keys: list[str] = []
+            if isinstance(meta, dict):
+                if meta.get("pdf_key"):
+                    pdf_keys.append(str(meta["pdf_key"]))
+                # 혹시 변환 전 원본이 MinIO에 따로 올라갔다면 (보통은 FS 경로)
+                if meta.get("original_key") and str(meta["original_key"]).startswith(("uploaded/", "serverfs/")):
+                    pdf_keys.append(str(meta["original_key"]))
+            # fallback(메타 없을 때)
+            pdf_keys.append(pdf_key_guess)
+
+            # 중복 제거
+            seen = set()
+            pdf_keys = [k for k in pdf_keys if not (k in seen or seen.add(k))]
+
+            # 2-3) PDF/원본 후보들 삭제
+            for key in pdf_keys:
+                if not key or key.startswith("serverfs://"):  # 로컬 FS 경로는 MinIO 객체 아님
+                    continue
+                if mstore.delete_object_safe(key):
+                    deleted_files.append(key)
+                    print(f"[DELETE] ✅ MinIO object deleted: {key}")
+
+            # 2-4) meta.json 및 해당 프리픽스 삭제
+            # 먼저 meta.json 단건
+            if mstore.delete_object_safe(meta_key):
+                deleted_files.append(meta_key)
+                print(f"[DELETE] ✅ MinIO object deleted: {meta_key}")
+            # 남아있을 수 있는 같은 프리픽스 하위 파일 전부 삭제
+            purged = mstore.delete_prefix(meta_prefix)
+            if purged:
+                print(f"[DELETE] ✅ MinIO prefix purged: {meta_prefix} (count={purged})")
         
         print(f"[DELETE] ✅ Deleted {deleted_count} chunks for data_id={data_id}")
         

@@ -241,6 +241,35 @@ class MinIOStore:
         except S3Error as e:
             raise RuntimeError(f"MinIO 삭제 실패: {e}") from e
         
+    def delete_object_safe(self, object_name: str) -> bool:
+        """객체가 있으면 삭제하고 True, 없으면 False."""
+        try:
+            self.client.remove_object(self.bucket, object_name)
+            return True
+        except Exception:
+            # 존재하지 않거나 권한 문제 등 → 삭제 불가 시 False
+            return False
+
+    def delete_prefix(self, prefix: str) -> int:
+        """
+        prefix 아래 모든 객체 삭제. 삭제한 개수 반환.
+        """
+        deleted = 0
+        try:
+            objects = self.client.list_objects(
+                self.bucket, prefix=prefix, recursive=True
+            )
+            for obj in objects:
+                try:
+                    self.client.remove_object(self.bucket, obj.object_name)
+                    deleted += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return deleted
+
+        
     def list(self, prefix: str = "") -> List[str]:
         return self.list_files(prefix)
 
