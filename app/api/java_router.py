@@ -23,7 +23,7 @@ from pydantic import BaseModel
 import httpx
 
 from app.services.db_connector import DBConnector
-from app.services.pdf_converter import convert_to_pdf, ConvertError
+from app.services.pdf_converter import convert_to_pdf, convert_bytes_to_pdf_bytes, ConvertError
 from app.services import job_state
 from app.services.minio_store import MinIOStore
 from datetime import timezone
@@ -231,7 +231,7 @@ def perform_advanced_chunking(
     job_state.update(job_id, step="chunking:unified")
     return build_chunks(pages_std, layout_map, job_id=job_id)
 
-# --- add near top-level helpers (모듈 상단 어딘가) ---
+
 def _render_text_pdf(text: str, out_path: str) -> str:
     """
     주어진 text를 간단한 PDF로 렌더링해 out_path에 저장하고 경로를 반환.
@@ -289,6 +289,7 @@ def _render_text_pdf(text: str, out_path: str) -> str:
     c.showPage()
     c.save()
     return out_path
+
 
 # ==================== Endpoints ====================
 
@@ -517,11 +518,16 @@ async def process_convert_and_index_prod(
 ):
     """
     운영용 백그라운드 처리 - convert-and-index
-    (기존 로직 유지 - OCR 포함)
+    
+    🔥 수정사항:
+    1. PDF 외 확장자 → PDF 변환 (bytes 기반)
+    2. 변환된 PDF를 MinIO에 업로드
+    3. DB에는 경로를 쓰지 않고 상태만 업데이트
     """
     from app.services.file_parser import parse_pdf, parse_pdf_blocks
     
     db = DBConnector()
+    m = MinIOStore()
     start_time = datetime.utcnow()
     
     job_state.start(job_id, data_id=data_id, file_id=file_id)
@@ -541,26 +547,76 @@ async def process_convert_and_index_prod(
          
         print(f"[PROD] Processing file: {full_path}")
         
-        # ========== Step 2: PDF 변환 (필요 시) ==========
-        is_already_pdf = str(full_path).lower().endswith(".pdf")
+        # ========== Step 2: PDF 변환 (필요 시) + MinIO 업로드 ==========
+        src_ext = full_path.suffix.lower()
+        is_already_pdf = (src_ext == ".pdf")
         
         if is_already_pdf:
+            # 이미 PDF인 경우
             converted_pdf_path = str(full_path)
             print(f"[PROD] Already PDF: {converted_pdf_path}")
+            
+            # PDF 파일을 bytes로 읽어서 MinIO에 업로드
+            with open(full_path, 'rb') as f:
+                pdf_bytes = f.read()
+            
+            doc_id = str(data_id)
+            object_pdf = f"uploaded/{doc_id}.pdf"
+            
+            m.upload_bytes(
+                pdf_bytes,
+                object_name=object_pdf,
+                content_type="application/pdf",
+                length=len(pdf_bytes)
+            )
+            print(f"[PROD] ✅ PDF uploaded to MinIO: {object_pdf}")
+            
         else:
-            job_state.update(job_id, status="converting", step="Converting to PDF")
-            print(f"[PROD] Converting to PDF: {full_path}")
+            # PDF가 아닌 경우 → 변환 후 MinIO 업로드
+            job_state.update(job_id, status="converting", step=f"Converting {src_ext} to PDF")
+            print(f"[PROD] Converting {src_ext} to PDF: {full_path}")
             
-            converted_pdf_path = convert_to_pdf(str(full_path))
-            if not converted_pdf_path or not Path(converted_pdf_path).exists():
-                raise ConvertError("PDF 변환 실패")
-            
-            print(f"[PROD] Converted: {converted_pdf_path}")
-            
-            # DB 업데이트: 변환된 파일 경로
-            rel_folder = str(Path(converted_pdf_path).parent.relative_to(SERVER_BASE_PATH))
-            rel_filename = Path(converted_pdf_path).name
-            db.update_converted_file_path(data_id, rel_folder, rel_filename)
+            try:
+                # bytes로 읽기
+                with open(full_path, 'rb') as f:
+                    content = f.read()
+                
+                # 1순위: Gotenberg bytes 변환
+                pdf_bytes = convert_bytes_to_pdf_bytes(content, src_ext)
+                
+                if pdf_bytes is None:
+                    # 2순위: 로컬 파일 기반 변환 (폴백)
+                    converted_pdf_path = convert_to_pdf(str(full_path))
+                    if not converted_pdf_path or not Path(converted_pdf_path).exists():
+                        raise ConvertError("PDF 변환 실패")
+                    
+                    with open(converted_pdf_path, 'rb') as f:
+                        pdf_bytes = f.read()
+                else:
+                    # bytes 변환 성공: 임시 파일로 저장 (파싱용)
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                        tmp.write(pdf_bytes)
+                        converted_pdf_path = tmp.name
+                
+                print(f"[PROD] ✅ PDF converted: {len(pdf_bytes)} bytes")
+                
+                # MinIO 업로드
+                doc_id = str(data_id)
+                object_pdf = f"uploaded/{doc_id}.pdf"
+                
+                m.upload_bytes(
+                    pdf_bytes,
+                    object_name=object_pdf,
+                    content_type="application/pdf",
+                    length=len(pdf_bytes)
+                )
+                print(f"[PROD] ✅ PDF uploaded to MinIO: {object_pdf}")
+                
+            except Exception as e:
+                raise ConvertError(f"PDF 변환 실패: {e}")
+        
+        # ⚠️ DB에는 경로를 쓰지 않음 (기존 update_converted_file_path 호출 제거)
         
         # ========== Step 3: OCR 시작 마킹 ==========
         db.mark_ocr_start(data_id)
@@ -663,18 +719,9 @@ async def process_convert_and_index_prod(
                     display_title = Path(pdf_path_for_upload).name  # fallback
 
                 if pdf_path_for_upload and Path(pdf_path_for_upload).exists():
-                    m = MinIOStore()
+                    # 이미 MinIO에 업로드했으므로 중복 업로드 불필요
+                    # meta.json만 업데이트
                     object_pdf = f"uploaded/{doc_id}.pdf"
-
-                    # 파일 → bytes 업로드
-                    with open(pdf_path_for_upload, "rb") as f:
-                        data = f.read()
-                    m.upload_bytes(
-                        data,
-                        object_name=object_pdf,
-                        content_type="application/pdf",
-                        length=len(data),
-                    )
 
                     # meta.json 갱신(존재하면 merge)
                     meta = {}
@@ -701,7 +748,7 @@ async def process_convert_and_index_prod(
                         "original_key": None,                   # ✅ MinIO 오브젝트가 아니면 None
                         "original_fs_path": str(full_path),     # ✅ 로컬 경로는 별도 필드에
                         "original_name": Path(full_path).name,
-                        "is_pdf_original": True,
+                        "is_pdf_original": is_already_pdf,
                         "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "indexed": True,
                         "chunk_count": int(chunk_count),
@@ -779,12 +826,12 @@ async def process_manual_ocr_and_index(
     1. rag_yn='N': 신규 OCR 작업
        - osk_data.parse_yn = 'L' 로 시작
        - osk_ocr_data에서 텍스트 가져와서 청킹/임베딩
-       - 완료 시 parse_yn = 'S'
+       - 완료 시 parse_yn = 'S', osk_ocr_hist 로깅
     
-    2. rag_yn='Y': 기존 작업 수정
+    2. rag_yn='Y': 기존 작업 수정 (사용자가 페이지 수정)
        - osk_ocr_data에서 수정된 텍스트 가져와서 재청킹/임베딩
        - Milvus에서 기존 청크 삭제 후 새로 삽입
-       - 완료 시 parse_yn = 'S'
+       - 완료 시 parse_yn = 'S', osk_ocr_hist 로깅
     """
     db = DBConnector()
     start_time = datetime.utcnow()
@@ -1209,7 +1256,6 @@ async def process_sc_index(
     
     except Exception as e:
         job_state.fail(job_id, str(e))
-        db.update_rag_error(data_id, str(e))
         print(f"[SC-INDEX] ❌ Error: {e}")
         
         if callback_url:
@@ -1230,64 +1276,55 @@ async def process_delete_document(
     callback_url: Optional[str]
 ):
     """문서 삭제 백그라운드 처리"""
+    from app.services.milvus_store_v2 import MilvusStoreV2
+    from app.services.embedding_model import get_sentence_embedding_dimension
+    
     try:
-        from app.services.milvus_store_v2 import MilvusStoreV2
-        from app.services.embedding_model import get_sentence_embedding_dimension
-        
+        # Milvus 삭제
         mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
-        
-        # Milvus에서 삭제
         deleted_chunks = mvs._delete_by_doc_id(data_id)
         print(f"[DELETE] Deleted {deleted_chunks} chunks from Milvus for data_id={data_id}")
         
-        # MinIO에서 삭제
+        # MinIO 삭제 (선택)
         deleted_files = []
         if delete_from_minio:
             m = MinIOStore()
+            doc_id = str(data_id)
             
             # PDF 삭제
-            pdf_key = f"uploaded/{data_id}.pdf"
+            pdf_key = f"uploaded/{doc_id}.pdf"
             if m.exists(pdf_key):
                 m.delete(pdf_key)
                 deleted_files.append(pdf_key)
             
-            # 메타 삭제
-            meta_key = META_KEY(data_id)
+            # meta.json 삭제
+            meta_key = META_KEY(doc_id)
             if m.exists(meta_key):
                 m.delete(meta_key)
                 deleted_files.append(meta_key)
             
             print(f"[DELETE] Deleted {len(deleted_files)} files from MinIO")
         
-        # Webhook 전송
+        # Webhook
         if callback_url:
-            payload = {
-                "data_id": data_id,
-                "status": "deleted",
-                "deleted_chunks": deleted_chunks,
-                "deleted_files": deleted_files,
-                "message": "Document deleted successfully"
-            }
-            
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    await client.post(callback_url, json=payload)
-                    print(f"[DELETE-WEBHOOK] ✅ Sent to {callback_url}")
-            except Exception as e:
-                print(f"[DELETE-WEBHOOK] ❌ Failed: {e}")
+            payload = WebhookPayload(
+                job_id=str(uuid.uuid4())[:8],
+                data_id=data_id,
+                status="deleted",
+                converted=False,
+                metrics={"deleted_chunks": deleted_chunks, "deleted_files": len(deleted_files)},
+                message=f"Document deleted: {deleted_chunks} chunks, {len(deleted_files)} files"
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
     
     except Exception as e:
         print(f"[DELETE] ❌ Error: {e}")
         
         if callback_url:
-            payload = {
-                "data_id": data_id,
-                "status": "error",
-                "message": str(e)
-            }
-            
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    await client.post(callback_url, json=payload)
-            except Exception:
-                pass
+            payload = WebhookPayload(
+                job_id=str(uuid.uuid4())[:8],
+                data_id=data_id,
+                status="delete_error",
+                message=str(e)
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
