@@ -465,6 +465,25 @@ class DBConnector:
         combined = "\n\n".join(parts)
         print(f"[DB] ✅ Combined SC text: {len(combined)} chars from {len(parts)} sections")
         return combined
+    
+    def update_file_id_only(self, data_id: str | int, new_file_id: str) -> None:
+        """
+        osk_data.file_id만 변경. file_folder는 변경하지 않음.
+        CUBRID에서는 위치 홀더로 '?' 사용.
+        """
+        try:
+            sql = """
+            UPDATE osk_data
+               SET file_id = ?
+             WHERE data_id = ?
+            """
+            with self.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, (new_file_id, data_id))
+                cur.close()
+            print(f"[DB] ✅ Updated file_id only: data_id={data_id} -> {new_file_id}")
+        except Exception as e:
+            print(f"[DB] ❌ update_file_id_only failed: {e}")
 
     # ==================== 호환성 유지 메서드 ====================
     def update_parse_status(

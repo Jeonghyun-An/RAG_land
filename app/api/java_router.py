@@ -547,77 +547,88 @@ async def process_convert_and_index_prod(
          
         print(f"[PROD] Processing file: {full_path}")
         
-        # ========== Step 2: PDF 변환 (필요 시) + MinIO 업로드 ==========
+        # ========== Step 2: PDF 변환 (필요 시) + MinIO 업로드 + (변환 시) 볼륨 저장 + DB file_id만 변경 ==========
         src_ext = full_path.suffix.lower()
         is_already_pdf = (src_ext == ".pdf")
         
+        doc_id = str(data_id)
+        object_pdf = f"uploaded/{doc_id}.pdf"  # MinIO 업로드 키
+        
+        converted_pdf_path: Optional[str] = None
+        pdf_bytes: Optional[bytes] = None
+        
         if is_already_pdf:
-            # 이미 PDF인 경우
+            # (A) 이미 PDF면: 파일 그대로 사용 + MinIO 업로드 (DB file_id 변경 안 함)
             converted_pdf_path = str(full_path)
             print(f"[PROD] Already PDF: {converted_pdf_path}")
-            
-            # PDF 파일을 bytes로 읽어서 MinIO에 업로드
-            with open(full_path, 'rb') as f:
+        
+            with open(full_path, "rb") as f:
                 pdf_bytes = f.read()
-            
-            doc_id = str(data_id)
-            object_pdf = f"uploaded/{doc_id}.pdf"
-            
+        
             m.upload_bytes(
                 pdf_bytes,
                 object_name=object_pdf,
                 content_type="application/pdf",
-                length=len(pdf_bytes)
+                length=len(pdf_bytes),
             )
             print(f"[PROD] ✅ PDF uploaded to MinIO: {object_pdf}")
-            
+        
         else:
-            # PDF가 아닌 경우 → 변환 후 MinIO 업로드
+            # (B) PDF가 아니면: 변환 → MinIO 업로드 → 동일 폴더에 *.pdf 저장 → DB에는 file_id만 *.pdf로 변경
             job_state.update(job_id, status="converting", step=f"Converting {src_ext} to PDF")
             print(f"[PROD] Converting {src_ext} to PDF: {full_path}")
-            
+        
             try:
-                # bytes로 읽기
-                with open(full_path, 'rb') as f:
+                # 1) bytes 변환 우선
+                with open(full_path, "rb") as f:
                     content = f.read()
-                
-                # 1순위: Gotenberg bytes 변환
+        
                 pdf_bytes = convert_bytes_to_pdf_bytes(content, src_ext)
-                
+        
+                # 2) bytes 변환 실패 시 로컬 변환기로 경로 변환
+                temp_pdf_path: Optional[str] = None
                 if pdf_bytes is None:
-                    # 2순위: 로컬 파일 기반 변환 (폴백)
-                    converted_pdf_path = convert_to_pdf(str(full_path))
-                    if not converted_pdf_path or not Path(converted_pdf_path).exists():
-                        raise ConvertError("PDF 변환 실패")
-                    
-                    with open(converted_pdf_path, 'rb') as f:
+                    temp_pdf_path = convert_to_pdf(str(full_path))
+                    if not temp_pdf_path or not Path(temp_pdf_path).exists():
+                        raise ConvertError("PDF 변환 실패(출력 없음)")
+                    with open(temp_pdf_path, "rb") as f:
                         pdf_bytes = f.read()
-                else:
-                    # bytes 변환 성공: 임시 파일로 저장 (파싱용)
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                        tmp.write(pdf_bytes)
-                        converted_pdf_path = tmp.name
-                
+        
+                assert pdf_bytes is not None, "pdf_bytes is None"
                 print(f"[PROD] ✅ PDF converted: {len(pdf_bytes)} bytes")
-                
-                # MinIO 업로드
-                doc_id = str(data_id)
-                object_pdf = f"uploaded/{doc_id}.pdf"
-                
+        
+                # 3) MinIO 업로드
                 m.upload_bytes(
                     pdf_bytes,
                     object_name=object_pdf,
                     content_type="application/pdf",
-                    length=len(pdf_bytes)
+                    length=len(pdf_bytes),
                 )
                 print(f"[PROD] ✅ PDF uploaded to MinIO: {object_pdf}")
+        
+                # 4) 볼륨(기존 폴더) 에 *.pdf 저장 — 경로는 그대로, 파일명만 .pdf
+                save_path = full_path.with_suffix(".pdf")
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(save_path, "wb") as fw:
+                    fw.write(pdf_bytes)
+                converted_pdf_path = str(save_path)
+                print(f"[PROD] ✅ PDF saved to volume: {converted_pdf_path}")
+        
+                # 5) DB에는 file_id만 *.pdf로 업데이트 (폴더는 건드리지 않음)
+                new_file_id_pdf = save_path.name  # ex) f20231212M3Uv.pdf
+                # ↓ DB 커넥터에 메서드가 없으면 하나 추가해야 합니다. (예시)
+                db.update_file_id_only(data_id, new_file_id_pdf)
+        
+                # 6) 임시 파일 정리
+                try:
+                    if temp_pdf_path and Path(temp_pdf_path).exists():
+                        Path(temp_pdf_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
                 
             except Exception as e:
                 raise ConvertError(f"PDF 변환 실패: {e}")
-        
-        # ⚠️ DB에는 경로를 쓰지 않음 (기존 update_converted_file_path 호출 제거)
-        
+                
         # ========== Step 3: OCR 시작 마킹 ==========
         db.mark_ocr_start(data_id)
         
@@ -967,6 +978,7 @@ async def process_sc_index(
     5. osk_data.parse_yn = 'S', osk_ocr_hist 로깅
     """
     db = DBConnector()
+    m = MinIOStore()
     start_time = datetime.utcnow()
     
     job_state.start(job_id, data_id=data_id, file_id="sc_document")
