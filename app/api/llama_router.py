@@ -589,51 +589,62 @@ def _t(lang: str, ko: str, en: str) -> str:
 
 def _build_prompt(context: str, question: str, lang: str) -> str:
     if lang == "ko":
-        return f"""당신은 한국원자력통제기술원에 등록된 공식 문서를 바탕으로 답변하는 키나기AI 입니다.
-외부 지식이나 추측은 사용하지 않으며, 참고문서 내용만을 근거로 답변합니다.
-일상적인 질문은 일상적으로 대답하세요.
-참고문서에 대한 답변은 한두 개의 단락으로 명확하게 표현하세요. 
+        return f"""당신은 한국원자력통제기술원(KINAC)의 AI 어시스턴트 '키나기AI'입니다.
 
-[작성 지침]
-- 자연스러운 설명체로 2~4문장 이내로 작성합니다.
-- 불릿(-)은 **여러 조치를 나열하거나 절차를 요약할 때만** 전 문장과 띄어쓰기 하여 사용합니다. 
-  (예: “주요 절차는 다음과 같습니다.” 이후에 리스트 작성)
-- 가능한 한 일반 문장형으로 설명하고, 형식적인 번호(1), 2))는 피하세요.
-- 문서의 원문 용어(예: Source material, Safeguards, PIV, PIT)는 그대로 사용합니다.
-- 인용, 링크, 각주([p.xx], [1], URL 등)는 사용하지 마세요.
-- 문서에서 근거를 찾지 못하면 정확히 아래 문장만 출력하세요:  
-  `KINAC의 문서에서 해당 내용을 찾을 수 없습니다.`
+# 답변 원칙
+1. 항상 존댓말을 사용합니다 (~습니다, ~하세요 체).
+2. 이모지, 은어, 인터넷 슬랭은 사용하지 않습니다.
+3. 간결하고 명확하게 답변합니다.
 
-[참고 문서]
+# 답변 방식
+질문이 인사, 안부, 격려, 잡담, 일상 조언이면 컨텍스트를 사용하지 말고 1~3문장으로 친절하게 답변하세요.
+
+질문이 정의, 절차, 정책, 규정, 용어 설명이면 아래 규칙을 따르세요:
+- 제공된 컨텍스트만 사용하고, 외부 지식은 사용하지 마세요.
+- 2~4문장의 자연스러운 문단으로 작성하세요.
+- 불릿(-)은 여러 조치나 절차를 나열할 때만 사용하세요.
+- 번호(1), 2), ①, ② 등은 사용하지 마세요.
+- 원문 용어(Source material, Safeguards, PIV, PIT 등)는 그대로 유지하세요.
+- 페이지 번호, 인용 번호, URL은 포함하지 마세요.
+- 컨텍스트에서 답을 찾을 수 없으면:
+  "KINAC의 문서에서 해당 내용을 찾을 수 없습니다."
+
+# 컨텍스트
 {context}
 
-[질문]
+# 질문
 {question}
 
-[답변]
-"""
+# 답변"""
+
     else:
-        return f"""You are an expert analyst who answers based strictly on IAEA official documents.
-Do not use outside knowledge or speculation. Write your answer as a short, fluent paragraph.
-Use bullet points only when summarizing multiple steps or key points.
+        return f"""You are "Kinagi AI", an AI assistant for KINAC (Korea Institute of Nuclear Nonproliferation And Control).
 
-[Instructions]
-- Write 2–4 concise sentences in a natural, explanatory tone.
-- Use **dash(-)** bullets only when listing multiple items (e.g., procedures, conditions).
-- Prefer paragraph-style explanations for single ideas.
-- Keep original technical terms (e.g. Source material, Safeguards, PIV, PIT).
-- Do not include page numbers, citations ([p.xx], [1]), or URLs.
-- If the answer cannot be found, write exactly:  
-  `I cannot find this in the documents.`
+# Answer Principles
+1. Always use polite, professional language.
+2. Never use emojis, slang, or internet jargon.
+3. Be concise and clear.
 
-[Context]
+# How to Answer
+If the question is a greeting, small talk, encouragement, or everyday advice, do NOT use the context. Answer naturally and kindly in 1-3 sentences.
+
+If the question asks for definitions, procedures, policies, regulations, or terminology, follow these rules:
+- Use ONLY the provided context. No external knowledge.
+- Write 2-4 sentences in natural paragraphs.
+- Use bullet points (dash -) only when listing multiple procedures or steps.
+- Avoid numbered formatting like 1), 2), ①, ②.
+- Keep original technical terms (Source material, Safeguards, PIV, PIT, etc.) as-is.
+- Do NOT include page numbers, citation numbers, or URLs.
+- If the answer cannot be found in the context:
+  "I cannot find this information in KINAC's documents."
+
+# Context
 {context}
 
-[Question]
+# Question
 {question}
 
-[Answer]
-"""
+# Answer"""
 
 # ---- ko -> en 번역기 (로컬 vLLM 사용) ---------------------------------------
 # ON/OFF 토글: RAG_TRANSLATE_QUERY=1 (default 1)
@@ -650,43 +661,107 @@ def _cached_ko_to_en(text: str) -> str:
     return _ko_to_en_call(text)
 
 def _ko_to_en_call(text: str) -> str:
+    """
+    한국어 질문을 영어로 번역 (RAG 검색용)
+    - 질문의 의도와 핵심 키워드 보존
+    - 구어체를 문어체로 변환
+    - 문맥을 고려한 의미 중심 번역
+    """
     try:
         client = get_openai_client()
-        sys = "You are a professional translator. Output ONLY the English translation. No quotes. No notes."
+        
+        # 개선된 시스템 프롬프트
+        sys = """You are a professional translator specialized in converting Korean queries to English for document retrieval.
+
+CRITICAL RULES:
+1. Preserve the INTENT of the question (interrogative → interrogative, statement → statement)
+2. Convert colloquial/informal Korean to formal search-friendly English
+3. Keep technical terms and proper nouns intact
+4. Output ONLY the English translation - no quotes, no explanations
+5. For questions: MUST use question words (What, How, Why, When, Where, Which, etc.)
+6. For incomplete/casual speech: infer the complete meaning
+
+Examples:
+- "오늘 날씨는 어때?" → "What is the weather today?"
+- "왜 반말해?" → "Why are you speaking informally?"
+- "왜 중국어 해 너 중국어 잘해?" → "Why are you speaking Chinese? Are you good at Chinese?"
+- "제57조가 뭐야?" → "What is Article 57?"
+- "PIV 절차 알려줘" → "What is the PIV procedure?"
+- "이거 어떻게 해?" → "How do I do this?"
+"""
+        
         st = pytime.time()
         resp = client.chat.completions.create(
             model=os.getenv("DEFAULT_MODEL_ALIAS", "llama-3.1-8b"),
-            messages=[{"role":"system","content":sys},{"role":"user","content":text}],
-            temperature=0.0, max_tokens=256,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.1,  # 약간의 창의성 허용 (0.0 → 0.1)
+            max_tokens=256,
         )
+        
         if pytime.time() - st > TRANSLATE_TIMEOUT:
             raise TimeoutError("translate timeout")
+        
         out = (resp.choices[0].message.content or "").strip()
-        # 한글 섞이면 한 번 더 강제
+        
+        # 따옴표 제거
+        out = out.strip('"\'`')
+        
+        # 한글이 섞여 있으면 한 번 더 시도
         if _has_hangul(out):
-            sys2 = "Translate to English. Output ONLY ASCII English. No Korean letters. No quotes."
+            sys2 = """Translate to English for document search. 
+Output ONLY pure ASCII English. 
+NO Korean letters. NO quotes. NO explanations.
+Preserve question format if input is a question."""
+            
             resp2 = client.chat.completions.create(
                 model=os.getenv("DEFAULT_MODEL_ALIAS", "llama-3.1-8b"),
-                messages=[{"role":"system","content":sys2},{"role":"user","content":text}],
-                temperature=0.0, max_tokens=256,
+                messages=[
+                    {"role": "system", "content": sys2},
+                    {"role": "user", "content": f"Translate this Korean to English: {text}"}
+                ],
+                temperature=0.0,
+                max_tokens=256,
             )
-            out = (resp2.choices[0].message.content or "").strip()
+            out = (resp2.choices[0].message.content or "").strip().strip('"\'`')
+        
+        # 여전히 한글이 있거나 비어있으면 fallback
         if not out or _has_hangul(out):
             logger.warning("[ask] translation contains Hangul or empty; fallback to original")
             return text
+        
         return out
+        
     except Exception as e:
         logger.warning(f"[ask] translate failed: {e}")
         return text
 
+
 def _maybe_translate_query_for_search(question: str, lang: str) -> str:
+    """
+    검색용 쿼리 전처리:
+    1. normalize_query로 정의형 질문 보강
+    2. 한국 법식 표기 보정 (제 N 조 → Article N)
+    3. 한국어면 영어로 번역
+    """
     q = normalize_query(question)
+    
     if not USE_Q_TRANSL or lang != "ko":
         return q
-    # 한국 법식 "제 12 조" → 영어 "Article 12" 보정(있으면)
+    
+    # 한국 법식 "제 12 조" → 영어 "Article 12" 보정 (번역 전 적용)
     q = re.sub(r"제\s*(\d+)\s*조", r"Article \1", q)
+    
     # 캐시된 번역 사용
-    return _cached_ko_to_en(q)
+    translated = _cached_ko_to_en(q)
+    
+    # 번역 결과 로깅 (디버깅용)
+    if translated != q:
+        logger.debug(f"[translate] {q[:50]} → {translated[:50]}")
+    
+    return translated
 # ---------- Routes ----------
 @router.get("/test")
 def test():
@@ -927,20 +1002,26 @@ def ask_question(req: AskReq):
                 used_chunks=0,
                 sources=[]
             )
-        #  항상 찍히는 요약 로그 (분기 여부와 무관)
+
+        # --- (3) 모든 청크에 대해 임계값 검사 (수정됨) ---
+        filtered_topk = []
+        for c in topk:
+            if _is_confident(c, THRESH):
+                filtered_topk.append(c)
+        
+        # 로그 (전체 top3 + 필터링 결과)
         try:
             dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
-            logger.info("[ask] rerank-top3 (re,emb)=%s | keep=%d | THRESH=%.3f",
-                        dbg, len(topk), THRESH)
+            logger.info("[ask] rerank-top3 (re,emb)=%s | filtered=%d/%d | THRESH=%.3f",
+                        dbg, len(filtered_topk), len(topk), THRESH)
         except Exception as e:
             logger.warning("[ask] debug summarize failed: %s", e)
-
-        # --- (3) 컷오프 로직 대체 ---
-        best = topk[0]
-        if not _is_confident(best, THRESH):
+        
+        # 필터링 후 청크가 없으면 답변 거부
+        if not filtered_topk:
             try:
                 dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
-                logger.info("[ask] LOW-CONF; top3 (re,emb)=%s | q_search=%s",
+                logger.info("[ask] LOW-CONF; all chunks filtered | top3 (re,emb)=%s | q_search=%s",
                     dbg, query_for_search[:120])
             except Exception as e:
                 logger.warning(f"[ask] debug print failed: {e}")
@@ -952,10 +1033,10 @@ def ask_question(req: AskReq):
                 sources=[]
             )
 
-        # 5) 컨텍스트/출처 구성
+        # 5) 컨텍스트/출처 구성 (필터링된 청크만 사용)
         context_lines = []
         sources = []
-        for i, c in enumerate(topk, 1):
+        for i, c in enumerate(filtered_topk, 1):
             sec = (c.get("section") or "").strip()
             chunk_body = _strip_meta_line(c.get("chunk", ""))
             context_lines.append(f"[{i}] (doc:{c['doc_id']} p.{c['page']})\n{chunk_body}")
@@ -975,7 +1056,8 @@ def ask_question(req: AskReq):
         answer = generate_answer_unified(prompt, req.model_name)
         answer = _clean_repetitive_answer(answer)
 
-        return AskResp(answer=answer, used_chunks=len(topk), sources=sources)
+        return AskResp(answer=answer, used_chunks=len(filtered_topk), sources=sources)
+
 
     except HTTPException:
         raise
