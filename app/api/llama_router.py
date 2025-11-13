@@ -589,19 +589,20 @@ def _t(lang: str, ko: str, en: str) -> str:
 
 def _build_prompt(context: str, question: str, lang: str) -> str:
     if lang == "ko":
-        return f"""당신은 국제원자력기구(IAEA) 공식 문서를 바탕으로 답변하는 전문 분석가입니다.
-외부 지식이나 추측은 사용하지 말고, 문서 내용만 근거로 자연스럽게 작성하세요.
-답변은 한두 개의 단락으로 명확하게 표현하세요. 필요할 때만 불릿을 사용하세요.
+        return f"""당신은 한국원자력통제기술원에 등록된 공식 문서를 바탕으로 답변하는 키나기AI 입니다.
+외부 지식이나 추측은 사용하지 않으며, 참고문서 내용만을 근거로 답변합니다.
+일상적인 질문은 일상적으로 대답하세요.
+참고문서에 대한 답변은 한두 개의 단락으로 명확하게 표현하세요. 
 
 [작성 지침]
 - 자연스러운 설명체로 2~4문장 이내로 작성합니다.
-- 불릿(-)은 **여러 조치를 나열하거나 절차를 요약할 때만** 사용합니다. 
+- 불릿(-)은 **여러 조치를 나열하거나 절차를 요약할 때만** 전 문장과 띄어쓰기 하여 사용합니다. 
   (예: “주요 절차는 다음과 같습니다.” 이후에 리스트 작성)
 - 가능한 한 일반 문장형으로 설명하고, 형식적인 번호(1), 2))는 피하세요.
 - 문서의 원문 용어(예: Source material, Safeguards, PIV, PIT)는 그대로 사용합니다.
 - 인용, 링크, 각주([p.xx], [1], URL 등)는 사용하지 마세요.
 - 문서에서 근거를 찾지 못하면 정확히 아래 문장만 출력하세요:  
-  `문서에서 해당 내용을 찾을 수 없습니다.`
+  `KINAC의 문서에서 해당 내용을 찾을 수 없습니다.`
 
 [참고 문서]
 {context}
@@ -1241,6 +1242,39 @@ def status():
     except Exception:
         return {"has_data": False, "doc_count": 0}
 
+
+@router.get("/view/alias/{filename:path}")
+def view_object_alias(filename: str, src: str):
+    """
+    URL이 원하는 파일명으로 끝나도록 만드는 alias 뷰어 엔드포인트.
+    예: /view/alias/원하는이름.pdf?src=uploaded/53.pdf
+    """
+    key = unquote(src)
+    m = MinIOStore()
+    if not m.exists(key):
+        raise HTTPException(404, f"object not found: {key}")
+
+    # 표시/다운로드 모두 동일하게 보이도록 inline + filename 지정
+    media = "application/pdf"
+    try:
+        obj = m.client.get_object(m.bucket, key)
+    except Exception as e:
+        raise HTTPException(500, f"MinIO get_object failed: {e}")
+
+    headers = {
+        "Content-Disposition": _content_disposition("inline", filename),
+        "Content-Type": media,
+    }
+
+    def _iter():
+        try:
+            for chunk in obj.stream(32 * 1024):
+                yield chunk
+        finally:
+            obj.close()
+            obj.release_conn()
+
+    return StreamingResponse(_iter(), media_type=media, headers=headers)
 
 @router.delete("/file/{object_name}")
 def delete_file(object_name: str):
