@@ -1,3 +1,4 @@
+# app/services/pdf_converter.py
 from __future__ import annotations
 from PIL import Image
 if not hasattr(Image, "ANTIALIAS"):
@@ -26,26 +27,11 @@ TXT_EXT    = {".txt", ".csv", ".md"}
 class ConvertStreamError(Exception):
     pass
 
-def convert_stream_to_pdf_bytes(content: bytes, src_ext: str) -> Optional[bytes]:
-    """
-    외부 변환기(예: ONLYOFFICE, 사내 컨버터)로 bytes를 보내 PDF bytes로 받는다.
-    - env DOC_CONVERTER_URL 필요 (POST multipart/form-data)
-    - 실패/미설정 시 None 반환(상위에서 폴백)
-    """
-    if not CONVERTER_ENDPOINT:
-        return None
-    try:
-        files = {"file": (f"upload{src_ext}", content)}
-        data = {"target": "pdf"}
-        r = requests.post(CONVERTER_ENDPOINT, files=files, data=data, timeout=120)
-        r.raise_for_status()
-        # 변환기가 application/pdf 바이너리를 바로 반환한다고 가정
-        return r.content
-    except Exception as e:
-        raise ConvertStreamError(f"stream->pdf 변환 실패: {e}")
+class ConvertError(RuntimeError): 
+    pass
 
-class ConvertError(RuntimeError): ...
-def _ensure_parent(p: Path): p.parent.mkdir(parents=True, exist_ok=True)
+def _ensure_parent(p: Path): 
+    p.parent.mkdir(parents=True, exist_ok=True)
 
 # ---------- helpers ----------
 def _gotenberg_ok() -> bool:
@@ -88,7 +74,120 @@ def _chromium_opts(no_margins: bool = False) -> dict:
         })
     return data
 
-# ---------- public ----------
+# ---------- reportlab 기반 TXT → PDF (bytes 버전) ----------
+def _text_to_pdf_bytes(text: str) -> bytes:
+    """
+    텍스트를 reportlab로 PDF bytes로 변환
+    [핵심 추가] TXT 파일 지원을 위한 bytes 기반 변환
+    """
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError as e:
+        raise ConvertError(f"reportlab이 필요합니다: {e}")
+
+    # 메모리 버퍼
+    buffer = io.BytesIO()
+    
+    # 폰트 등록 시도 (없어도 기본 폰트로 동작)
+    try:
+        # 한글 폰트가 있으면 등록
+        # pdfmetrics.registerFont(TTFont("NotoSans", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"))
+        pass
+    except Exception:
+        pass
+
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    margin_x = 20 * mm
+    margin_y = 20 * mm
+    max_width = width - 2 * margin_x
+    y = height - margin_y
+
+    # 폰트 설정
+    try:
+        c.setFont("Helvetica", 10)
+    except Exception:
+        pass
+
+    # 워드랩
+    import textwrap
+    lines = []
+    for para in (text or "").splitlines():
+        wrap = textwrap.wrap(para, width=95) or [""]
+        lines.extend(wrap)
+
+    line_height = 12  # pt
+    for line in lines:
+        if y <= margin_y:
+            c.showPage()
+            try:
+                c.setFont("Helvetica", 10)
+            except Exception:
+                pass
+            y = height - margin_y
+        c.drawString(margin_x, y, line)
+        y -= line_height
+
+    c.showPage()
+    c.save()
+    
+    # bytes 반환
+    buffer.seek(0)
+    return buffer.read()
+
+# ---------- Local file path 기반 변환 (기존 로직) ----------
+def _libreoffice_to_pdf(src: Path, out: Path):
+    if not _gotenberg_ok():
+        raise ConvertError("Gotenberg 서비스 없음")
+    url = f"{GOTENBERG_URL}/forms/libreoffice/convert"
+    with open(src, "rb") as f:
+        files = {"files": (src.name, f, "application/octet-stream")}
+        pdf_bytes = _post_retry(url, files)
+    with open(out, "wb") as fw:
+        fw.write(pdf_bytes)
+
+def _html_to_pdf(src: Path, out: Path):
+    if not _gotenberg_ok():
+        raise ConvertError("Gotenberg 서비스 없음")
+    url = f"{GOTENBERG_URL}/forms/chromium/convert/html"
+    with open(src, "rb") as f:
+        files = [("files", ("index.html", f, "text/html; charset=utf-8"))]
+        pdf_bytes = _post_retry(url, files, data=_chromium_opts())
+    with open(out, "wb") as fw:
+        fw.write(pdf_bytes)
+
+def _image_to_pdf(src: Path, out: Path):
+    if not _gotenberg_ok():
+        raise ConvertError("Gotenberg 서비스 없음")
+    url = f"{GOTENBERG_URL}/forms/chromium/convert/html"
+    html = (b'<!doctype html><meta charset="utf-8">'
+            b'<style>html,body{margin:0;padding:0}img{width:100%;height:auto}</style>'
+            b'<img src="file.bin">')
+    with open(src, "rb") as f:
+        files = [
+            ("files", ("index.html", io.BytesIO(html), "text/html; charset=utf-8")),
+            ("files", ("file.bin", f, "application/octet-stream")),
+        ]
+        pdf_bytes = _post_retry(url, files, data=_chromium_opts(no_margins=True))
+    with open(out, "wb") as fw:
+        fw.write(pdf_bytes)
+
+def _text_to_pdf(src: Path, out: Path):
+    """로컬 파일 기반 TXT → PDF 변환"""
+    with open(src, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+    
+    pdf_bytes = _text_to_pdf_bytes(text)
+    
+    with open(out, "wb") as fw:
+        fw.write(pdf_bytes)
+
+# ---------- public: 로컬 파일 경로 기반 변환 ----------
 def convert_to_pdf(src_path: str) -> str:
     """입력 파일을 PDF로 변환해서 로컬 경로 반환. 이미 PDF면 그대로 반환."""
     src = Path(src_path)
@@ -114,20 +213,32 @@ def convert_to_pdf(src_path: str) -> str:
         raise ConvertError("변환된 PDF가 비어있습니다.")
     return str(out)
 
-import io
-
-# Gotenberg로 bytes를 직접 보내서 PDF bytes를 얻는다.
-# - 성공: PDF bytes 반환
-# - 미지원 확장자/실패: None
+# ---------- public: bytes 기반 변환 (java_router용) ----------
 def convert_bytes_to_pdf_bytes(content: bytes, src_ext: str) -> bytes | None:
+    """
+    bytes를 PDF bytes로 변환
+    [핵심 수정] TXT 파일 지원 추가
+    
+    Returns:
+        PDF bytes if success, None if unsupported
+    """
     ext = (src_ext or "").lower()
 
     # 이미 PDF면 그대로
     if ext == ".pdf":
         return content
 
-    # 1) Office 류 → LibreOffice 변환
-    if ext in {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".odt", ".odp", ".ods", ".rtf"}:
+    # 1) TXT 류 → reportlab 변환 [핵심 추가]
+    if ext in TXT_EXT:
+        try:
+            text = content.decode("utf-8", errors="ignore")
+            return _text_to_pdf_bytes(text)
+        except Exception as e:
+            print(f"[CONVERT] TXT→PDF 변환 실패: {e}")
+            return None
+
+    # 2) Office 류 → LibreOffice 변환
+    if ext in OFFICE_EXT:
         if not _gotenberg_ok():
             return None
         url = f"{GOTENBERG_URL}/forms/libreoffice/convert"
@@ -137,8 +248,8 @@ def convert_bytes_to_pdf_bytes(content: bytes, src_ext: str) -> bytes | None:
         except Exception:
             return None
 
-    # 2) HTML → Chromium 변환
-    if ext in {".html", ".htm"}:
+    # 3) HTML → Chromium 변환
+    if ext in HTML_EXT:
         if not _gotenberg_ok():
             return None
         url = f"{GOTENBERG_URL}/forms/chromium/convert/html"
@@ -148,8 +259,8 @@ def convert_bytes_to_pdf_bytes(content: bytes, src_ext: str) -> bytes | None:
         except Exception:
             return None
 
-    # 3) 단일 이미지 → 간단한 HTML로 감싸 Chromium 변환
-    if ext in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}:
+    # 4) 단일 이미지 → HTML로 감싸 Chromium 변환
+    if ext in IMG_EXT:
         if not _gotenberg_ok():
             return None
         url = f"{GOTENBERG_URL}/forms/chromium/convert/html"
@@ -165,87 +276,23 @@ def convert_bytes_to_pdf_bytes(content: bytes, src_ext: str) -> bytes | None:
         except Exception:
             return None
 
-    # 4) 미지원 (예: .hwpx, .hwp 등) → None
+    # 지원하지 않는 확장자
     return None
 
-# ---------- converters ----------
-def _libreoffice_to_pdf(src: Path, out: Path):
-    if not _gotenberg_ok():
-        raise ConvertError("Gotenberg healthcheck 실패")
-    url = f"{GOTENBERG_URL}/forms/libreoffice/convert"
-    with open(src, "rb") as f:
-        files = {"files": (src.name, f, "application/octet-stream")}
-        pdf = _post_retry(url, files)
-    out.write_bytes(pdf)
-
-def _html_to_pdf(src: Path, out: Path):
-    if not _gotenberg_ok():
-        raise ConvertError("Gotenberg healthcheck 실패")
-    url = f"{GOTENBERG_URL}/forms/chromium/convert/html"
-    with open(src, "rb") as f:
-        files = {"files": ("index.html", f, "text/html; charset=utf-8")}
-        data = _chromium_opts()
-        pdf = _post_retry(url, files, data=data)
-    out.write_bytes(pdf)
-
-def _text_to_pdf(src: Path, out: Path):
-    # TXT/CSV/MD를 간단히 HTML로 감싸서 Chromium 경로 사용(폰트/여백 안정화)
-    content = src.read_text(encoding="utf-8", errors="ignore")
-    style = f"""
-    <style>
-      @page {{ size: {PDF_PAPER if PDF_PAPER!='auto' else 'A4'}; margin: {PDF_MARGIN_MM}mm; }}
-      body {{ font-family: system-ui, 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', Arial, sans-serif;
-              white-space: pre-wrap; word-break: break-word; }}
-      pre {{ white-space: pre-wrap; }}
-      table {{ border-collapse: collapse; width: 100%; }}
-      td, th {{ border: 1px solid #ddd; padding: 4px; }}
-    </style>"""
-    html = f"<!doctype html><meta charset='utf-8'>{style}<pre>{content}</pre>"
-    if not _gotenberg_ok():
-        raise ConvertError("Gotenberg healthcheck 실패")
-    url = f"{GOTENBERG_URL}/forms/chromium/convert/html"
-    files = {"files": ("index.html", io.BytesIO(html.encode("utf-8")), "text/html; charset=utf-8")}
-    data = _chromium_opts()
-    pdf = _post_retry(url, files, data=data)
-    out.write_bytes(pdf)
-
-def _image_to_pdf(src: Path, out: Path):
-    """이미지 → PDF 변환 (Pillow 10.0+ 호환)"""
+def convert_stream_to_pdf_bytes(content: bytes, src_ext: str) -> Optional[bytes]:
+    """
+    외부 변환기(예: ONLYOFFICE, 사내 컨버터)로 bytes를 보내 PDF bytes로 받는다.
+    - env DOC_CONVERTER_URL 필요 (POST multipart/form-data)
+    - 실패/미설정 시 None 반환(상위에서 폴백)
+    """
+    if not CONVERTER_ENDPOINT:
+        return None
     try:
-        from PIL import Image, ImageSequence
-        im = Image.open(src)
-        
-        # Pillow 10.0+ 호환: LANCZOS 사용 (ANTIALIAS 제거됨)
-        frames = []
-        for frame in ImageSequence.Iterator(im):
-            rgb_frame = frame.convert("RGB")
-            # 리샘플링이 필요한 경우 LANCZOS 명시
-            frames.append(rgb_frame)
-        
-        if not frames:
-            frames = [im.convert("RGB")]
-        
-        if len(frames) == 1:
-            frames[0].save(out, "PDF", resolution=100.0)
-        else:
-            frames[0].save(out, "PDF", save_all=True, append_images=frames[1:], resolution=100.0)
-        return
+        files = {"file": (f"upload{src_ext}", content)}
+        data = {"target": "pdf"}
+        r = requests.post(CONVERTER_ENDPOINT, files=files, data=data, timeout=120)
+        r.raise_for_status()
+        # 변환기가 application/pdf 바이너리를 바로 반환한다고 가정
+        return r.content
     except Exception as e:
-        print(f"[PDF_CONVERTER] Pillow 변환 실패, Chromium 폴백: {e}")
-        pass
-    _image_to_pdf_via_chromium(src, out)
-    
-def _image_to_pdf_via_chromium(src: Path, out: Path):
-    if not _gotenberg_ok():
-        raise ConvertError("Gotenberg healthcheck 실패")
-    url = f"{GOTENBERG_URL}/forms/chromium/convert/html"
-    html = (b'<!doctype html><meta charset="utf-8">'
-            b'<style>html,body{margin:0;padding:0}img{width:100%;height:auto}</style>'
-            b'<img src="file.bin">')
-    files = [
-        ("files", ("index.html", io.BytesIO(html), "text/html; charset=utf-8")),
-        ("files", ("file.bin", open(src, "rb"), "application/octet-stream")),
-    ]
-    data = _chromium_opts(no_margins=True)
-    pdf = _post_retry(url, files, data=data)
-    out.write_bytes(pdf)
+        raise ConvertStreamError(f"stream->pdf 변환 실패: {e}")
