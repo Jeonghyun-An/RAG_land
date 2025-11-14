@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Tuple, Dict, Any, Callable, Optional
 
 from pymilvus import (
@@ -20,6 +21,54 @@ SECTION_MAX = int(os.getenv("MILVUS_SECTION_MAX", "512"))
 DOC_ID_MAX  = int(os.getenv("MILVUS_DOCID_MAX",  "256"))
 CHUNK_MAX   = int(os.getenv("MILVUS_CHUNK_MAX",  "8192"))
 
+
+def _safe_truncate_text(text: str, max_len: int) -> str:
+    """
+    텍스트를 UTF-8 바이트 길이 기준으로 안전하게 자르기.
+    문자 수가 아닌 바이트 수를 기준으로 하여 Milvus VARCHAR 제한을 절대 넘지 않음.
+    """
+    if not text:
+        return ""
+    
+    # 1단계: 바이트 길이 체크
+    encoded = text.encode('utf-8', errors='ignore')
+    if len(encoded) <= max_len:
+        return text
+    
+    # 2단계: 바이트 기준으로 잘라야 함
+    # 안전 마진 (10% 여유)
+    target_bytes = int(max_len * 0.9)
+    
+    # 바이트 단위로 자르되, UTF-8 문자 경계를 지킴
+    truncated_bytes = encoded[:target_bytes]
+    
+    # UTF-8 디코딩 시도 (불완전한 멀티바이트 문자 제거)
+    try:
+        truncated = truncated_bytes.decode('utf-8', errors='ignore')
+    except:
+        # 혹시 모를 에러에 대비
+        truncated = text[:int(max_len * 0.5)]
+    
+    # 3단계: 문장 경계에서 자르기 시도
+    if len(truncated) > target_bytes * 0.5:  # 절반 이상 남아있으면
+        last_sentence_end = max(
+            truncated.rfind('.'),
+            truncated.rfind('!'),
+            truncated.rfind('?'),
+            truncated.rfind('。'),
+        )
+        if last_sentence_end > len(truncated) * 0.5:
+            truncated = truncated[:last_sentence_end + 1]
+    
+    # 4단계: 최종 바이트 길이 검증 및 강제 자르기
+    final_encoded = truncated.encode('utf-8', errors='ignore')
+    while len(final_encoded) > max_len and truncated:
+        # 10% 씩 줄이기
+        cut_point = int(len(truncated) * 0.9)
+        truncated = truncated[:cut_point]
+        final_encoded = truncated.encode('utf-8', errors='ignore')
+    
+    return truncated.strip()
 
 
 def _vmax(field):
@@ -52,9 +101,6 @@ def _get_schema_limits(col: Collection) -> dict:
         "chunk":   _vmax(f.get("chunk"))   or CHUNK_MAX,
     }
 
-def delete_by_doc_id(self, doc_id: str) -> int:
-    return self._delete_by_doc_id(doc_id)
-
 
 class MilvusStoreV2:
     """
@@ -62,6 +108,7 @@ class MilvusStoreV2:
       - 스키마:
           id (INT64, auto_id, primary)
           doc_id (VARCHAR 256)
+          seq (INT64)
           page (INT64)
           section (VARCHAR 512)
           chunk (VARCHAR 8192)
@@ -125,21 +172,36 @@ class MilvusStoreV2:
                         return int(getattr(field, "max_length", 0))
                     except Exception:
                         return 0
-            if vmax(fdict["doc_id"]) != DOC_ID_MAX: return True
-            if vmax(fdict["section"]) != SECTION_MAX: return True
-            if vmax(fdict["chunk"])   != CHUNK_MAX:  return True
+            
+            # 환경변수 기준으로 스키마 불일치 체크
+            current_doc_id_max = vmax(fdict["doc_id"])
+            current_section_max = vmax(fdict["section"])
+            current_chunk_max = vmax(fdict["chunk"])
+            
+            # 현재 스키마와 환경변수 비교
+            if current_doc_id_max != DOC_ID_MAX:
+                print(f"⚠️ Schema mismatch: doc_id max_length {current_doc_id_max} != {DOC_ID_MAX}")
+                return True
+            if current_section_max != SECTION_MAX:
+                print(f"⚠️ Schema mismatch: section max_length {current_section_max} != {SECTION_MAX}")
+                return True
+            if current_chunk_max != CHUNK_MAX:
+                print(f"⚠️ Schema mismatch: chunk max_length {current_chunk_max} != {CHUNK_MAX}")
+                return True
+            
             return False
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ Schema check error: {e}")
             return True
 
     def _create_collection(self) -> Collection:
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length= DOC_ID_MAX),
+            FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=DOC_ID_MAX),
             FieldSchema(name="seq", dtype=DataType.INT64),
             FieldSchema(name="page", dtype=DataType.INT64),
-            FieldSchema(name="section", dtype=DataType.VARCHAR, max_length= SECTION_MAX),
-            FieldSchema(name="chunk", dtype=DataType.VARCHAR, max_length= CHUNK_MAX),
+            FieldSchema(name="section", dtype=DataType.VARCHAR, max_length=SECTION_MAX),
+            FieldSchema(name="chunk", dtype=DataType.VARCHAR, max_length=CHUNK_MAX),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.dim),
         ]
         schema = CollectionSchema(fields, description="RAG chunks with metadata (v2)")
@@ -187,13 +249,20 @@ class MilvusStoreV2:
 
     # ---------------- public ----------------
 
-    def insert(self, doc_id: str, chunks: List[Tuple[str, Dict[str, Any]]], embed_fn: Callable[[List[str]], List[List[float]]], ) -> Dict[str, Any]:
+    def insert(
+        self, 
+        doc_id: str, 
+        chunks: List[Tuple[str, Dict[str, Any]]], 
+        embed_fn: Callable[[List[str]], List[List[float]]],
+    ) -> Dict[str, Any]:
         """
         중복 방지 & 안전 삽입:
         - RAG_SKIP_IF_EXISTS=1  : 같은 doc_id 존재 시 스킵
         - RAG_REPLACE_DOC=1     : 같은 doc_id 존재 시 삭제 후 삽입
         - RAG_DEDUP_MANIFEST=1  : MinIO docs/{doc_id}.json 에 sha256 기록/비교
         - RAG_UNIQUE_SUFFIX_ON_CONFLICT=1 : 충돌인데 REPLACE 아님 → doc_id__hash 로 새로 삽입
+        
+        **중요**: 텍스트 길이 제한을 임베딩 전에 적용하여 Milvus 에러 방지
         """
         out = {"inserted": 0, "skipped": False, "reason": None, "doc_id": doc_id}
         if not chunks:
@@ -213,122 +282,146 @@ class MilvusStoreV2:
         UNIQUE_SUFFIX   = os.getenv("RAG_UNIQUE_SUFFIX_ON_CONFLICT", "1") == "1"
 
         # -------- 1) 매니페스트(해시) 비교
-        # 해시 = 전체 텍스트 조인 sha256
         import hashlib
-        texts = [c[0] for c in chunks]
-        text_blob = "\n\n".join(texts).encode("utf-8", errors="ignore")
+        
+        # ===== 중요: 텍스트 길이 제한을 임베딩 전에 적용 =====
+        # 먼저 텍스트 추출 및 안전하게 자르기
+        raw_texts = [(c[0] or "") for c in chunks]
+        safe_texts = [_safe_truncate_text(t, CHUNK_MAX) for t in raw_texts]
+        
+        # 해시 계산은 안전하게 잘린 텍스트 기준
+        text_blob = "\n\n".join(safe_texts).encode("utf-8", errors="ignore")
         doc_hash = hashlib.sha256(text_blob).hexdigest()
+
         manifest_key = f"docs/{doc_id}.json"
-        manifest = None
+
+        # 매니페스트 비교
         if USE_MANIFEST:
             try:
                 from app.services.minio_store import MinIOStore
-                m = MinIOStore()
-                if m.exists(manifest_key):
-                    manifest = m.get_json(manifest_key)
-            except Exception:
-                manifest = None
-
-        # 해시가 같으면 스킵
-        if manifest and manifest.get("sha256") == doc_hash:
-            out["skipped"] = True
-            out["reason"] = "same_hash"
-            return out
-
-        # -------- 2) 존재 정책 처리
-        if exists_cnt > 0:
-            if SKIP_IF_EXISTS and not manifest:
-                # 단순 존재 스킵
-                out["skipped"] = True
-                out["reason"] = "exists_skip"
-                return out
-
-            if REPLACE_DOC:
-                try:
-                    deleted = self._delete_by_doc_id(doc_id)
-                    print(f"replace existing doc_id={doc_id}: deleted {deleted} rows")
-                except Exception as e:
-                    raise RuntimeError(f"failed to replace existing doc_id={doc_id}: {e}")
-            else:
-                # REPLACE 아님 → 충돌 처리
-                if UNIQUE_SUFFIX:
-                    suffix = doc_hash[:8]
-                    doc_id = f"{doc_id}__{suffix}"
-                    out["doc_id"] = doc_id
-                else:
+                prev = MinIOStore().get_json(manifest_key)
+                if prev and prev.get("sha256") == doc_hash:
                     out["skipped"] = True
-                    out["reason"] = "exists_conflict"
+                    out["reason"] = "manifest_match"
                     return out
+            except Exception:
+                pass
 
-        # -------- 3) 메타 정규화
+        # -------- 2) 존재 여부 체크
+        if exists_cnt > 0:
+            if SKIP_IF_EXISTS:
+                out["skipped"] = True
+                out["reason"] = "exists"
+                return out
+            if REPLACE_DOC:
+                self._replace_doc_if_needed(doc_id)
+            elif UNIQUE_SUFFIX:
+                doc_id = doc_id + "__" + doc_hash[:8]
+                out["doc_id"] = doc_id
+
+        # -------- 3) 메타데이터 추출 및 길이 제한 적용
         limits = _get_schema_limits(self.col)
-        SEC_MAX   = int(limits["section"])
-        CHK_MAX = int(limits["chunk"])
-        SAFE_VARCHAR_CAP = 512
-        SEC_MAX = min(SEC_MAX if SEC_MAX>0 else SECTION_MAX, SAFE_VARCHAR_CAP)
-        RAG_SEC_MAX = int(os.getenv("RAG_SECTION_MAX", 160))
+        SEC_MAX = limits["section"]
+        CHK_MAX = limits["chunk"]
+        
+        # 안전 마진을 위한 실제 제한값 (스키마보다 작게)
+        SAFE_SECTION_LIMIT = min(SEC_MAX, 480)  # 512 - 마진
+        SAFE_CHUNK_LIMIT = min(CHK_MAX, 8000)   # 8192 - 마진
         
         metas = [c[1] for c in chunks]
         pages = []
         sections = []
+        seqs = list(range(len(chunks)))
+        
         for m in metas:
             try:
                 pages.append(int(m.get("page", 0)))
             except Exception:
                 pages.append(0)
-            s = "" if m.get("section") is None else str(m.get("section"))
-            s=s[:RAG_SEC_MAX]
-            sections.append(s[:SEC_MAX])  #  실제 스키마 길이로 clamp
             
-        # -------- 4) 텍스트 준비 (임베딩 전에 잘라서 "임베딩 내용 == 저장 내용")
-        texts = [(c[0] or "") for c in chunks]
-        texts = [t[:CHUNK_MAX] for t in texts]  #  하드 클램프
-        
-        seqs = list(range(len(texts)))
+            # section 필드도 안전하게 자르기
+            s = "" if m.get("section") is None else str(m.get("section"))
+            sections.append(_safe_truncate_text(s, SAFE_SECTION_LIMIT))
 
-        # -------- 4) 임베딩 + 차원 검증
-        vecs = embed_fn(texts)
-        if not vecs or len(vecs) != len(texts):
+        # -------- 4) 텍스트 최종 정리 (이미 safe_texts로 잘림)
+        # 추가 안전장치: 다시 한번 체크
+        final_texts = [_safe_truncate_text(t, SAFE_CHUNK_LIMIT) for t in safe_texts]
+        
+        # 디버그 로그
+        for i, (orig, safe) in enumerate(zip(raw_texts, final_texts)):
+            if len(orig) > len(safe):
+                print(f"⚠️ Chunk {i} truncated: {len(orig)} → {len(safe)} chars")
+
+        # -------- 5) 임베딩 생성 (이제 안전하게 잘린 텍스트로)
+        print(f"[Milvus] Embedding {len(final_texts)} chunks...")
+        vecs = embed_fn(final_texts)
+        
+        if not vecs or len(vecs) != len(final_texts):
             raise RuntimeError("embedding failed: empty or count mismatch")
+        
         dim0 = len(vecs[0])
         if dim0 != self.dim:
             raise RuntimeError(f"embedding dim mismatch: expect {self.dim}, got {dim0}")
+        
         for i, v in enumerate(vecs):
             if len(v) != dim0:
                 raise RuntimeError(f"embedding dim mismatch at {i}: {len(v)}")
 
-        # -------- 5) 리스트-컬럼 방식으로 삽입 (스키마: [id, doc_id, page, section, chunk, embedding])
+        # -------- 6) doc_id 길이 제한
         if len(doc_id) > DOC_ID_MAX:
-            import hashlib
-            suf = hashlib.sha256(doc_id.encode("utf-8","ignore")).hexdigest()[:8]
-            doc_id = doc_id[:(DOC_ID_MAX-10)] + "__" + suf
-        # 리스트로 묶어서 삽입
+            suf = hashlib.sha256(doc_id.encode("utf-8", "ignore")).hexdigest()[:8]
+            doc_id = doc_id[:(DOC_ID_MAX - 10)] + "__" + suf
+            out["doc_id"] = doc_id
+
+        # -------- 7) entities 생성 전 최종 검증
+        # 스키마 제한 확인
+        schema_limits = _get_schema_limits(self.col)
+        actual_chunk_max = schema_limits["chunk"]
+        actual_section_max = schema_limits["section"]
+        
+        print(f"[Milvus] Schema limits: chunk={actual_chunk_max}, section={actual_section_max}")
+        
+        # 최종 안전장치: 스키마 제한보다 작게 자르기
+        final_texts = [_safe_truncate_text(t, actual_chunk_max - 100) for t in final_texts]
+        sections = [_safe_truncate_text(s, actual_section_max - 32) for s in sections]
+        
+        # 검증: 모든 텍스트가 제한 내에 있는지 확인
+        for i, t in enumerate(final_texts):
+            byte_len = len(t.encode('utf-8', errors='ignore'))
+            if byte_len > actual_chunk_max:
+                print(f"⚠️ CRITICAL: Chunk {i} still exceeds limit! {byte_len} > {actual_chunk_max}")
+                # 강제 자르기
+                final_texts[i] = t[:actual_chunk_max - 100]
+        
+        # -------- 8) entities 생성 및 삽입
         entities = [
-            [doc_id] * len(texts),   # doc_id
-            seqs,                    # seq(in doc)
-            pages,                   # page
-            sections,                # section
-            [t[:8192] for t in texts],  # chunk
-            vecs,                    # embedding
+            [doc_id] * len(final_texts),   # doc_id
+            seqs,                           # seq
+            pages,                          # page
+            sections,                       # section
+            final_texts,                    # chunk (이미 안전하게 잘림)
+            vecs,                           # embedding
         ]
 
+        print(f"[Milvus] Inserting {len(final_texts)} chunks for doc_id={doc_id}...")
         mr = self.col.insert(entities)
         self.col.flush()
+        
         try:
             self.col.load()
         except Exception:
             pass
 
-        out["inserted"] = len(texts)
+        out["inserted"] = len(final_texts)
 
-        # -------- 6) 매니페스트 기록(옵션)
+        # -------- 9) 매니페스트 기록(옵션)
         if USE_MANIFEST:
             try:
                 from app.services.minio_store import MinIOStore
                 MinIOStore().put_json(manifest_key, {
                     "doc_id": doc_id,
                     "sha256": doc_hash,
-                    "chunks": len(texts),
+                    "chunks": len(final_texts),
                     "dim": self.dim,
                 })
             except Exception:
@@ -356,7 +449,6 @@ class MilvusStoreV2:
         rows = self.col.query(
             expr=f'doc_id == "{safe}"',
             output_fields=["id"],
-            # limit는 제거(모두 가져오기). 환경에 따라 한번에 너무 많으면 나눠서 조회 필요
         ) or []
 
         ids = [r["id"] for r in rows if "id" in r]
@@ -367,13 +459,21 @@ class MilvusStoreV2:
         BATCH = 16384  # 안전한 배치 크기
         for i in range(0, len(ids), BATCH):
             batch = ids[i : i + BATCH]
-            # 리스트를 그대로 포맷팅하면 [1,2,3] 형태가 되어 expr로 사용 가능
             self.col.delete(expr=f"id in {batch}")
 
         self.col.flush()
         return len(ids)
     
-    def search(self, query: str, embed_fn: Callable[[List[str]], List[List[float]]], topk: int = 20) -> List[Dict[str, Any]]:
+    def delete_by_doc_id(self, doc_id: str) -> int:
+        """외부 호출용 alias"""
+        return self._delete_by_doc_id(doc_id)
+    
+    def search(
+        self, 
+        query: str, 
+        embed_fn: Callable[[List[str]], List[List[float]]], 
+        topk: int = 20
+    ) -> List[Dict[str, Any]]:
         """IP metric + normalize 임베딩 기준으로 상위 topk 반환"""
         if not query:
             return []
@@ -390,26 +490,24 @@ class MilvusStoreV2:
             param={"metric_type": "IP", "params": {"ef": 64}},
             limit=topk,
             output_fields=["doc_id", "seq", "page", "section", "chunk"],
-            consistency_level="Strong",  # 바로 insert한 것도 검색 반영
+            consistency_level="Strong",
         )
 
         out: List[Dict[str, Any]] = []
         for hit in res[0]:
             ent = hit.entity
-            out.append(
-                {
-                    "score": float(hit.distance),  # IP similarity (normalized → cosine과 동일하게 해석)
-                    "doc_id": ent.get("doc_id"),
-                    "seq": int(ent.get("seq")),
-                    "page": int(ent.get("page")),
-                    "section": ent.get("section"),
-                    "chunk": ent.get("chunk"),
-                }
-            )
+            out.append({
+                "score": float(hit.distance),
+                "doc_id": ent.get("doc_id"),
+                "seq": int(ent.get("seq")),
+                "page": int(ent.get("page")),
+                "section": ent.get("section"),
+                "chunk": ent.get("chunk"),
+            })
         return out
     
-# ----------------카운트 관련----------------
     def count_by_doc(self, doc_id: str) -> int:
+        """특정 doc_id의 청크 개수 조회"""
         try:
             self.col.load()
         except Exception:
@@ -421,8 +519,6 @@ class MilvusStoreV2:
         )
         return len(res) if res else 0
 
-# 파일 상단 import 그대로 두고, 클래스 안에 아래 메서드들 추가
-
     def stats(self) -> dict:
         """컬렉션 상태 요약"""
         try:
@@ -432,7 +528,6 @@ class MilvusStoreV2:
         idx = []
         try:
             for ix in getattr(self.col, "indexes", []):
-                # Milvus 2.2.x 에서 index.params 구조가 다를 수 있어 방어적으로 추출
                 params = {}
                 try:
                     params = ix.params
@@ -456,128 +551,44 @@ class MilvusStoreV2:
             output_fields=["doc_id", "seq", "page", "section", "chunk"],
             limit=limit
         )
+        max_preview = int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))
         return [
             {
                 "doc_id": r.get("doc_id"),
+                "seq": int(r.get("seq", -1)),
                 "page": int(r.get("page", -1)),
                 "section": r.get("section", ""),
-                # 잘림 길이를 라우터에서 제어하도록 환경변수 허용 (기본 300)
-                "chunk": (
-                    (r.get("chunk") or "")[: int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))]
-                    if os.getenv("DEBUG_PEEK_MAX_CHARS", "300") != "0"
-                    else (r.get("chunk") or "")
-                ),
+                "chunk": (r.get("chunk", "")[:max_preview] + "..." 
+                         if max_preview > 0 and len(r.get("chunk", "")) > max_preview 
+                         else r.get("chunk", "")),
             }
             for r in rows
         ]
 
-    def peek(self, limit: int = 5) -> list[dict]:
-        """아무거나 몇 개 보기(샘플)"""
-        rows = self.col.query(
-            expr="page >= 0",
-            output_fields=["doc_id", "seq", "page", "section", "chunk"],
-            limit=limit
-        )
-        return [
-            {
-                "doc_id": r.get("doc_id"),
-                "page": int(r.get("page", -1)),
-                "section": r.get("section", ""),
-                "chunk": (
-                    (r.get("chunk") or "")[: int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))]
-                    if os.getenv("DEBUG_PEEK_MAX_CHARS", "300") != "0"
-                    else (r.get("chunk") or "")
-                ),
-            }
-            for r in rows
-        ]
-        
-    def debug_search(self, query: str, embed_fn, topk: int = 5) -> list[dict]:
-        """리랭크 전 순수 벡터 검색 결과 보기"""
-        qv = embed_fn([query])[0]
-        self.col.load()
-        res = self.col.search(
-            data=[qv],
-            anns_field="embedding",
-            param={"metric_type": "IP", "params": {"ef": 64}},
-            limit=topk,
-            output_fields=["doc_id", "seq", "page", "section", "chunk"]
-        )
-        out = []
-        if res and res[0]:
-            for h in res[0]:
-                out.append({
-                    "score_ip": float(h.distance),
-                    "doc_id": h.entity.get("doc_id"),
-                    "page": int(h.entity.get("page")),
-                    "section": h.entity.get("section"),
-                    "chunk": (
-                         (h.entity.get("chunk") or "")[: int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))]
-                         if os.getenv("DEBUG_PEEK_MAX_CHARS", "300") != "0"
-                         else (h.entity.get("chunk") or "")
-                     ),
-                })
-        return out
-    
-    # def neighbors_by_seq(self, doc_id: str, center_seq: int, k_before: int = 2, k_after: int = 2) -> list[dict]:
-    #     lo = max(0, int(center_seq) - int(k_before))
-    #     hi = int(center_seq) + int(k_after)
-    #     expr = f'doc_id == "{doc_id}" and seq >= {lo} and seq <= {hi}'
-    #     rows = self.col.query(
-    #         expr=expr,
-    #         output_fields=["doc_id", "seq", "page", "section", "chunk"],
-    #         limit= max(1, (k_before + k_after + 1)) * 5   # 안전 여유치
-    #     )
-    #     # seq 기준 정렬 + 중복 제거
-    #     rows = sorted(rows, key=lambda r: int(r.get("seq", 0)))
-    #     dedup = []
-    #     seen = set()
-    #     for r in rows:
-    #         key = (r.get("doc_id"), int(r.get("seq", -1)))
-    #         if key in seen: continue
-    #         seen.add(key)
-    #         dedup.append({
-    #             "doc_id": r.get("doc_id"),
-    #             "seq": int(r.get("seq", -1)),
-    #             "page": int(r.get("page", -1)),
-    #             "section": r.get("section", ""),
-    #             "chunk": r.get("chunk") or "",
-    #         })
-    #     return dedup
-
-
-    def neighbors_by_seq(self, doc_id: str, center_seq: int, k_before: int = 1, k_after: int = 1) -> list[dict]:
-        """
-        같은 doc_id 내에서 seq 기준으로 앞뒤 이웃을 포함해 묶음을 돌려준다.
-        반환: [{doc_id, page, seq, section, chunk}, ...] (seq 오름차순)
-        """
+    def peek(self, limit: int = 10) -> list[dict]:
+        """컬렉션의 일부 데이터 미리보기"""
         try:
             self.col.load()
         except Exception:
             pass
-        start = int(center_seq) - int(k_before)
-        end   = int(center_seq) + int(k_after)
-        expr = f'doc_id == "{doc_id}" && seq >= {start} && seq <= {end}'
+        
         rows = self.col.query(
-            expr=expr,
-            output_fields=["doc_id", "page", "seq", "section", "chunk"],
-            limit=10000
+            expr="id >= 0",
+            output_fields=["id", "doc_id", "seq", "page", "section", "chunk"],
+            limit=limit
         )
-        rows = rows or []
-        rows.sort(key=lambda r: int(r.get("seq", 0)))
-        # page/seq 정규화 + 미리보기 자르기(환경변수)
-        out = []
-        for r in rows:
-            out.append({
+        
+        max_preview = int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))
+        return [
+            {
+                "id": r.get("id"),
                 "doc_id": r.get("doc_id"),
-                "page": int(r.get("page", -1)),
                 "seq": int(r.get("seq", -1)),
+                "page": int(r.get("page", -1)),
                 "section": r.get("section", ""),
-                "chunk": (
-                    (r.get("chunk") or "")[: int(os.getenv("DEBUG_PEEK_MAX_CHARS", "300"))]
-                    if os.getenv("DEBUG_PEEK_MAX_CHARS", "300") != "0"
-                    else (r.get("chunk") or "")
-                ),
-            })
-        return out
-    
+                "chunk": (r.get("chunk", "")[:max_preview] + "..." 
+                         if max_preview > 0 and len(r.get("chunk", "")) > max_preview 
+                         else r.get("chunk", "")),
+            }
+            for r in rows
+        ]
