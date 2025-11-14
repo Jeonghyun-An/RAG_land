@@ -615,7 +615,9 @@ def _build_prompt(context: str, question: str, lang: str) -> str:
 # 질문
 {question}
 
-# 답변"""
+# 답변
+답변만 작성하세요. 질문 유형이나 판단 과정은 출력 금지."""
+
 
     else:
         return f"""You are "Kinagi AI", an AI assistant for KINAC (Korea Institute of Nuclear Nonproliferation And Control).
@@ -644,7 +646,8 @@ If the question asks for definitions, procedures, policies, regulations, or term
 # Question
 {question}
 
-# Answer"""
+# Answer
+Provide only the answer. Do not mention the question type or reasoning process."""
 
 # ---- ko -> en 번역기 (로컬 vLLM 사용) ---------------------------------------
 # ON/OFF 토글: RAG_TRANSLATE_QUERY=1 (default 1)
