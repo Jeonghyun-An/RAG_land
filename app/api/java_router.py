@@ -34,6 +34,8 @@ router = APIRouter(prefix="/java", tags=["java-production"])
 # 환경변수
 SHARED_SECRET = os.getenv("JAVA_SHARED_SECRET", "")
 SERVER_BASE_PATH = os.getenv("SERVER_BASE_PATH", "/mnt/shared")
+MILVUS_VARCHAR_MAX = int(os.getenv("MILVUS_VARCHAR_MAX", "8192"))
+
 
 def META_KEY(doc_id: str) -> str:
     return f"uploaded/__meta__/{doc_id}/meta.json"
@@ -178,13 +180,37 @@ def _normalize_pages_for_chunkers(pages) -> List[Tuple[int, str]]:
 
     return out
 
+def _split_for_milvus(text: str, meta: dict) -> list[tuple[str, dict]]:
+    """
+    Milvus VARCHAR 한도를 초과하지 않도록 텍스트를 강제로 쪼갠다.
+    - 문자 기준 단순 슬라이스 (문장 경계는 신경 안 쓰고 '내용 보존'에 집중)
+    """
+    max_len = MILVUS_VARCHAR_MAX
+
+    if len(text) <= max_len:
+        return [(text, meta)]
+
+    pieces = []
+    # 약간의 여유를 두고 잘라서 후처리 문자열을 붙일 여지도 남김
+    step = max_len - 8
+
+    for idx, start in enumerate(range(0, len(text), step)):
+        sub = text[start:start + step]
+        m = dict(meta)
+        m["split_index_for_milvus"] = idx  # 디버깅용
+        pieces.append((sub, m))
+
+    return pieces
+
 
 def _coerce_chunks_for_milvus(chs):
     """
     (텍스트, 메타) 리스트를 Milvus insert 형태로 정규화
-    llama_router와 동일한 로직
+    - page/section/bboxes만 유지
+    - 최종적으로는 모든 text가 MILVUS_VARCHAR_MAX 이하가 되도록 강제 분할
     """
-    safe = []
+    safe: list[tuple[str, dict]] = []
+
     for t in chs or []:
         if not isinstance(t, (list, tuple)) or len(t) < 2:
             continue
@@ -195,27 +221,43 @@ def _coerce_chunks_for_milvus(chs):
 
         # section 우선 결정
         section = str(meta.get("section", ""))[:512]
+
         # page 정규화: pages가 있으면 첫 페이지
         pages = meta.get("pages")
         if isinstance(pages, (list, tuple)) and len(pages) > 0:
             try:
                 page = int(pages[0])
             except Exception:
-                page = int(meta.get("page", 0))
+                try:
+                    page = int(meta.get("page", 0))
+                except Exception:
+                    page = 0
         else:
             try:
                 page = int(meta.get("page", 0))
             except Exception:
                 page = 0
 
-        safe.append((text, {"page": page, "section": section, "pages": pages or [], "bboxes": meta.get("bboxes", {})}))
+        base_meta = {
+            "page": page,
+            "section": section,
+            "pages": pages or [],
+            "bboxes": meta.get("bboxes", {}),
+        }
 
-    out = []
-    last = None
+        # ✅ 여기서 한 번 더 길이 체크 + 분할
+        #    (각 청커 구현이 길이 제한을 안 지켜도 여기서 최종 방어)
+        split_items = _split_for_milvus(text, base_meta)
+        safe.extend(split_items)
+
+    # 중복 제거
+    out: list[tuple[str, dict]] = []
+    last: tuple[str, dict] | None = None
     for it in safe:
         if it[0] and it != last:
             out.append(it)
             last = it
+
     return out
 
 
