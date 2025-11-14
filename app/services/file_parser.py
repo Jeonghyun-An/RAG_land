@@ -1,7 +1,7 @@
 # app/services/file_parser.py
 from __future__ import annotations
 from typing import Dict, List, Tuple, Union, Optional
-import os
+import os, re
 from io import BytesIO
 
 from app.services.ocr_service import _norm_easyocr_langs
@@ -147,19 +147,42 @@ def _ocr_with_easyocr(images_iter, by_page: bool, lang: str) -> Union[str, List[
         return pages
     return "\n\n".join([t for _, t in pages]).strip()
 
+
+def _has_cid_codes(text: str) -> bool:
+    """텍스트에 CID 코드가 많으면 True (OCR 필요)"""
+    if not text:
+        return False
+    # (cid:숫자) 패턴 개수 확인
+    cid_count = len(re.findall(r'\(cid:\d+\)', text))
+    total_len = len(text)
+    # CID 코드가 전체의 5% 이상이면 비정상
+    return cid_count > 10 and (cid_count * 10 / max(1, total_len)) > 0.05
+
 # ---------------------- Heuristic for OCR fallback ---------------------- #
 def _should_ocr(txt_or_pages: Union[str, List[Tuple[int, str]]]) -> bool:
-    """
-    텍스트 밀도 낮으면 OCR로 전환 (auto 모드에서만 사용)
-    """
+    """텍스트 밀도 낮거나 CID 코드 많으면 OCR로 전환"""
     try:
         th = int(os.getenv("OCR_MIN_CHARS", "40"))
     except Exception:
         th = 40
+    
     if isinstance(txt_or_pages, str):
-        return len(txt_or_pages.strip()) < th
+        if len(txt_or_pages.strip()) < th:
+            return True
+        if _has_cid_codes(txt_or_pages):  # ← 추가
+            return True
+        return False
+    
     total = sum(len(t or "") for _, t in (txt_or_pages or []))
-    return total < th
+    if total < th:
+        return True
+    
+    # 각 페이지에서 CID 코드 체크
+    for _, text in (txt_or_pages or []):
+        if _has_cid_codes(text):  # ← 추가
+            return True
+    
+    return False
 
 # ---------------------- Public API ---------------------- #
 def parse_docx_sections(path: str) -> List[Tuple[int, str]]:
@@ -452,3 +475,5 @@ def parse_any_bytes(name_hint: str, content: bytes) -> dict:
         return {"kind": "plain", "ext": ext, "items": parse_plaintext_bytes(content)}
 
     return {"kind": "plain", "ext": ext, "items": parse_plaintext_bytes(content)}
+
+
