@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Dict, List, Tuple, Union, Optional
 import os, re
 from io import BytesIO
-
 from app.services.ocr_service import _norm_easyocr_langs
 
 """
@@ -132,31 +131,136 @@ def _ocr_with_tesseract(images_iter, by_page: bool, lang: str) -> Union[str, Lis
     return "\n\n".join([t for _, t in pages]).strip()
 
 def _ocr_with_easyocr(images_iter, by_page: bool, lang: str) -> Union[str, List[Tuple[int, str]]]:
+    """
+    EasyOCR로 이미지에서 텍스트 추출
+    - CID 코드 자동 감지
+    - 회전된 이미지 자동 보정
+    """
     import easyocr
+    import numpy as np
+    from PIL import Image
+    
     langs = _norm_easyocr_langs(lang)
     gpu = os.getenv("OCR_EASYOCR_GPU", "1").strip() == "1"
+    
+    # 옵션
+    width_ths = float(os.getenv("OCR_WIDTH_THS", "0.5"))
+    height_ths = float(os.getenv("OCR_HEIGHT_THS", "0.5"))
+    auto_rotate = os.getenv("OCR_AUTO_ROTATE", "1").strip() == "1"
+    
     reader = easyocr.Reader(langs, gpu=gpu)
 
     pages: List[Tuple[int, str]] = []
     for pno, img in images_iter:
-        res = reader.readtext(img)
-        text = " ".join([x[1] for x in res if len(x) >= 2 and x[1]]).strip()
-        if text:
-            pages.append((pno, text))
+        # PIL Image → numpy array
+        if hasattr(img, 'mode'):
+            img_pil = img
+            img_array = np.array(img)
+        else:
+            img_array = img
+            img_pil = Image.fromarray(img_array)
+        
+        best_text = ""
+        best_conf = 0
+        
+        # ★ 회전 각도별 시도 (auto_rotate=True 시)
+        if auto_rotate:
+            angles = [0, 90, 180, 270]
+            for angle in angles:
+                # 이미지 회전
+                if angle == 0:
+                    test_img = img_array
+                else:
+                    rotated_pil = img_pil.rotate(angle, expand=True)
+                    test_img = np.array(rotated_pil)
+                
+                # OCR 실행
+                try:
+                    res = reader.readtext(
+                        test_img,
+                        detail=1,
+                        paragraph=False,
+                        width_ths=width_ths,
+                        height_ths=height_ths,
+                    )
+                except Exception as e:
+                    print(f"⚠️ OCR failed at {angle}°: {e}")
+                    continue
+                
+                if not res:
+                    continue
+                
+                # 신뢰도 계산
+                total_conf = sum([x[2] for x in res if len(x) >= 3])
+                text_count = len([x for x in res if len(x) >= 2 and len(x[1].strip()) > 1])
+                avg_conf = total_conf / len(res) if res else 0
+                
+                # 점수 = 평균 신뢰도 × 텍스트 수
+                score = avg_conf * text_count
+                
+                # 텍스트 추출
+                sorted_res = sorted(res, key=lambda x: (x[0][0][1], x[0][0][0]))
+                text_lines = [x[1] for x in sorted_res if len(x) >= 2 and x[1]]
+                text = " ".join(text_lines).strip()
+                
+                # 최고 점수 갱신
+                if score > best_conf:
+                    best_conf = score
+                    best_text = text
+                    if angle != 0:
+                        print(f"✅ Page {pno}: Best orientation at {angle}° (score: {score:.2f})")
+        else:
+            # 회전 감지 비활성화 시 바로 실행
+            res = reader.readtext(
+                img_array,
+                detail=1,
+                paragraph=False,
+                width_ths=width_ths,
+                height_ths=height_ths,
+            )
+            
+            if res:
+                sorted_res = sorted(res, key=lambda x: (x[0][0][1], x[0][0][0]))
+                best_text = " ".join([x[1] for x in sorted_res if len(x) >= 2 and x[1]]).strip()
+        
+        # 결과 저장
+        if best_text:
+            pages.append((pno, best_text))
+    
     if by_page:
         return pages
     return "\n\n".join([t for _, t in pages]).strip()
 
-
 def _has_cid_codes(text: str) -> bool:
-    """텍스트에 CID 코드가 많으면 True (OCR 필요)"""
+    """
+    텍스트에 CID 코드가 많으면 True 반환
+    
+    CID 코드 예시: (cid:31), (cid:144), (cid:157) 등
+    """
     if not text:
         return False
-    # (cid:숫자) 패턴 개수 확인
-    cid_count = len(re.findall(r'\(cid:\d+\)', text))
-    total_len = len(text)
-    # CID 코드가 전체의 5% 이상이면 비정상
-    return cid_count > 10 and (cid_count * 10 / max(1, total_len)) > 0.05
+    
+    # (cid:숫자) 패턴 찾기
+    cid_pattern = r'\(cid:\d+\)'
+    cid_matches = re.findall(cid_pattern, text)
+    cid_count = len(cid_matches)
+    
+    # 임계값: 10개 이상
+    if cid_count < 10:
+        return False
+    
+    # 전체 텍스트 대비 CID 비율
+    total_chars = len(text)
+    cid_chars = sum(len(m) for m in cid_matches)
+    cid_ratio = cid_chars / max(1, total_chars)
+    
+    # CID가 5% 이상이면 비정상
+    is_cid = cid_ratio > 0.05
+    
+    if is_cid:
+        print(f"⚠️ CID codes detected: {cid_count} codes, {cid_ratio*100:.1f}% of text")
+    
+    return is_cid
 
 # ---------------------- Heuristic for OCR fallback ---------------------- #
 def _should_ocr(txt_or_pages: Union[str, List[Tuple[int, str]]]) -> bool:
