@@ -4,7 +4,8 @@ MinIO → Milvus 전체 재인덱싱 스크립트 (독립 실행 버전)
 
 사용법:
     cd /app
-    python -m app.services.reindex_standalone [OPTIONS]
+    python -m app.scripts.reindex_from_minio [OPTIONS]
+    python -m app.scripts.reindex_from_minio --skip-errors
 
 옵션:
     --dry-run                   실제 처리 없이 목록만 출력

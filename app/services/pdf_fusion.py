@@ -3,6 +3,7 @@
 PDF 융합 파서 개선 버전
 - pdfminer 텍스트 추출 + OCR 보강
 - bbox 정보 정확도 향상
+- CID 패턴 명시적 감지 추가
 - 워터마크 필터링 강화
 - 표 영역 bbox 최적화
 """
@@ -18,6 +19,7 @@ import fitz
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 import os
+import re
 from io import BytesIO
 
 # [신규] EasyOCR Reader 싱글톤 캐싱
@@ -51,6 +53,48 @@ except Exception:
             else: out.append(s)
         return out or ["ko","en"]
 
+
+# 🔥 NEW: OCR 필요 여부 종합 판단
+def _needs_ocr_for_page(text: str, min_chars: int) -> bool:
+    """
+    페이지 텍스트가 OCR이 필요한지 판단
+    
+    Args:
+        text: 페이지 텍스트
+        min_chars: 최소 문자 수 임계값
+    
+    Returns:
+        True if OCR needed, False otherwise
+    """
+    if not text or len(text.strip()) < min_chars:
+        return True
+    
+    # 🔥 CID 패턴 감지 (명시적)
+    cid_threshold = float(os.getenv("OCR_CID_THRESHOLD", "0.2"))
+    cid_pattern = re.compile(r'\(cid:\d+\)')
+    cid_matches = cid_pattern.findall(text)
+    cid_char_count = sum(len(m) for m in cid_matches)
+    
+    if len(text) > 0:
+        cid_ratio = cid_char_count / len(text)
+        if cid_ratio > cid_threshold:
+            print(f"[OCR] CID pattern detected ({cid_ratio:.1%} > {cid_threshold:.0%}), triggering OCR")
+            return True
+    
+    # 🔥 읽을 수 있는 문자 비율 체크
+    min_readable_ratio = float(os.getenv("OCR_MIN_READABLE_RATIO", "0.3"))
+    readable_chars = len(re.findall(r'[a-zA-Z0-9가-힣]', text))
+    total_chars = len(text)
+    
+    if total_chars > 0:
+        readable_ratio = readable_chars / total_chars
+        if readable_ratio < min_readable_ratio:
+            print(f"[OCR] Low readable ratio ({readable_ratio:.1%} < {min_readable_ratio:.0%}), triggering OCR")
+            return True
+    
+    return False
+
+
 # ---------- 내부: pdfminer 로 per-page 텍스트 & 블록 ----------
 def _pdfminer_pages_and_blocks_from_path(path: str) -> Tuple[List[Tuple[int,str]], Dict[int, List[Dict]]]:
     from pdfminer.high_level import extract_pages
@@ -78,8 +122,10 @@ def _pdfminer_pages_and_blocks_from_path(path: str) -> Tuple[List[Tuple[int,str]
                             "y1": float(y1)
                         }
                     })
-        pages.append((i, "\n".join(texts).strip()))
-        layout_map[i] = blocks
+        full = "\n\n".join(texts).strip()
+        pages.append((i, full))
+        if blocks:
+            layout_map[i] = blocks
     return pages, layout_map
 
 def _pdfminer_pages_and_blocks_from_bytes(pdf_bytes: bytes) -> Tuple[List[Tuple[int,str]], Dict[int, List[Dict]]]:
@@ -90,28 +136,81 @@ def _pdfminer_pages_and_blocks_from_bytes(pdf_bytes: bytes) -> Tuple[List[Tuple[
     pages: List[Tuple[int,str]] = []
     layout_map: Dict[int, List[Dict]] = {}
 
-    bio = BytesIO(pdf_bytes)
-    for i, layout in enumerate(extract_pages(bio, laparams=laparams), start=1):
-        texts = []
-        blocks: List[Dict] = []
-        for elem in layout:
-            if isinstance(elem, LTTextContainer):
-                t = (elem.get_text() or "").strip()
-                if t:
-                    texts.append(t)
-                    x0, y0, x1, y1 = elem.bbox
-                    blocks.append({
-                        "text": t, 
-                        "bbox": {
-                            "x0": float(x0), 
-                            "y0": float(y0), 
-                            "x1": float(x1), 
-                            "y1": float(y1)
-                        }
-                    })
-        pages.append((i, "\n".join(texts).strip()))
-        layout_map[i] = blocks
+    with BytesIO(pdf_bytes) as bio:
+        for i, layout in enumerate(extract_pages(bio, laparams=laparams), start=1):
+            texts = []
+            blocks: List[Dict] = []
+            for elem in layout:
+                if isinstance(elem, LTTextContainer):
+                    t = (elem.get_text() or "").strip()
+                    if t:
+                        texts.append(t)
+                        x0, y0, x1, y1 = elem.bbox
+                        blocks.append({
+                            "text": t,
+                            "bbox": {
+                                "x0": float(x0), 
+                                "y0": float(y0), 
+                                "x1": float(x1), 
+                                "y1": float(y1)
+                            }
+                        })
+            full = "\n\n".join(texts).strip()
+            pages.append((i, full))
+            if blocks:
+                layout_map[i] = blocks
     return pages, layout_map
+
+
+def _filter_watermark_blocks(blocks: List[Dict], page_width: float, 
+                            page_height: float) -> List[Dict]:
+    """
+    [신규] 워터마크 블록 필터링
+    - 페이지 중앙에 큰 글자
+    - 반복되는 패턴
+    - 투명도 높은 텍스트 (간접 추정)
+    """
+    if not blocks:
+        return blocks
+    
+    filtered = []
+    
+    # 중앙 영역 정의 (페이지의 중앙 30%)
+    center_x = page_width / 2
+    center_y = page_height / 2
+    center_tolerance = 0.15  # 중앙의 ±15%
+    
+    for block in blocks:
+        bbox = block['bbox']
+        
+        # bbox 중심
+        block_center_x = (bbox['x0'] + bbox['x1']) / 2
+        block_center_y = (bbox['y0'] + bbox['y1']) / 2
+        
+        # 중앙 근처 여부
+        is_center = (
+            abs(block_center_x - center_x) / page_width < center_tolerance and
+            abs(block_center_y - center_y) / page_height < center_tolerance
+        )
+        
+        # 크기 (워터마크는 보통 큼)
+        width = bbox['x1'] - bbox['x0']
+        height = bbox['y1'] - bbox['y0']
+        is_large = width > page_width * 0.3 or height > page_height * 0.1
+        
+        # 워터마크 키워드
+        text_lower = block['text'].lower()
+        watermark_keywords = ['draft', 'confidential', '기밀', '초안', 'watermark']
+        has_watermark_keyword = any(kw in text_lower for kw in watermark_keywords)
+        
+        # 워터마크로 판단되면 제외
+        if is_center and is_large and has_watermark_keyword:
+            continue
+        
+        filtered.append(block)
+    
+    return filtered
+
 
 # ---------- 내부: EasyOCR로 한 페이지 OCR (bbox 정확도 개선) ----------
 def _ocr_page_with_easyocr(img_nd: "np.ndarray", lang: str, gpu: bool) -> Tuple[str, List[Dict]]:
@@ -180,6 +279,7 @@ def _ocr_page_with_easyocr(img_nd: "np.ndarray", lang: str, gpu: bool) -> Tuple[
     
     return ("\n".join(sorted_texts).strip(), blocks)
 
+
 def _ocr_page_with_tesseract(img_nd: "np.ndarray", lang: str) -> Tuple[str, List[Dict]]:
     """
     [개선] Tesseract bbox 정확도 향상
@@ -235,54 +335,6 @@ def _ocr_page_with_tesseract(img_nd: "np.ndarray", lang: str) -> Tuple[str, List
     
     return text, blocks
 
-def _filter_watermark_blocks(blocks: List[Dict], page_width: float, 
-                            page_height: float) -> List[Dict]:
-    """
-    [신규] 워터마크 블록 필터링
-    - 페이지 중앙에 큰 글자
-    - 반복되는 패턴
-    - 투명도 높은 텍스트 (간접 추정)
-    """
-    if not blocks:
-        return blocks
-    
-    filtered = []
-    
-    # 중앙 영역 정의 (페이지의 중앙 30%)
-    center_x = page_width / 2
-    center_y = page_height / 2
-    center_tolerance = 0.15  # 중앙의 ±15%
-    
-    for block in blocks:
-        bbox = block['bbox']
-        
-        # bbox 중심
-        block_center_x = (bbox['x0'] + bbox['x1']) / 2
-        block_center_y = (bbox['y0'] + bbox['y1']) / 2
-        
-        # 중앙 근처 여부
-        is_center = (
-            abs(block_center_x - center_x) / page_width < center_tolerance and
-            abs(block_center_y - center_y) / page_height < center_tolerance
-        )
-        
-        # 크기 (워터마크는 보통 큼)
-        width = bbox['x1'] - bbox['x0']
-        height = bbox['y1'] - bbox['y0']
-        is_large = width > page_width * 0.3 or height > page_height * 0.1
-        
-        # 워터마크 키워드
-        text_lower = block['text'].lower()
-        watermark_keywords = ['draft', 'confidential', '기밀', '초안', 'watermark']
-        has_watermark_keyword = any(kw in text_lower for kw in watermark_keywords)
-        
-        # 워터마크로 판단되면 제외
-        if is_center and is_large and has_watermark_keyword:
-            continue
-        
-        filtered.append(block)
-    
-    return filtered
 
 # ---------- 내부: 한 페이지에 OCR 적용 ----------
 def _ocr_page_image(fitz_page: "fitz.Page") -> Tuple[str, List[Dict]]:
@@ -302,6 +354,7 @@ def _ocr_page_image(fitz_page: "fitz.Page") -> Tuple[str, List[Dict]]:
         gpu  = os.getenv("OCR_EASYOCR_GPU", "1").strip() == "1"
         return _ocr_page_with_easyocr(img, lang, gpu)
 
+
 # ---------- 공개: 경로 입력을 OCR-융합으로 뽑기 ----------
 def extract_pdf_fused(path: str) -> Tuple[List[Tuple[int,str]], Dict[int, List[Dict]]]:
     """
@@ -312,7 +365,7 @@ def extract_pdf_fused(path: str) -> Tuple[List[Tuple[int,str]], Dict[int, List[D
     규칙:
       - OCR_MODE=off → pdfminer 결과 그대로
       - OCR_MODE=force → 모든 페이지를 OCR로 대체(텍스트/박스)
-      - OCR_MODE=auto → 페이지 텍스트 길이가 OCR_MIN_CHARS_PER_PAGE 미만이면 해당 페이지만 OCR로 교체
+      - OCR_MODE=auto → CID 패턴 또는 텍스트 부족 페이지만 OCR
     """
     import fitz
     pages, layout_map = _pdfminer_pages_and_blocks_from_path(path)
@@ -325,8 +378,10 @@ def extract_pdf_fused(path: str) -> Tuple[List[Tuple[int,str]], Dict[int, List[D
 
     doc = fitz.open(path)
     try:
-        for (idx, _), pg in zip(pages, doc, strict=False):
-            need_ocr = (ocr_mode == "force") or (len((pages[idx-1][1] or "").strip()) < min_chars)
+        for (idx, text), pg in zip(pages, doc, strict=False):
+            # 🔥 개선: CID 패턴 명시적 감지
+            need_ocr = (ocr_mode == "force") or _needs_ocr_for_page(text, min_chars)
+            
             if need_ocr:
                 txt, blocks = _ocr_page_image(pg)
                 # 교체
@@ -335,6 +390,7 @@ def extract_pdf_fused(path: str) -> Tuple[List[Tuple[int,str]], Dict[int, List[D
     finally:
         doc.close()
     return pages, layout_map
+
 
 def extract_pdf_fused_from_bytes(pdf_bytes: bytes) -> Tuple[List[Tuple[int,str]], Dict[int, List[Dict]]]:
     """
@@ -353,7 +409,10 @@ def extract_pdf_fused_from_bytes(pdf_bytes: bytes) -> Tuple[List[Tuple[int,str]]
     try:
         for i, pg in enumerate(doc, start=1):
             cur_txt = (pages[i-1][1] or "") if i-1 < len(pages) else ""
-            need_ocr = (ocr_mode == "force") or (len(cur_txt.strip()) < min_chars)
+            
+            # 🔥 개선: CID 패턴 명시적 감지
+            need_ocr = (ocr_mode == "force") or _needs_ocr_for_page(cur_txt, min_chars)
+            
             if need_ocr:
                 txt, blocks = _ocr_page_image(pg)
                 if i-1 < len(pages):
