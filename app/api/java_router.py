@@ -619,31 +619,32 @@ async def process_convert_and_index_prod(
             # (B) PDF가 아니면: 변환 → MinIO 업로드 → 동일 폴더에 *.pdf 저장 → DB에는 file_id만 *.pdf로 변경
             job_state.update(job_id, status="converting", step=f"Converting {src_ext} to PDF")
             print(f"[PROD] Converting {src_ext} to PDF: {full_path}")
-        
+
             try:
                 # 1) bytes 변환 우선 시도
                 with open(full_path, "rb") as f:
                     content = f.read()
-        
+
                 pdf_bytes = convert_bytes_to_pdf_bytes(content, src_ext)
-        
+
                 # 2) bytes 변환 실패 시 로컬 경로 기반 변환기로 폴백
-                temp_pdf_path: Optional[str] = None
                 if pdf_bytes is None:
                     print(f"[PROD] ⚠️ Bytes conversion failed, trying local file converter...")
                     temp_pdf_path = convert_to_pdf(str(full_path))
-                    
+
                     if not temp_pdf_path or not Path(temp_pdf_path).exists():
                         raise ConvertError(f"PDF 변환 실패(출력 없음): {src_ext}")
-                        
-                    with open(temp_pdf_path, "rb") as f:
+
+                    # ✅ 핵심: temp_pdf_path를 converted_pdf_path로 사용
+                    converted_pdf_path = temp_pdf_path
+                    print(f"[PROD] ✅ Local converter success: {converted_pdf_path}")
+
+                    with open(converted_pdf_path, "rb") as f:
                         pdf_bytes = f.read()
-                    
-                    print(f"[PROD] ✅ Local converter success: {temp_pdf_path}")
-        
+
                 assert pdf_bytes is not None and len(pdf_bytes) > 0, "pdf_bytes is None or empty"
                 print(f"[PROD] ✅ PDF converted: {len(pdf_bytes)} bytes")
-        
+
                 # 3) MinIO 업로드
                 m.upload_bytes(
                     pdf_bytes,
@@ -652,36 +653,34 @@ async def process_convert_and_index_prod(
                     length=len(pdf_bytes),
                 )
                 print(f"[PROD] ✅ PDF uploaded to MinIO: {object_pdf}")
-        
-                # 4) 볼륨(기존 폴더) 에 *.pdf 저장 — 경로는 그대로, 파일명만 .pdf
-                save_path = full_path.with_suffix(".pdf")
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(save_path, "wb") as fw:
-                    fw.write(pdf_bytes)
-                converted_pdf_path = str(save_path)
-                print(f"[PROD] ✅ PDF saved to volume: {converted_pdf_path}")
-        
+
+                # 4) bytes 변환 성공 시에만 파일 저장 (로컬 변환은 이미 저장됨)
+                if converted_pdf_path is None:
+                    save_path = full_path.with_suffix(".pdf")
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(save_path, "wb") as fw:
+                        fw.write(pdf_bytes)
+                    converted_pdf_path = str(save_path)
+                    print(f"[PROD] ✅ PDF saved to volume: {converted_pdf_path}")
+
                 # 5) DB에는 file_id만 *.pdf로 업데이트 (폴더는 건드리지 않음)
-                new_file_id_pdf = save_path.name  # ex) f20231212M3Uv.pdf
+                # ✅ 핵심 수정: converted_pdf_path에서 직접 추출
+                new_file_id_pdf = Path(converted_pdf_path).name  # ex) f20231212M3Uv.pdf
                 db.update_file_id_only(data_id, new_file_id_pdf)
-        
-                # 6) 임시 파일 정리
-                try:
-                    if temp_pdf_path and Path(temp_pdf_path).exists():
-                        Path(temp_pdf_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-                
+
             except Exception as e:
                 error_msg = f"PDF 변환 실패 ({src_ext}): {e}"
                 print(f"[PROD] ❌ {error_msg}")
                 raise ConvertError(error_msg)
-        
+
         # converted_pdf_path가 설정되지 않았다면 문제 발생
-        if not converted_pdf_path or not Path(converted_pdf_path).exists():
+        if not converted_pdf_path:
+            raise RuntimeError("converted_pdf_path가 설정되지 않음")
+
+        if not Path(converted_pdf_path).exists():
             raise RuntimeError(f"converted_pdf_path가 존재하지 않음: {converted_pdf_path}")
-        
-        print(f"[PROD] ✅ Final PDF path for parsing: {converted_pdf_path}")                
+
+        print(f"[PROD] ✅ Final PDF path for parsing: {converted_pdf_path}")          
         # ========== Step 3: OCR 시작 마킹 ==========
         db.mark_ocr_start(data_id)
         

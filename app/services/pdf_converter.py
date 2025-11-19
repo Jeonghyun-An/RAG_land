@@ -55,55 +55,39 @@ def _post_retry(url: str, files, data: Optional[dict] = None) -> bytes:
         except Exception as e:
             last = e
         time.sleep(GOTENBERG_BACKOFF_BASE * (2 ** i))
-    raise ConvertError(f"Gotenberg 요청 실패: {last!s}")
+    raise last or ConvertError("Unknown error")
 
-def _chromium_opts(no_margins: bool = False) -> dict:
-    data = {}
-    if PDF_PAPER and PDF_PAPER.lower() != "auto":
-        # A4(210x297mm) -> 8.27 x 11.69 inch
-        if PDF_PAPER.lower() == "a4":
-            data["paperWidth"] = "8.27"
-            data["paperHeight"] = "11.69"
-        elif PDF_PAPER.lower() == "letter":
-            data["paperWidth"] = "8.5"
-            data["paperHeight"] = "11"
+def _chromium_opts(no_margins: bool = False, prefer_css_page_size: bool = True) -> dict:
+    d = {"preferCssPageSize": "true" if prefer_css_page_size else "false"}
+    if PDF_PAPER.lower() != "auto":
+        d["paperWidth"] = "8.27"
+        d["paperHeight"] = "11.7"
     if not no_margins:
-        margin_in = max(0.0, float(PDF_MARGIN_MM)) / 25.4
-        data.update({
-            "marginTop": str(margin_in),
-            "marginBottom": str(margin_in),
-            "marginLeft": str(margin_in),
-            "marginRight": str(margin_in),
-        })
-    return data
+        mm_str = f"{PDF_MARGIN_MM}mm"
+        d["marginTop"] = d["marginBottom"] = d["marginLeft"] = d["marginRight"] = mm_str
+    return d
 
-# ---------- reportlab 기반 TXT → PDF (bytes 버전) ----------
+# ---------- TXT → PDF 변환 (reportlab) ----------
 def _text_to_pdf_bytes(text: str) -> bytes:
     """
-    텍스트를 reportlab로 PDF bytes로 변환
-    [핵심 추가] TXT 파일 지원을 위한 bytes 기반 변환
+    텍스트를 PDF bytes로 변환 (reportlab 사용)
     reportlab이 없으면 ImportError 발생 -> 상위에서 처리.
     """
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.units import mm
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-    except ImportError as e:
-        raise ConvertError(f"reportlab이 필요합니다: {e}")
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
 
-    # 메모리 버퍼
-    buffer = io.BytesIO()
-    
-    # 폰트 등록 시도 (없어도 기본 폰트로 동작)
+    # 폰트 등록 (없어도 기본 폰트로 동작은 함)
     try:
-        # 한글 폰트가 있으면 등록
+        # 시스템에 NotoSansCJK 같은 폰트가 있으면 등록 (선택)
         # pdfmetrics.registerFont(TTFont("NotoSans", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"))
         pass
     except Exception:
         pass
 
+    buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
@@ -118,10 +102,12 @@ def _text_to_pdf_bytes(text: str) -> bytes:
     except Exception:
         pass
 
-    # 워드랩
+    # 아주 단순한 워드랩
     import textwrap
     lines = []
     for para in (text or "").splitlines():
+        # 대략적인 폭 기준(영문 80~100자, 한글 섞이면 줄 조밀)
+        # 필요하면 reportlab의 stringWidth로 정확도 향상 가능
         wrap = textwrap.wrap(para, width=95) or [""]
         lines.extend(wrap)
 
@@ -192,6 +178,62 @@ def _text_to_pdf(src: Path, out: Path):
         fw.write(pdf_bytes)
 
 # ========== [추가] HWP → PDF 변환 함수 ==========
+def _hwp_to_pdf_via_text(src: Path, out: Path):
+    """
+    HWP → TXT → PDF 변환 (pyhwp 사용)
+    무료 오픈소스 방식
+    """
+    import subprocess
+    import tempfile
+    
+    print(f"[CONVERT] Converting HWP to PDF via pyhwp: {src}")
+    
+    # 1단계: HWP → TXT 변환 (pyhwp)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp_txt:
+        txt_path = tmp_txt.name
+    
+    try:
+        # hwp5txt 명령어로 텍스트 추출
+        result = subprocess.run(
+            ["hwp5txt", "--output", txt_path, str(src)],
+            capture_output=True,
+            timeout=60,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print(f"[CONVERT] hwp5txt failed: {result.stderr}")
+            raise ConvertError(f"hwp5txt 실패: {result.stderr[:200]}")
+        
+        # 2단계: TXT → PDF 변환 (reportlab)
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        
+        if not text.strip():
+            raise ConvertError("HWP에서 추출된 텍스트가 비어있습니다")
+        
+        print(f"[CONVERT] Extracted {len(text)} characters from HWP")
+        
+        # reportlab로 PDF 생성
+        pdf_bytes = _text_to_pdf_bytes(text)
+        
+        with open(out, 'wb') as f:
+            f.write(pdf_bytes)
+        
+        # 임시 파일 정리
+        os.unlink(txt_path)
+        
+        print(f"[CONVERT] ✅ HWP→PDF via pyhwp 성공: {out}")
+        
+    except subprocess.TimeoutExpired:
+        if os.path.exists(txt_path):
+            os.unlink(txt_path)
+        raise ConvertError("HWP 변환 타임아웃")
+    except Exception as e:
+        if os.path.exists(txt_path):
+            os.unlink(txt_path)
+        raise ConvertError(f"HWP 변환 실패: {e}")
+
 def _hwp_to_pdf(src: Path, out: Path):
     """
     HWP → PDF 변환
@@ -254,6 +296,7 @@ def convert_to_pdf(src_path: str) -> str:
 
     if not out.exists() or out.stat().st_size == 0:
         raise ConvertError("변환된 PDF가 비어있습니다.")
+    
     return str(out)
 
 # ---------- public: bytes 기반 변환 (java_router용) ----------
@@ -339,53 +382,59 @@ def convert_stream_to_pdf_bytes(content: bytes, src_ext: str) -> Optional[bytes]
     if not CONVERTER_ENDPOINT:
         raise ConvertStreamError("DOC_CONVERTER_URL이 설정되지 않았습니다.")
     
+    # 파일 해시 생성 (캐시 키로 사용 가능)
+    file_hash = hashlib.md5(content).hexdigest()
+    
+    # src_ext에서 . 제거
+    ext = src_ext.lstrip('.').lower()
+    
+    # ONLYOFFICE 지원 형식 매핑
+    format_map = {
+        'hwp': 'hwp',
+        'hwpx': 'hwpx',
+        'doc': 'doc',
+        'docx': 'docx',
+        'xls': 'xls',
+        'xlsx': 'xlsx',
+        'ppt': 'ppt',
+        'pptx': 'pptx',
+        'odt': 'odt',
+        'ods': 'ods',
+        'odp': 'odp',
+        'rtf': 'rtf'
+    }
+    
+    if ext not in format_map:
+        raise ConvertStreamError(f"지원하지 않는 형식: {ext}")
+    
+    # Base64 인코딩
+    base64_content = base64.b64encode(content).decode('utf-8')
+    
+    # ONLYOFFICE API 요청
+    payload = {
+        "async": False,
+        "filetype": format_map[ext],
+        "key": file_hash,
+        "outputtype": "pdf",
+        "title": f"document.{ext}",
+        "url": f"data:application/octet-stream;base64,{base64_content}"
+    }
+    
     try:
-        import json
-        import base64
-        import hashlib
-        
-        filename = f"document{src_ext}"
-        
-        # ========== ONLYOFFICE 전용 요청 형식 ==========
-        print(f"[CONVERT] Attempting conversion via ONLYOFFICE: {filename}")
-        
-        # 파일을 base64로 인코딩
-        file_base64 = base64.b64encode(content).decode('utf-8')
-        
-        # ONLYOFFICE 요청 페이로드
-        payload = {
-            "async": False,
-            "filetype": src_ext.lstrip('.'),  # .hwp → hwp
-            "key": hashlib.md5(content).hexdigest(),  # 고유 키
-            "outputtype": "pdf",
-            "title": filename,
-            "url": f"data:application/octet-stream;base64,{file_base64}"
-        }
-        
-        print(f"[CONVERT] Sending to ONLYOFFICE: filetype={payload['filetype']}, key={payload['key'][:8]}...")
-        
         response = requests.post(
-            CONVERTER_ENDPOINT,
+            f"{CONVERTER_ENDPOINT}/ConvertService.ashx",
             json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=GOTENBERG_TIMEOUT
+            timeout=120
         )
-        
-        print(f"[CONVERT] ONLYOFFICE response status: {response.status_code}")
         
         if response.status_code == 200:
             result = response.json()
-            print(f"[CONVERT] ONLYOFFICE result: {result}")
             
-            # ONLYOFFICE 응답 구조: {"endConvert": true, "fileUrl": "...", "percent": 100}
-            if result.get("endConvert"):
+            if result.get("error") == 0:
+                # PDF 다운로드
                 pdf_url = result.get("fileUrl")
                 if pdf_url:
-                    print(f"[CONVERT] Downloading PDF from: {pdf_url}")
-                    
-                    # PDF URL에서 실제 파일 다운로드
                     pdf_response = requests.get(pdf_url, timeout=60)
-                    
                     if pdf_response.status_code == 200:
                         pdf_bytes = pdf_response.content
                         print(f"[CONVERT] ✅ ONLYOFFICE 변환 성공: {len(pdf_bytes)} bytes")
@@ -413,59 +462,3 @@ def convert_stream_to_pdf_bytes(content: bytes, src_ext: str) -> Optional[bytes]
         raise ConvertStreamError(f"ONLYOFFICE 연결 실패: {e}")
     except Exception as e:
         raise ConvertStreamError(f"ONLYOFFICE 변환 오류: {e}")
-    
-def _hwp_to_pdf_via_text(src: Path, out: Path):
-    """
-    HWP → TXT → PDF 변환 (pyhwp 사용)
-    무료 오픈소스 방식
-    """
-    import subprocess
-    import tempfile
-    
-    print(f"[CONVERT] Converting HWP to PDF via pyhwp: {src}")
-    
-    # 1단계: HWP → TXT 변환 (pyhwp)
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp_txt:
-        txt_path = tmp_txt.name
-    
-    try:
-        # hwp5txt 명령어로 텍스트 추출
-        result = subprocess.run(
-            ["hwp5txt", "--output", txt_path, str(src)],
-            capture_output=True,
-            timeout=60,
-            text=True
-        )
-        
-        if result.returncode != 0:
-            print(f"[CONVERT] hwp5txt failed: {result.stderr}")
-            raise ConvertError(f"hwp5txt 실패: {result.stderr[:200]}")
-        
-        # 2단계: TXT → PDF 변환 (reportlab)
-        with open(txt_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-        
-        if not text.strip():
-            raise ConvertError("HWP에서 추출된 텍스트가 비어있습니다")
-        
-        print(f"[CONVERT] Extracted {len(text)} characters from HWP")
-        
-        # reportlab로 PDF 생성
-        pdf_bytes = _text_to_pdf_bytes(text)
-        
-        with open(out, 'wb') as f:
-            f.write(pdf_bytes)
-        
-        # 임시 파일 정리
-        os.unlink(txt_path)
-        
-        print(f"[CONVERT] ✅ HWP→PDF via pyhwp 성공: {out}")
-        
-    except subprocess.TimeoutExpired:
-        if os.path.exists(txt_path):
-            os.unlink(txt_path)
-        raise ConvertError("HWP 변환 타임아웃")
-    except Exception as e:
-        if os.path.exists(txt_path):
-            os.unlink(txt_path)
-        raise ConvertError(f"HWP 변환 실패: {e}")

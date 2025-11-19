@@ -39,7 +39,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ========== [추가] pyhwp 설치 (HWP 변환용) ==========
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --prefer-binary --pre pyhwp
+    if [ "$INSTALL_HWP_SUPPORT" = "1" ]; then \
+      python -m pip install --prefer-binary --pre pyhwp; \
+    fi
 
 # ---- CUBRID 파이썬 드라이버 (cp310) : URL 설치 + pip 캐시 활용 ----
 ARG CUBRID_WHEEL_URL="https://ftp.cubrid.org/CUBRID_Drivers/Python_Driver/11.3.0/Linux/cubrid_python-11.3.0.51-cp310-cp310-linux_x86_64.whl"
