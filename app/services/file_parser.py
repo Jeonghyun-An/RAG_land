@@ -458,7 +458,27 @@ def parse_xlsx_tables(path: str) -> List[Tuple[int, str]]:
     return out
 
 def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, str]]]:
+    """
+    PDF 파싱 with OCR 지원
+    ✅ HWP 변환 PDF는 OCR 스킵
+    """
+    import fitz
+    
+    skip_ocr = False
+    try:
+        doc = fitz.open(path)
+        metadata = doc.metadata
+        if metadata.get('subject') == 'NO_OCR_NEEDED' or metadata.get('title') == 'HWP_CONVERTED':
+            skip_ocr = True
+            print(f"[PARSE] ✅ Detected HWP-converted PDF, skipping OCR")
+        doc.close()
+    except Exception:
+        pass
+    
     ocr_mode = os.getenv("OCR_MODE", "auto").lower()
+    # HWP 변환 PDF는 강제로 OCR 스킵
+    if skip_ocr:
+        ocr_mode = "never"
     ocr_engine = os.getenv("OCR_ENGINE", "easyocr").lower()
     ocr_dpi = int(os.getenv("OCR_DPI", "300"))
 
