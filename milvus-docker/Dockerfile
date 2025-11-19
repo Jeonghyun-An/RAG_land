@@ -6,14 +6,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=60
 
-# ---- OCR 스택은 토글 가능 ----
+# ========== [추가] HWP 변환 지원 토글 ==========
 ARG INSTALL_OCR_STACK=1
+ARG INSTALL_HWP_SUPPORT=1
+
+# ---- 시스템 패키지 설치 ----
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt/lists \
     set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl \
+      ca-certificates curl wget \
       libglib2.0-0 libgl1 libsm6 libxext6 \
       poppler-utils; \
     if [ "$INSTALL_OCR_STACK" = "1" ]; then \
@@ -29,13 +32,15 @@ WORKDIR /app
 COPY milvus-docker/requirements.txt requirements.txt
 
 # ---- pip 캐시(빌드킷) 적극 사용 + 휠 우선 ----
-# 1) pip 업그레이드
-# 2) numpy 등 바이너리 휠 우선 설치 (소스 빌드 회피)
-# 3) 프로젝트 requirements 설치
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install -U pip setuptools wheel && \
     python -m pip install --prefer-binary "numpy>=1.24,<2.0" && \
     python -m pip install --prefer-binary -r requirements.txt
+
+# ========== [추가] pyhwp 설치 (HWP 변환용) ==========
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --prefer-binary --pre pyhwp
+
 # ---- CUBRID 파이썬 드라이버 (cp310) : URL 설치 + pip 캐시 활용 ----
 ARG CUBRID_WHEEL_URL="https://ftp.cubrid.org/CUBRID_Drivers/Python_Driver/11.3.0/Linux/cubrid_python-11.3.0.51-cp310-cp310-linux_x86_64.whl"
 RUN --mount=type=cache,target=/root/.cache/pip \
