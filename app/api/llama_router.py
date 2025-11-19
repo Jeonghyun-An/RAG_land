@@ -45,11 +45,11 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ---------- Schemas ----------
 class GenerateReq(BaseModel):
     prompt: str
-    model_name: str = "llama-3.1-8b"
+    model_name: str = "qwen2.5-14b"
 
 class AskReq(BaseModel):
     question: str
-    model_name: str = "llama-3.1-8b"
+    model_name: str = "qwen2.5-14b"
     top_k: int = 3
 
 class UploadResp(BaseModel):
@@ -695,7 +695,7 @@ Examples:
         
         st = pytime.time()
         resp = client.chat.completions.create(
-            model=os.getenv("DEFAULT_MODEL_ALIAS", "llama-3.1-8b"),
+            model=os.getenv("DEFAULT_MODEL_ALIAS", "qwen2.5-14b"),
             messages=[
                 {"role": "system", "content": sys},
                 {"role": "user", "content": text}
@@ -720,7 +720,7 @@ NO Korean letters. NO quotes. NO explanations.
 Preserve question format if input is a question."""
             
             resp2 = client.chat.completions.create(
-                model=os.getenv("DEFAULT_MODEL_ALIAS", "llama-3.1-8b"),
+                model=os.getenv("DEFAULT_MODEL_ALIAS", "qwen2.5-14b"),
                 messages=[
                     {"role": "system", "content": sys2},
                     {"role": "user", "content": f"Translate this Korean to English: {text}"}
