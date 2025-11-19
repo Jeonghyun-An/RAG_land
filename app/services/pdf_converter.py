@@ -12,6 +12,8 @@ from typing import Optional
 from pathlib import Path
 import hashlib
 import base64
+import zipfile
+import xml.etree.ElementTree as ET
 
 GOTENBERG_URL = os.getenv("GOTENBERG_URL", "http://gotenberg:3000")
 GOTENBERG_TIMEOUT = int(os.getenv("GOTENBERG_TIMEOUT", "120"))
@@ -213,7 +215,54 @@ def _text_to_pdf(src: Path, out: Path):
     with open(out, "wb") as fw:
         fw.write(pdf_bytes)
 
-# ========== [추가] HWP → PDF 변환 함수 ==========
+# ==========  HWPX XML 파싱 함수 ==========
+def _extract_text_from_hwpx(hwpx_path: Path) -> str:
+    """
+    HWPX 파일에서 텍스트 추출
+    HWPX는 ZIP 압축된 XML 파일들로 구성
+    """
+    try:
+        texts = []
+        
+        # HWPX는 ZIP 파일
+        with zipfile.ZipFile(hwpx_path, 'r') as zf:
+            # Contents/section*.xml 파일들에 본문 내용
+            section_files = [f for f in zf.namelist() if f.startswith('Contents/section') and f.endswith('.xml')]
+            section_files.sort()  # 순서대로 정렬
+            
+            for section_file in section_files:
+                try:
+                    with zf.open(section_file) as f:
+                        content = f.read()
+                        
+                    # XML 파싱
+                    root = ET.fromstring(content)
+                    
+                    # 텍스트 노드 찾기 (재귀적으로)
+                    for text_elem in root.iter():
+                        # 텍스트 내용이 있는 요소
+                        if text_elem.text and text_elem.text.strip():
+                            texts.append(text_elem.text.strip())
+                        if text_elem.tail and text_elem.tail.strip():
+                            texts.append(text_elem.tail.strip())
+                            
+                except Exception as e:
+                    print(f"[HWPX] Warning: Failed to parse {section_file}: {e}")
+                    continue
+        
+        full_text = "\n".join(texts)
+        
+        if not full_text.strip():
+            raise ValueError("HWPX에서 텍스트를 추출할 수 없습니다")
+        
+        return full_text
+        
+    except zipfile.BadZipFile:
+        raise ConvertError("유효하지 않은 HWPX 파일입니다 (ZIP 형식 오류)")
+    except Exception as e:
+        raise ConvertError(f"HWPX 텍스트 추출 실패: {e}")
+
+
 def _hwp_to_pdf_via_text(src: Path, out: Path):
     """
     HWP → TXT → PDF 변환 (pyhwp 사용)
@@ -270,23 +319,47 @@ def _hwp_to_pdf_via_text(src: Path, out: Path):
             os.unlink(txt_path)
         raise ConvertError(f"HWP 변환 실패: {e}")
 
+# ========== _hwp_to_pdf 함수 수정 (HWPX 지원 추가) ==========
 def _hwp_to_pdf(src: Path, out: Path):
     """
-    HWP → PDF 변환
+    HWP/HWPX → PDF 변환
     우선순위:
-    1. pyhwp (텍스트 추출) → reportlab (PDF 생성)
-    2. DOC_CONVERTER_URL (외부 서비스)
-    3. unoconv/soffice (작동 안 함)
+    1. HWPX: XML 파싱 → reportlab
+    2. HWP: pyhwp → reportlab
+    3. 외부 컨버터 (DOC_CONVERTER_URL)
     """
-    # 1순위: pyhwp (무료 오픈소스)
-    if shutil.which("hwp5txt"):
-        try:
-            _hwp_to_pdf_via_text(src, out)
-            return
-        except Exception as e:
-            print(f"[CONVERT] pyhwp 실패: {e}")
+    ext = src.suffix.lower()
     
-    # 2순위: 외부 컨버터
+    # ✅ HWPX 우선 처리 (pyhwp는 지원 안 함)
+    if ext == ".hwpx":
+        print(f"[CONVERT] Converting HWPX to PDF via XML parsing: {src}")
+        try:
+            # HWPX → 텍스트 추출
+            text = _extract_text_from_hwpx(src)
+            print(f"[CONVERT] Extracted {len(text)} characters from HWPX")
+            
+            # 텍스트 → PDF
+            pdf_bytes = _text_to_pdf_bytes(text)
+            with open(out, 'wb') as f:
+                f.write(pdf_bytes)
+            
+            print(f"[CONVERT] ✅ HWPX→PDF via XML parsing 성공: {out}")
+            return
+            
+        except Exception as e:
+            print(f"[CONVERT] HWPX XML parsing 실패: {e}")
+            # HWPX XML 파싱 실패 시 외부 컨버터로 폴백
+    
+    # ✅ HWP 처리 (pyhwp 사용)
+    if ext == ".hwp":
+        if shutil.which("hwp5txt"):
+            try:
+                _hwp_to_pdf_via_text(src, out)
+                return
+            except Exception as e:
+                print(f"[CONVERT] pyhwp 실패: {e}")
+    
+    # ✅ 외부 컨버터 (HWP/HWPX 모두 지원)
     if CONVERTER_ENDPOINT:
         try:
             with open(src, "rb") as f:
@@ -295,16 +368,22 @@ def _hwp_to_pdf(src: Path, out: Path):
             if pdf_bytes:
                 with open(out, "wb") as fw:
                     fw.write(pdf_bytes)
-                print(f"[CONVERT] ✅ HWP→PDF via DOC_CONVERTER_URL: {out}")
+                print(f"[CONVERT] ✅ HWP/HWPX→PDF via DOC_CONVERTER_URL: {out}")
                 return
         except Exception as e:
             print(f"[CONVERT] DOC_CONVERTER_URL 실패: {e}")
     
-    raise ConvertError(
-        "HWP 변환 실패: pyhwp를 설치하거나 DOC_CONVERTER_URL을 설정해주세요\n"
-        "설치 방법: pip install pyhwp"
-    )
-
+    # ✅ 모든 방법 실패
+    if ext == ".hwpx":
+        raise ConvertError(
+            "HWPX 변환 실패: XML 파싱이 실패했습니다.\n"
+            "대안: DOC_CONVERTER_URL을 설정하거나 HWP 5.0 형식으로 저장해주세요."
+        )
+    else:
+        raise ConvertError(
+            "HWP 변환 실패: pyhwp를 설치하거나 DOC_CONVERTER_URL을 설정해주세요\n"
+            "설치 방법: pip install pyhwp"
+        )
 # ---------- public: 로컬 파일 경로 기반 변환 ----------
 def convert_to_pdf(src_path: str) -> str:
     """입력 파일을 PDF로 변환해서 로컬 경로 반환. 이미 PDF면 그대로 반환."""
