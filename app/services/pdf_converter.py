@@ -67,25 +67,53 @@ def _chromium_opts(no_margins: bool = False, prefer_css_page_size: bool = True) 
         d["marginTop"] = d["marginBottom"] = d["marginLeft"] = d["marginRight"] = mm_str
     return d
 
+def _register_korean_font():
+    """
+    reportlab에 한글 폰트 등록
+    나눔고딕 폰트를 시스템에서 찾아 등록
+    """
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    
+    # 이미 등록되어 있으면 스킵
+    if "NanumGothic" in pdfmetrics.getRegisteredFontNames():
+        return "NanumGothic"
+    
+    # 나눔고딕 폰트 경로 후보들
+    font_paths = [
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+        "/usr/share/fonts/truetype/nanum-gothic/NanumGothic.ttf",
+        "/usr/share/fonts/nanum/NanumGothic.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",  # macOS
+    ]
+    
+    for font_path in font_paths:
+        if os.path.exists(font_path):
+            try:
+                pdfmetrics.registerFont(TTFont("NanumGothic", font_path))
+                print(f"[FONT] ✅ Registered Korean font: {font_path}")
+                return "NanumGothic"
+            except Exception as e:
+                print(f"[FONT] ⚠️ Failed to register {font_path}: {e}")
+                continue
+    
+    # 폰트를 찾지 못한 경우 경고
+    print("[FONT] ⚠️ No Korean font found, text may display as squares")
+    return "Helvetica"  # 기본 폰트로 폴백
+
 # ---------- TXT → PDF 변환 (reportlab) ----------
 def _text_to_pdf_bytes(text: str) -> bytes:
     """
     텍스트를 PDF bytes로 변환 (reportlab 사용)
-    reportlab이 없으면 ImportError 발생 -> 상위에서 처리.
+    ✅ 한글 폰트 지원 추가
     """
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import mm
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
 
-    # 폰트 등록 (없어도 기본 폰트로 동작은 함)
-    try:
-        # 시스템에 NotoSansCJK 같은 폰트가 있으면 등록 (선택)
-        # pdfmetrics.registerFont(TTFont("NotoSans", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"))
-        pass
-    except Exception:
-        pass
+    # ✅ 한글 폰트 등록
+    korean_font = _register_korean_font()
 
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -96,37 +124,45 @@ def _text_to_pdf_bytes(text: str) -> bytes:
     max_width = width - 2 * margin_x
     y = height - margin_y
 
-    # 폰트 설정
-    try:
-        c.setFont("Helvetica", 10)
-    except Exception:
-        pass
+    # ✅ 한글 폰트 설정
+    font_size = 10
+    c.setFont(korean_font, font_size)
 
-    # 아주 단순한 워드랩
+    # 워드랩 (한글 고려)
     import textwrap
     lines = []
     for para in (text or "").splitlines():
-        # 대략적인 폭 기준(영문 80~100자, 한글 섞이면 줄 조밀)
-        # 필요하면 reportlab의 stringWidth로 정확도 향상 가능
-        wrap = textwrap.wrap(para, width=95) or [""]
-        lines.extend(wrap)
+        # ✅ 한글은 폭이 넓으므로 줄당 글자 수 조정
+        # 영문: ~95자, 한글: ~45자
+        wrap_width = 45 if any(ord(ch) > 127 for ch in para) else 95
+        wrapped = textwrap.wrap(para, width=wrap_width, break_long_words=False, break_on_hyphens=False)
+        if wrapped:
+            lines.extend(wrapped)
+        else:
+            lines.append("")  # 빈 줄 유지
 
-    line_height = 12  # pt
+    line_height = font_size * 1.5  # 줄 간격
+    
     for line in lines:
         if y <= margin_y:
             c.showPage()
-            try:
-                c.setFont("Helvetica", 10)
-            except Exception:
-                pass
+            c.setFont(korean_font, font_size)
             y = height - margin_y
-        c.drawString(margin_x, y, line)
+        
+        # ✅ 안전한 텍스트 그리기
+        try:
+            c.drawString(margin_x, y, line)
+        except Exception as e:
+            # 특수문자 처리 실패 시 대체
+            print(f"[FONT] ⚠️ Failed to draw line: {e}")
+            safe_line = line.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
+            c.drawString(margin_x, y, safe_line)
+        
         y -= line_height
 
     c.showPage()
     c.save()
     
-    # bytes 반환
     buffer.seek(0)
     return buffer.read()
 
