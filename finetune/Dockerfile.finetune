@@ -1,6 +1,7 @@
 # finetune/Dockerfile.finetune
 FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel
 
+# 기본 작업 디렉토리
 WORKDIR /workspace
 
 # 시스템 패키지
@@ -11,7 +12,12 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Python 패키지 (A4000 최적화)
+# (옵션) requirements.txt가 있다면 복사 후 설치
+# 없으면 아래 처럼 직접 pip install 해도 됨
+# COPY requirements.txt .
+# RUN pip install --no-cache-dir -r requirements.txt
+
+# Python 패키지 (pymilvus 추가!!)
 RUN pip install --no-cache-dir \
     transformers==4.38.2 \
     datasets==2.16.1 \
@@ -21,8 +27,11 @@ RUN pip install --no-cache-dir \
     scipy \
     sentencepiece \
     tensorboard \
-    trl \
-    pymilvus==2.3.5
+    trl 
+
+RUN pip install --no-cache-dir pymilvus==2.3.5
+
+RUN pip install --no-cache-dir --upgrade marshmallow==3.19.0
 
 # 환경 설정
 ENV TRANSFORMERS_CACHE=/workspace/models
@@ -30,8 +39,12 @@ ENV HF_HOME=/workspace/models
 ENV TOKENIZERS_PARALLELISM=false
 ENV PYTHONUNBUFFERED=1
 
-# 작업 디렉토리
+# 코드 전체를 이미지 안으로 복사
+# (여기서 . 은 finetune 디렉토리 기준)
+COPY . /workspace/finetune
+
+# 실행 기본 위치
 WORKDIR /workspace/finetune
 
-# 기본 명령어
+# 기본 명령어 (컨테이너 들어갔을 때 bash)
 CMD ["bash"]
