@@ -21,7 +21,8 @@ RUN pip install --no-cache-dir \
     scipy \
     sentencepiece \
     tensorboard \
-    trl
+    trl \
+    pymilvus==2.3.5
 
 # 환경 설정
 ENV TRANSFORMERS_CACHE=/workspace/models
