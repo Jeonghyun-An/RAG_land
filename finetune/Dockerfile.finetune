@@ -1,0 +1,36 @@
+# finetune/Dockerfile.finetune
+FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel
+
+WORKDIR /workspace
+
+# 시스템 패키지
+RUN apt-get update && apt-get install -y \
+    git \
+    vim \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python 패키지 (A4000 최적화)
+RUN pip install --no-cache-dir \
+    transformers==4.38.2 \
+    datasets==2.16.1 \
+    peft==0.8.2 \
+    accelerate==0.27.2 \
+    bitsandbytes==0.42.0 \
+    scipy \
+    sentencepiece \
+    tensorboard \
+    trl
+
+# 환경 설정
+ENV TRANSFORMERS_CACHE=/workspace/models
+ENV HF_HOME=/workspace/models
+ENV TOKENIZERS_PARALLELISM=false
+ENV PYTHONUNBUFFERED=1
+
+# 작업 디렉토리
+WORKDIR /workspace/finetune
+
+# 기본 명령어
+CMD ["bash"]
