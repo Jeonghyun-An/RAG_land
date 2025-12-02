@@ -19,6 +19,7 @@ REGISTRY: Dict[str, ModelSpec] = {
     "llama-3.1-8b":   ModelSpec("vllm", "meta-llama/Llama-3.1-8B-Instruct"),
     "ko-llama3-8b":   ModelSpec("vllm", "saltlux/Ko-Llama3-Luxia-8B"),
     "qwen2.5-14b":   ModelSpec("vllm", "Qwen/Qwen2.5-14B-Instruct"),
+    "qwen2.5-7b":   ModelSpec("vllm", "Qwen/Qwen2.5-7B-Instruct"),
 
     # 실제 HF ID(그대로 받아도 로컬 로딩 가능)
     "meta-llama/Llama-3.2-1B-Instruct": ModelSpec("vllm", "meta-llama/Llama-3.2-1B-Instruct"),
@@ -26,6 +27,7 @@ REGISTRY: Dict[str, ModelSpec] = {
     "meta-llama/Llama-3.1-8B-Instruct": ModelSpec("vllm", "meta-llama/Llama-3.1-8B-Instruct"),
     "saltlux/Ko-Llama3-Luxia-8B":       ModelSpec("vllm", "saltlux/Ko-Llama3-Luxia-8B"),
     "Qwen/Qwen2.5-14B-Instruct":        ModelSpec("vllm", "Qwen/Qwen2.5-14B-Instruct", ctx_len=32768),
+    "Qwen/Qwen2.5-7B-Instruct":        ModelSpec("vllm", "Qwen/Qwen2.5-7B-Instruct", ctx_len=32768),
 }
 
 # 데모 기본값(원하면 .env에서 DEFAULT_ALIAS 오버라이드 해도 됨)
