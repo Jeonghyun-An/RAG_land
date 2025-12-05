@@ -107,6 +107,18 @@ class DeleteDocumentResponse(BaseModel):
     deleted_files: List[str]
     message: str
 
+class UpdateMetadataRequest(BaseModel):
+    """자바 → AI 메타데이터 업데이트 요청"""
+    data_id: str
+    callback_url: str  # 완료 콜백 URL
+
+
+class UpdateMetadataResponse(BaseModel):
+    """메타데이터 업데이트 즉시 응답"""
+    status: str
+    job_id: str
+    data_id: str
+    message: str
 
 # ==================== Helper Functions ====================
 def verify_internal_token(token: Optional[str]) -> bool:
@@ -516,6 +528,49 @@ async def batch_delete(
         "message": f"Batch deletion started for {len(data_ids)} documents"
     }
 
+@router.post("/update-metadata", response_model=UpdateMetadataResponse)
+async def update_metadata(
+    request: UpdateMetadataRequest,
+    background_tasks: BackgroundTasks,
+    x_internal_token: Optional[str] = Header(None)
+):
+    """
+    자바 → AI 메타데이터 업데이트 API
+    
+    자바측에서 osk_data 테이블의 메타데이터(data_title, data_code 등)를 수정한 후 호출
+    
+    프로세스:
+    1. data_id로 osk_data 테이블 조회
+    2. MinIO meta.json 업데이트
+    3. Milvus 청크 메타데이터 업데이트 (청크별 metadata 필드)
+    4. 완료 후 callback_url로 웹훅 전송
+    """
+    if not verify_internal_token(x_internal_token):
+        raise HTTPException(401, "Unauthorized - Invalid token")
+    
+    # data_id 존재 확인
+    db = DBConnector()
+    row = db.get_file_by_id(request.data_id)
+    
+    if not row:
+        raise HTTPException(404, f"data_id not found: {request.data_id}")
+    
+    job_id = str(uuid.uuid4())[:8]
+    
+    background_tasks.add_task(
+        process_update_metadata,
+        job_id=job_id,
+        data_id=request.data_id,
+        callback_url=request.callback_url
+    )
+    
+    return UpdateMetadataResponse(
+        status="accepted",
+        job_id=job_id,
+        data_id=request.data_id,
+        message="metadata update processing"
+    )
+
 
 @router.get("/status/{data_id}", response_model=StatusResponse)
 def get_status(data_id: str, x_internal_token: Optional[str] = Header(None)):
@@ -545,8 +600,9 @@ def health_check():
         "service": "java-router-production",
         "chunking": "advanced (en_tech → law → layout → basic)",
         "manual_ocr": "DB-based (osk_ocr_data)",
-        "sc_index": "SC document single chunk (preface + contents + conclusion)"
-    }
+        "sc_index": "SC document single chunk (preface + contents + conclusion)",
+        "metadata_update": "MinIO + Milvus metadata sync" 
+    }   
 
 
 # ==================== Background Tasks ====================
@@ -1392,3 +1448,179 @@ async def process_delete_document(
                 message=str(e)
             )
             await send_webhook(callback_url, payload, SHARED_SECRET)
+            
+async def process_update_metadata(
+    job_id: str,
+    data_id: str,
+    callback_url: str
+):
+    """
+    메타데이터 업데이트 백그라운드 처리
+    
+    프로세스:
+    1. osk_data 테이블에서 최신 메타데이터 조회
+    2. MinIO meta.json 업데이트 (title, data_code 등)
+    3. Milvus 청크 메타데이터 업데이트 (전체 청크 순회)
+    4. 완료 후 callback_url로 웹훅 전송
+    """
+    db = DBConnector()
+    start_time = datetime.utcnow()
+    
+    job_state.start(job_id, data_id=data_id)
+    
+    try:
+        # ========== Step 1: DB에서 최신 메타데이터 조회 ==========
+        job_state.update(job_id, status="loading", step="Loading metadata from DB")
+        
+        print(f"[META-UPDATE] Loading metadata for data_id={data_id}")
+        
+        row = db.get_file_by_id(data_id)
+        
+        if not row:
+            raise RuntimeError(f"데이터를 찾을 수 없습니다: data_id={data_id}")
+        
+        print(f"[META-UPDATE] Loaded: data_title={row.get('data_title')}, data_code={row.get('data_code')}")
+        
+        # ========== Step 2: MinIO meta.json 업데이트 ==========
+        job_state.update(job_id, status="updating_minio", step="Updating MinIO metadata")
+        
+        try:
+            m = MinIOStore()
+            doc_id = str(data_id)
+            meta_key = META_KEY(doc_id)
+            
+            # 기존 meta.json 로드
+            meta = {}
+            if m.exists(meta_key):
+                try:
+                    meta = m.get_json(meta_key) or {}
+                except Exception:
+                    meta = {}
+            
+            # DB 메타데이터로 업데이트
+            display_title = (row.get("data_title") or "").strip() or meta.get("title", f"Document {data_id}")
+            
+            # 업데이트할 필드들
+            db_meta_fields = {}
+            for k in [
+                "data_id","data_title","data_code","data_code_detail","data_code_detail_sub",
+                "file_folder","file_id","reg_nm","reg_id","reg_dt","reg_type","parse_yn"
+            ]:
+                if k in row:
+                    db_meta_fields[k] = row[k]
+            
+            # 기존 메타 유지하면서 업데이트
+            meta.update({
+                "title": display_title,
+                "last_metadata_updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                **db_meta_fields
+            })
+            
+            # MinIO에 저장
+            m.put_json(meta_key, meta)
+            
+            print(f"[META-UPDATE] ✅ MinIO meta.json updated: title='{display_title}'")
+        
+        except Exception as e:
+            print(f"[META-UPDATE] ⚠️ MinIO update failed: {e}")
+            # MinIO 업데이트 실패해도 Milvus는 계속 진행
+        
+        # ========== Step 3: Milvus 메타데이터 업데이트 ==========
+        job_state.update(job_id, status="updating_milvus", step="Updating Milvus metadata")
+        
+        try:
+            from app.services.milvus_store_v2 import MilvusStoreV2
+            from app.services.embedding_model import get_sentence_embedding_dimension
+            
+            mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
+            
+            # 기존 청크들 조회
+            print(f"[META-UPDATE] Fetching chunks from Milvus for doc_id={data_id}")
+            
+            # Milvus에서 해당 문서의 모든 청크 조회
+            search_results = mvs.collection.query(
+                expr=f'doc_id == "{data_id}"',
+                output_fields=["id", "doc_id", "chunk_index", "text", "page", "pages", "metadata"]
+            )
+            
+            if not search_results:
+                print(f"[META-UPDATE] ⚠️ No chunks found in Milvus for data_id={data_id}")
+            else:
+                print(f"[META-UPDATE] Found {len(search_results)} chunks in Milvus")
+                
+                # 청크별 메타데이터 업데이트
+                updated_count = 0
+                for chunk in search_results:
+                    chunk_id = chunk.get("id")
+                    current_metadata = chunk.get("metadata", {})
+                    
+                    # 메타데이터 업데이트
+                    updated_metadata = current_metadata.copy()
+                    updated_metadata.update({
+                        "data_title": row.get("data_title"),
+                        "data_code": row.get("data_code"),
+                        "data_code_detail": row.get("data_code_detail"),
+                        "data_code_detail_sub": row.get("data_code_detail_sub"),
+                        "last_metadata_updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    })
+                    
+                    # Milvus 업데이트
+                    try:
+                        mvs.collection.upsert([{
+                            "id": chunk_id,
+                            "metadata": updated_metadata
+                        }])
+                        updated_count += 1
+                    except Exception as e:
+                        print(f"[META-UPDATE] ⚠️ Failed to update chunk {chunk_id}: {e}")
+                
+                print(f"[META-UPDATE] ✅ Updated {updated_count}/{len(search_results)} chunks in Milvus")
+        
+        except Exception as e:
+            print(f"[META-UPDATE] ⚠️ Milvus update failed: {e}")
+            # Milvus 업데이트 실패해도 웹훅은 전송
+        
+        # ========== Step 4: 완료 처리 ==========
+        job_state.complete(
+            job_id,
+            pages=0,
+            chunks=len(search_results) if 'search_results' in locals() else 0
+        )
+        
+        print(f"[META-UPDATE] ✅ Metadata update completed for data_id={data_id}")
+        
+        # ========== Step 5: 완료 & Webhook ==========
+        end_time = datetime.utcnow()
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=job_id,
+                data_id=data_id,
+                status="metadata_updated",
+                converted=False,
+                metrics={
+                    "updated_title": display_title,
+                    "updated_chunks": len(search_results) if 'search_results' in locals() else 0
+                },
+                timestamps={
+                    "start": start_time.isoformat(), 
+                    "end": end_time.isoformat()
+                },
+                message="metadata updated successfully"
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+    
+    except Exception as e:
+        job_state.fail(job_id, str(e))
+        print(f"[META-UPDATE] ❌ Error: {e}")
+        
+        if callback_url:
+            payload = WebhookPayload(
+                job_id=job_id,
+                data_id=data_id,
+                status="metadata_update_error",
+                message=str(e)
+            )
+            await send_webhook(callback_url, payload, SHARED_SECRET)
+        
+        raise
