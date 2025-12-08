@@ -36,6 +36,7 @@ from app.services.milvus_store_v2 import MilvusStoreV2
 from app.services.embedding_model import get_embedding_model, embed
 from app.services.reranker import rerank
 from app.services.llm_client import get_openai_client
+from app.services.db_connector import DBConnector
 
 router = APIRouter(tags=["llama"])
 logger.info("[ask] router loaded v2025-10-29a")
@@ -1594,3 +1595,46 @@ def debug_vector_search(q: str, k: int = 5):
         return {"results": raw}
     except Exception as e:
         raise HTTPException(500, f"디버그 검색 실패: {e}")
+
+# ==================== 카테고리별 문서 필터링 (신규 엔드포인트) ====================
+class DocsByCodeResponse(BaseModel):
+    """카테고리 필터 응답"""
+    doc_ids: List[str]
+
+@router.get("/rag/docs/by-code", response_model=DocsByCodeResponse)
+def list_docs_by_code(
+    data_code: Optional[str] = Query(None, description="대분류 코드"),
+    data_code_detail: Optional[str] = Query(None, description="중분류 코드"),
+    data_code_detail_sub: Optional[str] = Query(None, description="소분류 코드"),
+):
+    """
+    osk_data 테이블에서 data_code / data_code_detail / data_code_detail_sub 기준으로
+    data_id(doc_id)를 조회해서 내려주는 엔드포인트.
+    
+    - parse_yn = 'S' (RAG 인덱싱 완료된 문서만)
+    - del_yn != 'Y' (삭제되지 않은 문서만)
+    
+    Examples:
+        - /rag/docs/by-code?data_code=LAW
+        - /rag/docs/by-code?data_code=LAW&data_code_detail=NUCLEAR
+        - /rag/docs/by-code?data_code=MANUAL&data_code_detail_sub=SAFETY
+    """
+    db = DBConnector()
+
+    try:
+        rows = db.fetch_docs_by_code(
+            data_code=data_code,
+            data_code_detail=data_code_detail,
+            data_code_detail_sub=data_code_detail_sub,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    doc_ids = [str(r["data_id"]) for r in rows]
+    
+    logger.info(
+        f"[/rag/docs/by-code] Filtered {len(doc_ids)} docs | "
+        f"code={data_code}, detail={data_code_detail}, sub={data_code_detail_sub}"
+    )
+    
+    return DocsByCodeResponse(doc_ids=doc_ids)

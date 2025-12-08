@@ -484,6 +484,68 @@ class DBConnector:
             print(f"[DB] ✅ Updated file_id only: data_id={data_id} -> {new_file_id}")
         except Exception as e:
             print(f"[DB] ❌ update_file_id_only failed: {e}")
+            
+    # ==================== 12. 카테고리별 문서 목록 조회 (신규 추가) ====================
+    def fetch_docs_by_code(
+        self,
+        data_code: str | None = None,
+        data_code_detail: str | None = None,
+        data_code_detail_sub: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        osk_data 에서 카테고리 기준으로 data_id 목록을 가져온다.
+        RAG 대상(parse_yn='S')이면서 삭제되지 않은 문서만 조회.
+        
+        Args:
+            data_code: 대분류 코드
+            data_code_detail: 중분류 코드
+            data_code_detail_sub: 소분류 코드
+        
+        Returns:
+            [{"data_id": str, "data_title": str, ...}, ...]
+        """
+        try:
+            sql = """
+                SELECT data_id, data_title, data_code, data_code_detail, data_code_detail_sub
+                FROM osk_data
+                WHERE 1=1
+            """
+            params: List[Any] = []
+
+            # RAG 대상으로 올라간 문서만 필터
+            sql += " AND parse_yn = 'S'"
+            
+            # 삭제되지 않은 문서만 필터
+            sql += " AND (del_yn IS NULL OR del_yn != 'Y')"
+
+            if data_code:
+                sql += " AND data_code = ?"
+                params.append(data_code)
+
+            if data_code_detail:
+                sql += " AND data_code_detail = ?"
+                params.append(data_code_detail)
+
+            if data_code_detail_sub:
+                sql += " AND data_code_detail_sub = ?"
+                params.append(data_code_detail_sub)
+            
+            sql += " ORDER BY data_id"
+
+            with self.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, tuple(params))
+                rows = cur.fetchall()
+                cols = [d[0] for d in cur.description]
+                cur.close()
+            
+            result = [dict(zip(cols, row)) for row in rows]
+            print(f"[DB] ✅ fetch_docs_by_code: {len(result)} documents (code={data_code}, detail={data_code_detail}, sub={data_code_detail_sub})")
+            return result
+            
+        except Exception as e:
+            print(f"[DB] ❌ fetch_docs_by_code failed: {e}")
+            return []
 
     # ==================== 호환성 유지 메서드 ====================
     def update_parse_status(
