@@ -506,6 +506,56 @@ class MilvusStoreV2:
             })
         return out
     
+    def search_in_docs(
+        self,
+        query: str,
+        embed_fn: Callable[[List[str]], List[List[float]]],
+        doc_ids: List[str],
+        topk: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        특정 doc_id 목록 안에서만 검색하는 버전
+        - doc_ids: osk_data.data_id 목록 (문자열)
+        """
+        if not query or not doc_ids:
+            return []
+
+        qv = embed_fn([query])[0]
+
+        try:
+            self.col.load()
+        except Exception:
+            pass
+
+        # Milvus expr용으로 doc_id in ["...", "..."] 형태로 변환
+        safe_ids = [str(d).replace('"', "").replace("\\", "") for d in doc_ids]
+        expr = "doc_id in [" + ",".join(f'"{i}"' for i in safe_ids) + "]"
+
+        res = self.col.search(
+            data=[qv],
+            anns_field="embedding",
+            param={"metric_type": "IP", "params": {"ef": 64}},
+            limit=topk,
+            expr=expr,  # 🔹 여기서 필터 적용
+            output_fields=["doc_id", "seq", "page", "section", "chunk"],
+            consistency_level="Strong",
+        )
+
+        out: List[Dict[str, Any]] = []
+        for hit in res[0]:
+            ent = hit.entity
+            out.append(
+                {
+                    "score": float(hit.distance),
+                    "doc_id": ent.get("doc_id"),
+                    "seq": int(ent.get("seq")),
+                    "page": int(ent.get("page")),
+                    "section": ent.get("section"),
+                    "chunk": ent.get("chunk"),
+                }
+            )
+        return out
+
     def count_by_doc(self, doc_id: str) -> int:
         """특정 doc_id의 청크 개수 조회"""
         try:

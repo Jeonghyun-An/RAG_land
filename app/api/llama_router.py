@@ -51,6 +51,8 @@ class AskReq(BaseModel):
     question: str
     model_name: str = "qwen2.5-14b"
     top_k: int = 3
+    history: Optional[List[dict]] = []
+    doc_ids: Optional[List[str]] = None
 
 class UploadResp(BaseModel):
     filename: str
@@ -924,6 +926,24 @@ def ask_question(req: AskReq):
 
         # 초기 넉넉히 검색
         raw_topk = max(40, req.top_k * 6)
+        # 선택 문서가 있을 경우 doc 필터를 걸어서 검색하는 헬퍼
+        def _search_with_optional_filter(q: str, topk: int):
+            if not q:
+                return []
+            if req.doc_ids:
+                logger.info("[ask] doc filter enabled: %d docs", len(req.doc_ids))
+                return store.search_in_docs(
+                    query=q,
+                    embed_fn=embed,  # embedding_model.embed (이미 import 되어 있음)
+                    doc_ids=req.doc_ids,
+                    topk=topk,
+                )
+            # 선택된 문서가 없으면 기존 글로벌 검색
+            return store.search(
+                query=q,
+                embed_fn=embed,
+                topk=topk,
+            )
         def _dedup_key(c):
             return (c.get("doc_id"), c.get("page"), _strip_meta_line(c.get("chunk",""))[:80])
 
@@ -938,14 +958,22 @@ def ask_question(req: AskReq):
 
         if lang == "ko" and _has_hangul(query_for_search):
             # 번역 실패로 판단 → 한/영 양방향 검색
-            logger.warning("[ask] q_search still contains Hangul; doing bilingual search fallback")
-            cands_ko = store.search(normalize_query(req.question), embed_fn=embed, topk=raw_topk//2)
+            logger.warning(
+                "[ask] q_search still contains Hangul; doing bilingual search fallback"
+            )
+            cands_ko = _search_with_optional_filter(
+                normalize_query(req.question),
+                raw_topk // 2,
+            )
             # 강제 번역(한 번 더)
             forced_en = _cached_ko_to_en(normalize_query(req.question))
-            cands_en = store.search(forced_en, embed_fn=embed, topk=raw_topk//2)
+            cands_en = _search_with_optional_filter(
+                forced_en,
+                raw_topk // 2,
+            )
             cands = _merge_dedup(cands_ko, cands_en)
         else:
-            cands = store.search(query_for_search, embed_fn=embed, topk=raw_topk)
+            cands = _search_with_optional_filter(query_for_search, raw_topk)
 
         logger.info("[ask] cands=%d (raw_topk=%d)", len(cands), raw_topk)
 
