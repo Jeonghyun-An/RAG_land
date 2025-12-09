@@ -1,9 +1,9 @@
 # app/services/pdf_fusion.py
 """
-PDF 융합 파서 개선 버전
-- pdfminer 텍스트 추출 + OCR 보강
+PDF 융합 파서 - SmartOCRRouter 통합 버전
+- pdfminer 텍스트 추출 + 지능형 OCR 보강
+- 페이지 품질 기반 OCR 라우팅
 - bbox 정보 정확도 향상
-- CID 패턴 명시적 감지 추가
 - 워터마크 필터링 강화
 - 표 영역 bbox 최적화
 """
@@ -54,23 +54,93 @@ except Exception:
         return out or ["ko","en"]
 
 
-# 🔥 NEW: OCR 필요 여부 종합 판단
-def _needs_ocr_for_page(text: str, min_chars: int) -> bool:
+# ========== SmartOCRRouter 통합 ==========
+def _get_smart_ocr_decision(
+    pages: List[Tuple[int, str]], 
+    layout_map: Dict[int, List[Dict]],
+    ocr_mode: str
+) -> Tuple[bool, List[int], Dict]:
     """
-    페이지 텍스트가 OCR이 필요한지 판단
-    
-    Args:
-        text: 페이지 텍스트
-        min_chars: 최소 문자 수 임계값
+    SmartOCRRouter를 사용한 OCR 결정
     
     Returns:
-        True if OCR needed, False otherwise
+        (전체_OCR_필요, 부분_OCR_페이지_리스트, 분석_정보)
+    """
+    # 환경변수로 SmartOCRRouter 활성화 제어
+    use_smart_router = os.getenv("OCR_USE_SMART_ROUTER", "1").strip() == "1"
+    
+    if not use_smart_router:
+        # 기존 방식 (하위 호환)
+        print("[OCR] SmartOCRRouter disabled, using legacy logic")
+        return _legacy_ocr_decision(pages, ocr_mode)
+    
+    try:
+        from app.services.smart_ocr_router import SmartOCRRouter
+        
+        router = SmartOCRRouter()
+        needs_full, partial_pages, analysis = router.should_use_ocr(pages, layout_map)
+        
+        print(f"[OCR] SmartOCRRouter decision:")
+        print(f"  - Full OCR needed: {needs_full}")
+        print(f"  - Partial OCR pages: {len(partial_pages)}")
+        print(f"  - High priority pages: {analysis.get('high_priority_pages', 0)}")
+        print(f"  - Avg confidence: {analysis.get('avg_confidence', 0):.3f}")
+        
+        # 디버그 모드면 상세 리포트 출력
+        if os.getenv("OCR_DEBUG", "1") == "1":
+            report = router.get_quality_report(pages, layout_map)
+            print("\n[OCR] Quality Report:")
+            for page_detail in report.get('page_details', []):
+                print(f"  Page {page_detail['page']}: "
+                      f"type={page_detail['type']}, "
+                      f"needs_ocr={page_detail['needs_ocr']}, "
+                      f"priority={page_detail['ocr_priority']}")
+            print(f"\n  Recommendations:")
+            for rec in report.get('recommendations', []):
+                print(f"    {rec}")
+        
+        return needs_full, partial_pages, analysis
+        
+    except ImportError as e:
+        print(f"[OCR] ⚠️  SmartOCRRouter import failed: {e}, falling back to legacy logic")
+        return _legacy_ocr_decision(pages, ocr_mode)
+    except Exception as e:
+        print(f"[OCR] ⚠️  SmartOCRRouter error: {e}, falling back to legacy logic")
+        return _legacy_ocr_decision(pages, ocr_mode)
+
+
+def _legacy_ocr_decision(
+    pages: List[Tuple[int, str]], 
+    ocr_mode: str
+) -> Tuple[bool, List[int], Dict]:
+    """
+    기존 OCR 결정 로직 (하위 호환)
+    """
+    min_chars = int(os.getenv("OCR_MIN_CHARS_PER_PAGE", "50"))
+    
+    if ocr_mode == "force":
+        return True, [], {'mode': 'force'}
+    
+    ocr_pages = []
+    for page_no, text in pages:
+        if _needs_ocr_for_page_legacy(text, min_chars):
+            ocr_pages.append(page_no)
+    
+    # 50% 이상이면 전체 OCR
+    needs_full = len(ocr_pages) >= len(pages) * 0.5
+    
+    return needs_full, ([] if needs_full else ocr_pages), {'mode': 'legacy'}
+
+
+def _needs_ocr_for_page_legacy(text: str, min_chars: int) -> bool:
+    """
+    기존 페이지별 OCR 필요 여부 판단 (하위 호환)
     """
     if not text or len(text.strip()) < min_chars:
         return True
     
-    # 🔥 CID 패턴 감지 (명시적)
-    cid_threshold = float(os.getenv("OCR_CID_THRESHOLD", "0.2"))
+    # CID 패턴 감지
+    cid_threshold = float(os.getenv("OCR_CID_THRESHOLD", "0.15"))
     cid_pattern = re.compile(r'\(cid:\d+\)')
     cid_matches = cid_pattern.findall(text)
     cid_char_count = sum(len(m) for m in cid_matches)
@@ -78,10 +148,9 @@ def _needs_ocr_for_page(text: str, min_chars: int) -> bool:
     if len(text) > 0:
         cid_ratio = cid_char_count / len(text)
         if cid_ratio > cid_threshold:
-            print(f"[OCR] CID pattern detected ({cid_ratio:.1%} > {cid_threshold:.0%}), triggering OCR")
             return True
     
-    # 🔥 읽을 수 있는 문자 비율 체크
+    # 읽을 수 있는 문자 비율 체크
     min_readable_ratio = float(os.getenv("OCR_MIN_READABLE_RATIO", "0.3"))
     readable_chars = len(re.findall(r'[a-zA-Z0-9가-힣]', text))
     total_chars = len(text)
@@ -89,7 +158,6 @@ def _needs_ocr_for_page(text: str, min_chars: int) -> bool:
     if total_chars > 0:
         readable_ratio = readable_chars / total_chars
         if readable_ratio < min_readable_ratio:
-            print(f"[OCR] Low readable ratio ({readable_ratio:.1%} < {min_readable_ratio:.0%}), triggering OCR")
             return True
     
     return False
@@ -147,7 +215,7 @@ def _pdfminer_pages_and_blocks_from_bytes(pdf_bytes: bytes) -> Tuple[List[Tuple[
                         texts.append(t)
                         x0, y0, x1, y1 = elem.bbox
                         blocks.append({
-                            "text": t,
+                            "text": t, 
                             "bbox": {
                                 "x0": float(x0), 
                                 "y0": float(y0), 
@@ -162,50 +230,44 @@ def _pdfminer_pages_and_blocks_from_bytes(pdf_bytes: bytes) -> Tuple[List[Tuple[
     return pages, layout_map
 
 
-def _filter_watermark_blocks(blocks: List[Dict], page_width: float, 
-                            page_height: float) -> List[Dict]:
+# ---------- 워터마크 필터링 ----------
+def _filter_watermark_blocks(blocks: List[Dict], page_width: int, page_height: int) -> List[Dict]:
     """
-    [신규] 워터마크 블록 필터링
-    - 페이지 중앙에 큰 글자
-    - 반복되는 패턴
-    - 투명도 높은 텍스트 (간접 추정)
+    워터마크 블록 필터링
+    - 중앙 배치 + 대각선 + 반투명 텍스트
     """
     if not blocks:
         return blocks
     
     filtered = []
-    
-    # 중앙 영역 정의 (페이지의 중앙 30%)
     center_x = page_width / 2
     center_y = page_height / 2
-    center_tolerance = 0.15  # 중앙의 ±15%
     
     for block in blocks:
-        bbox = block['bbox']
-        
-        # bbox 중심
-        block_center_x = (bbox['x0'] + bbox['x1']) / 2
-        block_center_y = (bbox['y0'] + bbox['y1']) / 2
-        
-        # 중앙 근처 여부
-        is_center = (
-            abs(block_center_x - center_x) / page_width < center_tolerance and
-            abs(block_center_y - center_y) / page_height < center_tolerance
-        )
-        
-        # 크기 (워터마크는 보통 큼)
-        width = bbox['x1'] - bbox['x0']
-        height = bbox['y1'] - bbox['y0']
-        is_large = width > page_width * 0.3 or height > page_height * 0.1
-        
-        # 워터마크 키워드
-        text_lower = block['text'].lower()
-        watermark_keywords = ['draft', 'confidential', '기밀', '초안', 'watermark']
-        has_watermark_keyword = any(kw in text_lower for kw in watermark_keywords)
-        
-        # 워터마크로 판단되면 제외
-        if is_center and is_large and has_watermark_keyword:
+        bbox = block.get('bbox', {})
+        if not isinstance(bbox, dict):
+            filtered.append(block)
             continue
+        
+        x0, y0 = bbox.get('x0', 0), bbox.get('y0', 0)
+        x1, y1 = bbox.get('x1', 0), bbox.get('y1', 0)
+        
+        block_center_x = (x0 + x1) / 2
+        block_center_y = (y0 + y1) / 2
+        
+        # 중앙 근처 + 회전 각도 체크
+        dist_from_center = ((block_center_x - center_x)**2 + (block_center_y - center_y)**2)**0.5
+        
+        if dist_from_center < min(page_width, page_height) * 0.3:
+            # 대각선 배치 체크
+            width = x1 - x0
+            height = y1 - y0
+            if width > page_width * 0.5 or height > page_height * 0.5:
+                # 워터마크 가능성
+                text = block.get('text', '').strip().lower()
+                if any(keyword in text for keyword in ['confidential', 'draft', 'copy', '사본', '기밀']):
+                    print(f"[OCR] Filtered watermark: {text[:30]}")
+                    continue
         
         filtered.append(block)
     
@@ -358,68 +420,112 @@ def _ocr_page_image(fitz_page: "fitz.Page") -> Tuple[str, List[Dict]]:
 # ---------- 공개: 경로 입력을 OCR-융합으로 뽑기 ----------
 def extract_pdf_fused(path: str) -> Tuple[List[Tuple[int,str]], Dict[int, List[Dict]]]:
     """
-    [개선] PDF 융합 추출 (경로)
+    [SmartOCRRouter 통합] PDF 융합 추출 (경로)
+    
     반환:
       pages: [(page_no, text)]
       layout_map: {page_no: [ {"text":..., "bbox":{...}, "confidence":...}, ... ] }
-    규칙:
+    
+    OCR 전략:
       - OCR_MODE=off → pdfminer 결과 그대로
-      - OCR_MODE=force → 모든 페이지를 OCR로 대체(텍스트/박스)
-      - OCR_MODE=auto → CID 패턴 또는 텍스트 부족 페이지만 OCR
+      - OCR_MODE=force → 모든 페이지를 OCR로 대체
+      - OCR_MODE=auto → SmartOCRRouter 기반 지능형 판단
     """
     import fitz
+    
+    # 1단계: pdfminer로 기본 추출
     pages, layout_map = _pdfminer_pages_and_blocks_from_path(path)
-
+    
     ocr_mode = os.getenv("OCR_MODE", "auto").strip().lower()  # off|auto|force
-    min_chars = int(os.getenv("OCR_MIN_CHARS_PER_PAGE", "50"))
-
+    
     if ocr_mode == "off":
+        print("[OCR] OCR disabled by OCR_MODE=off")
         return pages, layout_map
-
+    
+    # 2단계: SmartOCRRouter로 OCR 결정
+    needs_full_ocr, partial_ocr_pages, analysis = _get_smart_ocr_decision(
+        pages, layout_map, ocr_mode
+    )
+    
+    # 3단계: OCR 실행
     doc = fitz.open(path)
     try:
-        for (idx, text), pg in zip(pages, doc, strict=False):
-            # 🔥 개선: CID 패턴 명시적 감지
-            need_ocr = (ocr_mode == "force") or _needs_ocr_for_page(text, min_chars)
-            
-            if need_ocr:
+        if ocr_mode == "force" or needs_full_ocr:
+            # 전체 OCR
+            print(f"[OCR] Performing full OCR on all {len(pages)} pages")
+            for (idx, text), pg in zip(pages, doc, strict=False):
                 txt, blocks = _ocr_page_image(pg)
-                # 교체
                 pages[idx-1] = (idx, txt or "")
                 layout_map[idx] = blocks or []
+        
+        elif partial_ocr_pages:
+            # 부분 OCR
+            print(f"[OCR] Performing partial OCR on {len(partial_ocr_pages)} pages: {partial_ocr_pages}")
+            for page_no in partial_ocr_pages:
+                if 1 <= page_no <= len(pages):
+                    pg = doc[page_no - 1]
+                    txt, blocks = _ocr_page_image(pg)
+                    pages[page_no - 1] = (page_no, txt or "")
+                    layout_map[page_no] = blocks or []
+        else:
+            print("[OCR] No OCR needed based on quality analysis")
+    
     finally:
         doc.close()
+    
     return pages, layout_map
 
 
 def extract_pdf_fused_from_bytes(pdf_bytes: bytes) -> Tuple[List[Tuple[int,str]], Dict[int, List[Dict]]]:
     """
-    [개선] PDF 융합 추출 (바이트)
+    [SmartOCRRouter 통합] PDF 융합 추출 (바이트)
     """
     import fitz
+    
+    # 1단계: pdfminer로 기본 추출
     pages, layout_map = _pdfminer_pages_and_blocks_from_bytes(pdf_bytes)
-
+    
     ocr_mode = os.getenv("OCR_MODE", "auto").strip().lower()
-    min_chars = int(os.getenv("OCR_MIN_CHARS_PER_PAGE", "50"))
-
+    
     if ocr_mode == "off":
+        print("[OCR] OCR disabled by OCR_MODE=off")
         return pages, layout_map
-
+    
+    # 2단계: SmartOCRRouter로 OCR 결정
+    needs_full_ocr, partial_ocr_pages, analysis = _get_smart_ocr_decision(
+        pages, layout_map, ocr_mode
+    )
+    
+    # 3단계: OCR 실행
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        for i, pg in enumerate(doc, start=1):
-            cur_txt = (pages[i-1][1] or "") if i-1 < len(pages) else ""
-            
-            # 🔥 개선: CID 패턴 명시적 감지
-            need_ocr = (ocr_mode == "force") or _needs_ocr_for_page(cur_txt, min_chars)
-            
-            if need_ocr:
+        if ocr_mode == "force" or needs_full_ocr:
+            # 전체 OCR
+            print(f"[OCR] Performing full OCR on all {len(pages)} pages")
+            for i, pg in enumerate(doc, start=1):
                 txt, blocks = _ocr_page_image(pg)
                 if i-1 < len(pages):
                     pages[i-1] = (i, txt or "")
                 else:
                     pages.append((i, txt or ""))
                 layout_map[i] = blocks or []
+        
+        elif partial_ocr_pages:
+            # 부분 OCR
+            print(f"[OCR] Performing partial OCR on {len(partial_ocr_pages)} pages: {partial_ocr_pages}")
+            for page_no in partial_ocr_pages:
+                if 1 <= page_no <= len(doc):
+                    pg = doc[page_no - 1]
+                    txt, blocks = _ocr_page_image(pg)
+                    if page_no - 1 < len(pages):
+                        pages[page_no - 1] = (page_no, txt or "")
+                    else:
+                        pages.append((page_no, txt or ""))
+                    layout_map[page_no] = blocks or []
+        else:
+            print("[OCR] No OCR needed based on quality analysis")
+    
     finally:
         doc.close()
+    
     return pages, layout_map
