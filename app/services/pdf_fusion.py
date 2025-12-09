@@ -87,7 +87,7 @@ def _get_smart_ocr_decision(
         print(f"  - Avg confidence: {analysis.get('avg_confidence', 0):.3f}")
         
         # 디버그 모드면 상세 리포트 출력
-        if os.getenv("OCR_DEBUG", "1") == "1":
+        if os.getenv("OCR_DEBUG", "0") == "1":
             report = router.get_quality_report(pages, layout_map)
             print("\n[OCR] Quality Report:")
             for page_detail in report.get('page_details', []):
