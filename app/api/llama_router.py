@@ -7,7 +7,7 @@ import hashlib, tempfile
 import os, re
 import uuid
 from urllib.parse import unquote, quote
-from typing import List, Optional
+from typing import List, Optional,Literal
 from starlette.responses import StreamingResponse
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
@@ -51,9 +51,10 @@ class GenerateReq(BaseModel):
 class AskReq(BaseModel):
     question: str
     model_name: str = "qwen2.5-14b"
-    top_k: int = 3
+    top_k: int = 3  # 클라이언트에서 지정 가능하지만, response_type으로 오버라이드
     history: Optional[List[dict]] = []
     doc_ids: Optional[List[str]] = None
+    response_type: Literal["short", "long"] = "short"  # short(단문형) | long(장문형)
 
 class UploadResp(BaseModel):
     filename: str
@@ -65,6 +66,24 @@ class AskResp(BaseModel):
     answer: str
     used_chunks: int
     sources: Optional[List[dict]] = None  # (선택) 출처 제공
+    
+# ========== 답변 모드별 설정 ==========
+RESPONSE_MODE_CONFIG = {
+    "short": {
+        "top_k": 3,
+        "max_tokens": 320,
+        "top_p": 0.9,
+        "temperature": 0.0,
+        "context_style": "concise",  # 간결한 컨텍스트
+    },
+    "long": {
+        "top_k": 8,
+        "max_tokens": 1024,
+        "top_p": 0.92,
+        "temperature": 0.1,  # 약간의 다양성
+        "context_style": "detailed",  # 상세한 컨텍스트
+    }
+}
 
 # --- 폴백 전용: pages 정규화 도우미 ---------------------------------
 def _normalize_pages_for_chunkers(pages):
@@ -590,9 +609,124 @@ def _detect_lang(text: str) -> str:
 def _t(lang: str, ko: str, en: str) -> str:
     return ko if lang == "ko" else en
 
-def _build_prompt(context: str, question: str, lang: str) -> str:
+# def _build_prompt(context: str, question: str, lang: str) -> str:
+#     if lang == "ko":
+#         return f"""당신은 한국원자력통제기술원(KINAC)의 AI 어시스턴트 '키나기AI'입니다.
+
+# # 답변 원칙
+# 1. 항상 존댓말을 사용합니다 (~습니다, ~하세요 체).
+# 2. 이모지, 은어, 인터넷 슬랭은 사용하지 않습니다.
+# 3. 간결하고 명확하게 답변합니다.
+
+# # 답변 방식
+# 질문이 인사, 안부, 격려, 잡담, 일상 조언이면 컨텍스트를 사용하지 말고 1~3문장으로 친절하게 답변하세요.
+
+# 질문이 정의, 절차, 정책, 규정, 용어 설명이면 아래 규칙을 따르세요:
+# - 제공된 컨텍스트만 사용하고, 외부 지식은 사용하지 마세요.
+# - 2~4문장의 자연스러운 문단으로 작성하세요.
+# - 불릿(-)은 여러 조치나 절차를 나열할 때만 사용하세요.
+# - 번호(1), 2), ①, ② 등은 사용하지 마세요.
+# - 원문 용어(Source material, Safeguards, PIV, PIT 등)는 그대로 유지하세요.
+# - 페이지 번호, 인용 번호, URL은 포함하지 마세요.
+# - 컨텍스트에서 답을 찾을 수 없으면:
+#   "KINAC의 문서에서 해당 내용을 찾을 수 없습니다."
+
+# # 컨텍스트
+# {context}
+
+# # 질문
+# {question}
+
+# # 답변
+# 답변만 작성하세요. 질문 유형이나 판단 과정은 출력 금지."""
+
+
+#     else:
+#         return f"""You are "Kinagi AI", an AI assistant for KINAC (Korea Institute of Nuclear Nonproliferation And Control).
+
+# # Answer Principles
+# 1. Always use polite, professional language.
+# 2. Never use emojis, slang, or internet jargon.
+# 3. Be concise and clear.
+
+# # How to Answer
+# If the question is a greeting, small talk, encouragement, or everyday advice, do NOT use the context. Answer naturally and kindly in 1-3 sentences.
+
+# If the question asks for definitions, procedures, policies, regulations, or terminology, follow these rules:
+# - Use ONLY the provided context. No external knowledge.
+# - Write 2-4 sentences in natural paragraphs.
+# - Use bullet points (dash -) only when listing multiple procedures or steps.
+# - Avoid numbered formatting like 1), 2), ①, ②.
+# - Keep original technical terms (Source material, Safeguards, PIV, PIT, etc.) as-is.
+# - Do NOT include page numbers, citation numbers, or URLs.
+# - If the answer cannot be found in the context:
+#   "I cannot find this information in KINAC's documents."
+
+# # Context
+# {context}
+
+# # Question
+# {question}
+
+# # Answer
+# Provide only the answer. Do not mention the question type or reasoning process."""
+
+def _build_prompt(
+    context: str, 
+    question: str, 
+    lang: str,
+    response_type: str = "short"
+) -> str:
+    """
+    답변 모드에 따른 프롬프트 생성
+    
+    Args:
+        context: RAG 컨텍스트
+        question: 사용자 질문
+        lang: 언어 (ko/en)
+        response_type: short(단문형) | long(장문형)
+    
+    Returns:
+        모델 입력 프롬프트
+    """
     if lang == "ko":
-        return f"""당신은 한국원자력통제기술원(KINAC)의 AI 어시스턴트 '키나기AI'입니다.
+        if response_type == "long":
+            # 장문형: 상세하고 체계적인 답변 요구
+            return f"""당신은 "키나기 AI"로, KINAC(한국원자력통제기술원)의 AI 어시스턴트입니다.
+
+# 답변 원칙
+1. 항상 정중하고 전문적인 한국어를 사용하세요.
+2. 이모티콘, 은어, 인터넷 용어는 절대 사용하지 마세요.
+3. **상세하고 체계적으로** 답변하세요.
+
+# 답변 방법
+질문이 인사, 잡담, 격려, 일상 조언이면 컨텍스트를 사용하지 말고 1-3문장으로 자연스럽고 친절하게 답하세요.
+
+질문이 정의, 절차, 정책, 규정, 용어 설명이면 아래 규칙을 따르세요:
+- 제공된 컨텍스트만 사용하고, 외부 지식은 사용하지 마세요.
+- **상세한 설명**을 제공하세요 (5-10문장).
+- 다음 구조를 따르세요:
+  1) 핵심 정의/개념 설명 (2-3문장)
+  2) 세부 내용 및 절차 (3-5문장)
+  3) 관련 규정 또는 참고사항 (1-2문장)
+- 여러 항목을 나열할 때는 불릿(-)을 사용하세요.
+- 절차나 단계가 있으면 번호(1, 2, 3)를 사용하세요.
+- 원문 용어(Source material, Safeguards, PIV, PIT 등)는 그대로 유지하세요.
+- 페이지 번호, 인용 번호, URL은 포함하지 마세요.
+- 컨텍스트에서 답을 찾을 수 없으면:
+  "KINAC의 문서에서 해당 내용을 찾을 수 없습니다. 더 구체적인 질문을 주시면 도움을 드리겠습니다."
+
+# 컨텍스트
+{context}
+
+# 질문
+{question}
+
+# 답변
+상세하고 체계적인 답변만 작성하세요. 질문 유형이나 판단 과정은 출력 금지."""
+
+        else:  # short (기존 로직)
+            return f"""당신은 한국원자력통제기술원(KINAC)의 AI 어시스턴트 '키나기AI'입니다.
 
 # 답변 원칙
 1. 항상 존댓말을 사용합니다 (~습니다, ~하세요 체).
@@ -621,9 +755,44 @@ def _build_prompt(context: str, question: str, lang: str) -> str:
 # 답변
 답변만 작성하세요. 질문 유형이나 판단 과정은 출력 금지."""
 
+    else:  # English
+        if response_type == "long":
+            # Long form: Detailed and structured response
+            return f"""You are "Kinagi AI", an AI assistant for KINAC (Korea Institute of Nuclear Nonproliferation And Control).
 
-    else:
-        return f"""You are "Kinagi AI", an AI assistant for KINAC (Korea Institute of Nuclear Nonproliferation And Control).
+# Answer Principles
+1. Always use polite, professional language.
+2. Never use emojis, slang, or internet jargon.
+3. Be **detailed and systematic**.
+
+# How to Answer
+If the question is a greeting, small talk, encouragement, or everyday advice, do NOT use the context. Answer naturally and kindly in 1-3 sentences.
+
+If the question asks for definitions, procedures, policies, regulations, or terminology, follow these rules:
+- Use ONLY the provided context. No external knowledge.
+- Provide **detailed explanations** (5-10 sentences).
+- Follow this structure:
+  1) Core definition/concept (2-3 sentences)
+  2) Detailed content and procedures (3-5 sentences)
+  3) Related regulations or notes (1-2 sentences)
+- Use bullet points (dash -) when listing multiple items.
+- Use numbering (1, 2, 3) for procedures or steps.
+- Keep original technical terms (Source material, Safeguards, PIV, PIT, etc.) as-is.
+- Do NOT include page numbers, citation numbers, or URLs.
+- If the answer cannot be found in the context:
+  "I cannot find this information in KINAC's documents. Please provide a more specific question for better assistance."
+
+# Context
+{context}
+
+# Question
+{question}
+
+# Answer
+Provide only a detailed and systematic answer. Do not mention the question type or reasoning process."""
+
+        else:  # short (기존 로직)
+            return f"""You are "Kinagi AI", an AI assistant for KINAC (Korea Institute of Nuclear Nonproliferation And Control).
 
 # Answer Principles
 1. Always use polite, professional language.
@@ -912,7 +1081,24 @@ async def upload_document(
 
 @router.post("/ask", response_model=AskResp)
 def ask_question(req: AskReq):
+    """
+    [수정] response_type 필드만 추가, 나머지 로직은 기존과 동일
+    - 키워드 부스트 ✅
+    - 조항 검색 ✅
+    - 양방향 검색 ✅
+    - 임계값 필터링 ✅
+    """
     try:
+        # 🆕 response_type에 따른 파라미터 설정
+        mode_config = RESPONSE_MODE_CONFIG.get(req.response_type, RESPONSE_MODE_CONFIG["short"])
+        max_tokens = mode_config["max_tokens"]
+        temperature = mode_config["temperature"]
+        top_p = mode_config["top_p"]
+        
+        logger.info(f"[ask] response_type={req.response_type}, max_tokens={max_tokens}")
+
+        # ========== 기존 로직 시작 (수정 없음) ==========
+        
         # 0) 모델/스토어 준비
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
@@ -927,6 +1113,7 @@ def ask_question(req: AskReq):
 
         # 초기 넉넉히 검색
         raw_topk = max(40, req.top_k * 6)
+        
         # 선택 문서가 있을 경우 doc 필터를 걸어서 검색하는 헬퍼
         def _search_with_optional_filter(q: str, topk: int):
             if not q:
@@ -935,16 +1122,16 @@ def ask_question(req: AskReq):
                 logger.info("[ask] doc filter enabled: %d docs", len(req.doc_ids))
                 return store.search_in_docs(
                     query=q,
-                    embed_fn=embed,  # embedding_model.embed (이미 import 되어 있음)
+                    embed_fn=embed,
                     doc_ids=req.doc_ids,
                     topk=topk,
                 )
-            # 선택된 문서가 없으면 기존 글로벌 검색
             return store.search(
                 query=q,
                 embed_fn=embed,
                 topk=topk,
             )
+        
         def _dedup_key(c):
             return (c.get("doc_id"), c.get("page"), _strip_meta_line(c.get("chunk",""))[:80])
 
@@ -966,7 +1153,6 @@ def ask_question(req: AskReq):
                 normalize_query(req.question),
                 raw_topk // 2,
             )
-            # 강제 번역(한 번 더)
             forced_en = _cached_ko_to_en(normalize_query(req.question))
             cands_en = _search_with_optional_filter(
                 forced_en,
@@ -995,6 +1181,7 @@ def ask_question(req: AskReq):
         for c in cands:
             c["kw_boost"] = _kw_boost_score(c)
 
+        # 조항 검색 부스트
         ARTICLE_BOOST = float(os.getenv("RAG_ARTICLE_BOOST", "2.5"))
         if lang == "ko":
             m = re.search(r"제\s*(\d+)\s*조", req.question)
@@ -1008,23 +1195,19 @@ def ask_question(req: AskReq):
                         c["kw_boost"] = c.get("kw_boost", 0.0) + ARTICLE_BOOST
 
         cands.sort(key=lambda x: (x.get("kw_boost", 0), x.get("score", 0.0)), reverse=True)
-        rerank_pool = cands[:max(30, req.top_k * 6)] 
+        rerank_pool = cands[:max(30, req.top_k * 6)]
 
-        # --- (1) THRESH 완화: 기본 0.1 권장 ---
+        # 임계값 설정
         THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.1"))
 
-        # --- (2) re_score 없거나 낮아도 임베딩 점수로 보완 ---
         def _is_confident(hit: dict, thr: float) -> bool:
-            re_s = hit.get("re_score")  # bge-reranker 점수(있을 수도/없을 수도)
-            emb_s = hit.get("score", 0.0)  # 임베딩 유사도
-            # 규칙:
-            #  - re_score가 있으면 그걸 우선 보되, 너무 낮아도 임베딩 점수가 높으면 통과
-            #  - re_score가 없으면 임베딩 점수만으로 판단
+            re_s = hit.get("re_score")
+            emb_s = hit.get("score", 0.0)
             if re_s is not None:
                 return (re_s >= thr) or (emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.28")))
             return emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.28"))
 
-        # ... rerank() 이후
+        # Rerank
         topk = rerank(query_for_search, rerank_pool, top_k=req.top_k)
         if not topk:
             return AskResp(
@@ -1035,13 +1218,13 @@ def ask_question(req: AskReq):
                 sources=[]
             )
 
-        # --- (3) 모든 청크에 대해 임계값 검사 (수정됨) ---
+        # 임계값 필터링
         filtered_topk = []
         for c in topk:
             if _is_confident(c, THRESH):
                 filtered_topk.append(c)
         
-        # 로그 (전체 top3 + 필터링 결과)
+        # 로그
         try:
             dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
             logger.info("[ask] rerank-top3 (re,emb)=%s | filtered=%d/%d | THRESH=%.3f",
@@ -1049,7 +1232,6 @@ def ask_question(req: AskReq):
         except Exception as e:
             logger.warning("[ask] debug summarize failed: %s", e)
         
-        # 필터링 후 청크가 없으면 답변 거부
         if not filtered_topk:
             try:
                 dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
@@ -1065,7 +1247,7 @@ def ask_question(req: AskReq):
                 sources=[]
             )
 
-        # 5) 컨텍스트/출처 구성 (필터링된 청크만 사용)
+        # 5) 컨텍스트/출처 구성
         context_lines = []
         sources = []
         for i, c in enumerate(filtered_topk, 1):
@@ -1082,14 +1264,32 @@ def ask_question(req: AskReq):
             })
         context = "\n\n".join(context_lines)
 
-        # 6) 프롬프트 (언어별: 질문 원문 언어를 따른다)
-        prompt = _build_prompt(context=context, question=req.question, lang=lang)
+        # ========== 기존 로직 끝 ==========
 
-        answer = generate_answer_unified(prompt, req.model_name)
+        # 6) 프롬프트 생성 (🆕 response_type 반영)
+        prompt = _build_prompt(
+            context=context,
+            question=req.question,
+            lang=lang,
+            response_type=req.response_type
+        )
+
+        # 7) 모델 호출 (🆕 파라미터 전달)
+        answer = generate_answer_unified(
+            prompt=prompt,
+            name_or_id=req.model_name,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p          
+        )
+        
         answer = _clean_repetitive_answer(answer)
 
-        return AskResp(answer=answer, used_chunks=len(filtered_topk), sources=sources)
-
+        return AskResp(
+            answer=answer,
+            used_chunks=len(filtered_topk),
+            sources=sources
+        )
 
     except HTTPException:
         raise
@@ -1100,6 +1300,7 @@ def ask_question(req: AskReq):
                                     f"Milvus connection/search failed: {milvus_error}"))
     except Exception as e:
         lang = _detect_lang(getattr(req, "question", "") or "")
+        logger.error(f"[ask] Error: {e}", exc_info=True)
         raise HTTPException(500, _t(lang,
                                     f"질의 처리 중 오류: {e}",
                                     f"Error while processing the query: {e}"))

@@ -1,4 +1,9 @@
 # app/services/llama_model.py
+"""
+[개선] generate_answer_unified에 파라미터 전달 지원
+- max_tokens, temperature, top_p를 외부에서 지정 가능
+- 기본값은 환경변수 사용
+"""
 from __future__ import annotations
 
 import os, json, torch
@@ -9,16 +14,10 @@ from app.services.llm_client import chat_complete, chat_complete_on, list_vllm_m
 from app.services.model_registry import resolve as resolve_spec
 from app.config import HUGGINGFACE_TOKEN
 
-# alias -> vLLM base_url 매핑(JSON). 예) {"llama-3.2-1b":"http://vllm-a4000:8000/v1"}
 OPENAI_ALIAS_URLS: Dict[str, str] = json.loads(os.getenv("OPENAI_ALIAS_URLS", "{}"))
 USE_VLLM = os.getenv("USE_VLLM", "1") == "1"
-
-# 선택: HF ID -> served name 매핑(서버에서 별칭으로 다르게 띄웠을 때)
-# 예) {"meta-llama/Llama-3.2-1B-Instruct":"llama-3.2-1b"}
 SERVED_NAME_MAP: Dict[str, str] = json.loads(os.getenv("SERVED_NAME_MAP", "{}"))
-
-# 선택: 기본 모델 별칭(.env에서 바꿀 수 있음)
-DEFAULT_MODEL_ALIAS = os.getenv("DEFAULT_MODEL_ALIAS", "llama-3.2-3b")
+DEFAULT_MODEL_ALIAS = os.getenv("DEFAULT_MODEL_ALIAS", "qwen2.5-14b")
 
 LOADED_MODELS: Dict[str, Tuple[AutoModelForCausalLM, AutoTokenizer]] = {}
 
@@ -26,7 +25,6 @@ def _auth_kwargs() -> dict:
     return {"token": HUGGINGFACE_TOKEN} if HUGGINGFACE_TOKEN else {}
 
 def _hf_or_path(name: str) -> Optional[str]:
-    """별칭이 아닌 순수 HF ID나 로컬 경로면 그대로 반환."""
     if not name:
         return None
     if "/" in name or os.path.isdir(name):
@@ -34,23 +32,18 @@ def _hf_or_path(name: str) -> Optional[str]:
     return None
 
 def _served_name_candidates(hf_id: str, alias: Optional[str]) -> List[str]:
-    """vLLM served name으로 시도할 후보들 생성."""
     cands: List[str] = []
     if alias:
-        cands.append(alias)  # compose에서 --served-model-name을 별칭으로 맞춘 경우
-    # 명시적 매핑이 있으면 최우선
+        cands.append(alias)
     if hf_id in SERVED_NAME_MAP:
         cands.append(SERVED_NAME_MAP[hf_id])
-    # HF ID 자체로 서빙한 경우
     cands.append(hf_id)
-    # 레포 베이스명으로만 서빙한 경우 (ex. meta-llama/Llama-3.2-1B-Instruct -> Llama-3.2-1B-Instruct)
     try:
         base = hf_id.split("/")[-1]
         if base not in cands:
             cands.append(base)
     except Exception:
         pass
-    # 중복 제거, 순서 유지
     seen = set()
     uniq = []
     for x in cands:
@@ -63,7 +56,6 @@ def load_model(model_id: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
         return LOADED_MODELS[model_id]
 
     cache_dir = os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE")
-    # A4000 호환성/성능 무난: float16 (BF16도 가능하지만 통일성 위해 FP16)
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     device_map: Optional[str | dict] = "auto" if torch.cuda.is_available() else {"": "cpu"}
 
@@ -86,11 +78,11 @@ def generate_answer(
     prompt: str,
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    max_new_tokens: int = 320,     # ⬅ 기본 길이 축소/고정
-    temperature: float = 0.0,      # ⬅ 디폴트 0 (결정론)
+    max_new_tokens: int = 320,
+    temperature: float = 0.0,
     top_p: float = 0.9,
     top_k: int = 40,
-    do_sample: bool = False        # ⬅ 샘플링 끔
+    do_sample: bool = False
 ) -> str:
     try:
         messages = [{"role": "user", "content": prompt}]
@@ -111,7 +103,7 @@ def generate_answer(
         output_ids = model.generate(
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
-            do_sample=do_sample,      # ⬅ 반영
+            do_sample=do_sample,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -123,21 +115,40 @@ def generate_answer(
     gen_ids = output_ids[0, input_ids.shape[-1]:]
     return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
-def generate_answer_unified(prompt: str, name_or_id: Optional[str]):
+def generate_answer_unified(
+    prompt: str, 
+    name_or_id: Optional[str],
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None
+):
     """
-    우선순위:
-      1) model_registry.resolve 로 스펙 결정을 먼저 함(별칭/ID 모두 허용)
-      2) provider == 'vllm' 이고 USE_VLLM 켜져 있으면 vLLM로 시도:
-         - alias별 base_url 있으면 그 서버에서 served name 후보들 중 매칭되는 이름으로 호출
-         - 없으면 기본 서버에서 동일 절차
-      3) 실패 시 Transformers 로컬 로딩 폴백
+    [개선] 파라미터를 외부에서 지정 가능
+    
+    Args:
+        prompt: 프롬프트 텍스트
+        name_or_id: 모델 이름 또는 ID
+        max_tokens: 최대 토큰 수 (None이면 환경변수 사용)
+        temperature: 온도 (None이면 환경변수 사용)
+        top_p: top_p (None이면 환경변수 사용)
+    
+    Returns:
+        생성된 답변 텍스트
     """
+    # 파라미터 기본값 설정
+    if max_tokens is None:
+        max_tokens = int(os.getenv("GEN_MAX_TOKENS", "320"))
+    if temperature is None:
+        temperature = float(os.getenv("GEN_TEMP", "0.0"))
+    if top_p is None:
+        top_p = float(os.getenv("GEN_TOP_P", "0.9"))
+    
     # 0) 스펙 해석
     spec = resolve_spec(name_or_id)
     alias = (name_or_id or "").strip() or DEFAULT_MODEL_ALIAS
     hf_id = spec.model_id if _hf_or_path(spec.model_id) else _hf_or_path(alias) or spec.model_id
 
-    # 1) vLLM 경로 (가능하면 이쪽으로)
+    # 1) vLLM 경로
     if USE_VLLM and spec.provider == "vllm":
         per_alias_base = OPENAI_ALIAS_URLS.get(alias)
         bases = [per_alias_base] if per_alias_base else [None]
@@ -149,46 +160,45 @@ def generate_answer_unified(prompt: str, name_or_id: Optional[str]):
                         if base:
                             return chat_complete_on(
                                 base, candidate, prompt,
-                                temperature=float(os.getenv("GEN_TEMP","0.0")),
-                                max_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
-                                top_p=float(os.getenv("GEN_TOP_P","0.9")),
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                top_p=top_p,
                                 stop=None
                             )
                         else:
                             return chat_complete(
                                 candidate, prompt,
-                                temperature=float(os.getenv("GEN_TEMP","0.0")),
-                                max_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
-                                top_p=float(os.getenv("GEN_TOP_P","0.9")),
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                top_p=top_p,
                                 stop=None
                             )
         try:
             if per_alias_base:
                 return chat_complete_on(
                     per_alias_base, alias, prompt,
-                    temperature=float(os.getenv("GEN_TEMP","0.0")),
-                    max_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
-                    top_p=float(os.getenv("GEN_TOP_P","0.9")),
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
                     stop=None
                 )
             return chat_complete(
                 hf_id, prompt,
-                temperature=float(os.getenv("GEN_TEMP","0.0")),
-                max_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
-                top_p=float(os.getenv("GEN_TOP_P","0.9")),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
                 stop=None
             )
         except Exception:
-            pass  # 폴백
+            pass
 
-    # 2) Transformers 폴백도 동일 톤으로
+    # 2) Transformers 폴백
     model, tok = load_model(hf_id)
     return generate_answer(
         prompt, model, tok,
-        max_new_tokens=int(os.getenv("GEN_MAX_TOKENS","320")),
-        temperature=float(os.getenv("GEN_TEMP","0.0")),
-        top_p=float(os.getenv("GEN_TOP_P","0.9")),
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
         top_k=40,
-        do_sample=False
+        do_sample=(temperature > 0.0)
     )
-
