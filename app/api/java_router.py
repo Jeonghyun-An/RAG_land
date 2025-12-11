@@ -1496,16 +1496,16 @@ async def process_delete_document(
 async def process_update_metadata(
     job_id: str,
     data_id: str,
-    callback_url: str
+    callback_url: Optional[str]
 ):
     """
     메타데이터 업데이트 백그라운드 처리
     
-    프로세스:
-    1. osk_data 테이블에서 최신 메타데이터 조회
-    2. MinIO meta.json 업데이트 (title, data_code 등)
-    3. Milvus 청크 메타데이터 업데이트 (전체 청크 순회)
-    4. 완료 후 callback_url로 웹훅 전송
+    빠른 응답 전략:
+    1. DB 조회 성공 → 즉시 자바에게 성공 콜백 전송 (빠른 응답)
+    2. MinIO meta.json 업데이트 (백그라운드)
+    3. Milvus 청크 메타데이터 업데이트 (백그라운드)
+    
     """
     db = DBConnector()
     start_time = datetime.utcnow()
@@ -1513,7 +1513,7 @@ async def process_update_metadata(
     job_state.start(job_id, data_id=data_id)
     
     try:
-        # ========== Step 1: DB에서 최신 메타데이터 조회 ==========
+        # ========== Step 1: DB에서 최신 메타데이터 조회 (빠름) ==========
         job_state.update(job_id, status="loading", step="Loading metadata from DB")
         
         print(f"[META-UPDATE] Loading metadata for data_id={data_id}")
@@ -1521,11 +1521,45 @@ async def process_update_metadata(
         row = db.get_file_by_id(data_id)
         
         if not row:
+            # DB 조회 실패 시 즉시 에러 콜백
+            if callback_url:
+                error_payload = WebhookPayload(
+                    job_id=job_id,
+                    data_id=data_id,
+                    status="metadata_update_error",
+                    message=f"데이터를 찾을 수 없습니다: data_id={data_id}"
+                )
+                await send_webhook(callback_url, error_payload, SHARED_SECRET)
+            
             raise RuntimeError(f"데이터를 찾을 수 없습니다: data_id={data_id}")
         
         print(f"[META-UPDATE] Loaded: data_title={row.get('data_title')}, data_code={row.get('data_code')}")
         
-        # ========== Step 2: MinIO meta.json 업데이트 ==========
+        # ========== Step 1.5: DB 조회 성공 → 즉시 자바에게 콜백 전송  ==========
+        display_title = (row.get("data_title") or "").strip() or f"Document {data_id}"
+        
+        if callback_url:
+            quick_response = WebhookPayload(
+                job_id=job_id,
+                data_id=data_id,
+                status="metadata_loaded",
+                converted=False,
+                metrics={
+                    "data_title": display_title,
+                    "data_code": row.get("data_code"),
+                    "data_code_detail": row.get("data_code_detail"),
+                    "data_code_detail_sub": row.get("data_code_detail_sub")
+                },
+                timestamps={
+                    "start": start_time.isoformat(),
+                    "loaded_at": datetime.utcnow().isoformat()
+                },
+                message="metadata loaded from DB, updating storage in background"
+            )
+            await send_webhook(callback_url, quick_response, SHARED_SECRET)
+            print(f"[META-UPDATE] Quick callback sent to Java")
+        
+        # ========== Step 2: MinIO meta.json 업데이트 (백그라운드) ==========
         job_state.update(job_id, status="updating_minio", step="Updating MinIO metadata")
         
         try:
@@ -1540,9 +1574,6 @@ async def process_update_metadata(
                     meta = m.get_json(meta_key) or {}
                 except Exception:
                     meta = {}
-            
-            # DB 메타데이터로 업데이트
-            display_title = (row.get("data_title") or "").strip() or meta.get("title", f"Document {data_id}")
             
             # 업데이트할 필드들
             db_meta_fields = {}
@@ -1563,15 +1594,16 @@ async def process_update_metadata(
             # MinIO에 저장
             m.put_json(meta_key, meta)
             
-            print(f"[META-UPDATE] ✅ MinIO meta.json updated: title='{display_title}'")
+            print(f"[META-UPDATE] MinIO meta.json updated: title='{display_title}'")
         
         except Exception as e:
-            print(f"[META-UPDATE] ⚠️ MinIO update failed: {e}")
+            print(f"[META-UPDATE] MinIO update failed: {e}")
             # MinIO 업데이트 실패해도 Milvus는 계속 진행
         
-        # ========== Step 3: Milvus 메타데이터 업데이트 ==========
+        # ========== Step 3: Milvus 메타데이터 업데이트 (백그라운드) ==========
         job_state.update(job_id, status="updating_milvus", step="Updating Milvus metadata")
         
+        search_results = []
         try:
             from app.services.milvus_store_v2 import MilvusStoreV2
             from app.services.embedding_model import get_sentence_embedding_dimension
@@ -1588,7 +1620,7 @@ async def process_update_metadata(
             )
             
             if not search_results:
-                print(f"[META-UPDATE] ⚠️ No chunks found in Milvus for data_id={data_id}")
+                print(f"[META-UPDATE] No chunks found in Milvus for data_id={data_id}")
             else:
                 print(f"[META-UPDATE] Found {len(search_results)} chunks in Milvus")
                 
@@ -1596,10 +1628,18 @@ async def process_update_metadata(
                 updated_count = 0
                 for chunk in search_results:
                     chunk_id = chunk.get("id")
+                    
+                    # metadata 필드가 문자열(JSON)인 경우 파싱
                     current_metadata = chunk.get("metadata", {})
+                    if isinstance(current_metadata, str):
+                        try:
+                            import json
+                            current_metadata = json.loads(current_metadata)
+                        except:
+                            current_metadata = {}
                     
                     # 메타데이터 업데이트
-                    updated_metadata = current_metadata.copy()
+                    updated_metadata = current_metadata.copy() if isinstance(current_metadata, dict) else {}
                     updated_metadata.update({
                         "data_title": row.get("data_title"),
                         "data_code": row.get("data_code"),
@@ -1610,61 +1650,50 @@ async def process_update_metadata(
                     
                     # Milvus 업데이트
                     try:
+                        # metadata를 JSON 문자열로 변환
+                        import json
+                        metadata_str = json.dumps(updated_metadata, ensure_ascii=False)
+                        
                         mvs.collection.upsert([{
                             "id": chunk_id,
-                            "metadata": updated_metadata
+                            "metadata": metadata_str
                         }])
                         updated_count += 1
                     except Exception as e:
-                        print(f"[META-UPDATE] ⚠️ Failed to update chunk {chunk_id}: {e}")
+                        print(f"[META-UPDATE] Failed to update chunk {chunk_id}: {e}")
                 
-                print(f"[META-UPDATE] ✅ Updated {updated_count}/{len(search_results)} chunks in Milvus")
+                print(f"[META-UPDATE] Updated {updated_count}/{len(search_results)} chunks in Milvus")
         
         except Exception as e:
-            print(f"[META-UPDATE] ⚠️ Milvus update failed: {e}")
-            # Milvus 업데이트 실패해도 웹훅은 전송
+            print(f"[META-UPDATE] Milvus update failed: {e}")
+            import traceback
+            print(traceback.format_exc())
+            # Milvus 업데이트 실패해도 완료 처리
         
         # ========== Step 4: 완료 처리 ==========
         job_state.complete(
             job_id,
             pages=0,
-            chunks=len(search_results) if 'search_results' in locals() else 0
+            chunks=len(search_results)
         )
         
-        print(f"[META-UPDATE] ✅ Metadata update completed for data_id={data_id}")
-        
-        # ========== Step 5: 완료 & Webhook ==========
-        end_time = datetime.utcnow()
-        
-        if callback_url:
-            payload = WebhookPayload(
-                job_id=job_id,
-                data_id=data_id,
-                status="metadata_updated",
-                converted=False,
-                metrics={
-                    "updated_title": display_title,
-                    "updated_chunks": len(search_results) if 'search_results' in locals() else 0
-                },
-                timestamps={
-                    "start": start_time.isoformat(), 
-                    "end": end_time.isoformat()
-                },
-                message="metadata updated successfully"
-            )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
+        print(f"[META-UPDATE] Metadata update completed for data_id={data_id}")
+        print(f"[META-UPDATE] Summary: MinIO updated, Milvus {len(search_results)} chunks updated")
     
     except Exception as e:
         job_state.fail(job_id, str(e))
-        print(f"[META-UPDATE] ❌ Error: {e}")
+        print(f"[META-UPDATE] Error: {e}")
+        import traceback
+        print(traceback.format_exc())
         
-        if callback_url:
-            payload = WebhookPayload(
+        # 에러 발생 시에만 에러 콜백 (DB 조회 실패는 위에서 이미 전송)
+        if callback_url and not row:  # DB 조회 실패가 아닌 경우
+            error_payload = WebhookPayload(
                 job_id=job_id,
                 data_id=data_id,
                 status="metadata_update_error",
                 message=str(e)
             )
-            await send_webhook(callback_url, payload, SHARED_SECRET)
+            await send_webhook(callback_url, error_payload, SHARED_SECRET)
         
         raise
