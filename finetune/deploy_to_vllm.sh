@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "========================================"
-echo "🚀 vLLM 서버 배포"
+echo "vLLM 서버 배포"
 echo "========================================"
 echo "배포 모드: $DEPLOYMENT_MODE"
 echo "포트: $VLLM_PORT"
@@ -65,12 +65,12 @@ if [ "$DEPLOYMENT_MODE" == "lora" ]; then
     
     # LoRA 어댑터 존재 확인
     if [ ! -f "$LORA_PATH/adapter_config.json" ]; then
-        echo "❌ LoRA 어댑터를 찾을 수 없습니다: $LORA_PATH"
+        echo " LoRA 어댑터를 찾을 수 없습니다: $LORA_PATH"
         echo "   먼저 train_qlora.py를 실행하세요!"
         exit 1
     fi
     
-    echo "✅ LoRA 어댑터 확인됨: $LORA_PATH"
+    echo " LoRA 어댑터 확인됨: $LORA_PATH"
     
     # docker-compose 파일 생성
     cat > docker-compose.vllm-finetuned.yml << EOF
@@ -139,9 +139,9 @@ networks:
 EOF
 
     echo ""
-    echo "✅ docker-compose.vllm-finetuned.yml 생성됨"
+    echo " docker-compose.vllm-finetuned.yml 생성됨"
     echo ""
-    echo "🚀 vLLM 서버 시작 중..."
+    echo " vLLM 서버 시작 중..."
     
     docker-compose -f docker-compose.vllm-finetuned.yml up -d
     
@@ -154,13 +154,13 @@ EOF
     echo "🔍 서버 상태 확인..."
     
     if curl -s http://localhost:$VLLM_PORT/health > /dev/null 2>&1; then
-        echo "✅ vLLM 서버 정상 작동 중"
+        echo " vLLM 서버 정상 작동 중"
         echo ""
-        echo "📌 API 엔드포인트:"
+        echo " API 엔드포인트:"
         echo "   http://localhost:$VLLM_PORT/v1/completions"
         echo "   http://localhost:$VLLM_PORT/v1/chat/completions"
         echo ""
-        echo "🧪 테스트 명령어:"
+        echo " 테스트 명령어:"
         echo "   curl http://localhost:$VLLM_PORT/v1/models"
     else
         echo "⚠️  서버가 아직 준비되지 않았습니다"
@@ -175,12 +175,12 @@ elif [ "$DEPLOYMENT_MODE" == "merged" ]; then
     
     # 병합 모델 존재 확인
     if [ ! -f "$MERGED_PATH/config.json" ]; then
-        echo "❌ 병합 모델을 찾을 수 없습니다: $MERGED_PATH"
+        echo " 병합 모델을 찾을 수 없습니다: $MERGED_PATH"
         echo "   먼저 merge_model.py를 실행하세요!"
         exit 1
     fi
     
-    echo "✅ 병합 모델 확인됨: $MERGED_PATH"
+    echo " 병합 모델 확인됨: $MERGED_PATH"
     
     # docker-compose 파일 생성
     cat > docker-compose.vllm-finetuned.yml << EOF
@@ -244,38 +244,38 @@ networks:
 EOF
 
     echo ""
-    echo "✅ docker-compose.vllm-finetuned.yml 생성됨"
+    echo " docker-compose.vllm-finetuned.yml 생성됨"
     echo ""
-    echo "🚀 vLLM 서버 시작 중..."
+    echo " vLLM 서버 시작 중..."
     
     docker-compose -f docker-compose.vllm-finetuned.yml up -d
     
     echo ""
-    echo "⏳ 서버 초기화 대기 중 (60초)..."
+    echo " 서버 초기화 대기 중 (60초)..."
     sleep 60
     
     # 헬스 체크
     echo ""
-    echo "🔍 서버 상태 확인..."
+    echo " 서버 상태 확인..."
     
     if curl -s http://localhost:$VLLM_PORT/health > /dev/null 2>&1; then
-        echo "✅ vLLM 서버 정상 작동 중"
+        echo " vLLM 서버 정상 작동 중"
         echo ""
-        echo "📌 API 엔드포인트:"
+        echo " API 엔드포인트:"
         echo "   http://localhost:$VLLM_PORT/v1/completions"
         echo "   http://localhost:$VLLM_PORT/v1/chat/completions"
         echo ""
-        echo "🧪 테스트 명령어:"
+        echo " 테스트 명령어:"
         echo "   curl http://localhost:$VLLM_PORT/v1/models"
     else
-        echo "⚠️  서버가 아직 준비되지 않았습니다"
+        echo "  서버가 아직 준비되지 않았습니다"
         echo "   docker logs nuclear-vllm-finetuned 로 상태 확인"
     fi
 fi
 
 echo ""
 echo "========================================"
-echo "✅ 배포 완료!"
+echo " 배포 완료!"
 echo "========================================"
 echo ""
 echo "다음 단계:"

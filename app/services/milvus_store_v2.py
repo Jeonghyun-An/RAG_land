@@ -216,7 +216,7 @@ class MilvusStoreV2:
                 "params": {"M": 16, "efConstruction": 200},
             },
         )
-        print(f"✅ created collection: {self.collection_name} (dim={self.dim})")
+        print(f" created collection: {self.collection_name} (dim={self.dim})")
         return col
 
     def _ensure_index(self) -> None:
@@ -231,9 +231,9 @@ class MilvusStoreV2:
                         "params": {"M": 16, "efConstruction": 200},
                     },
                 )
-                print("✅ created missing index on existing collection")
+                print("✅created missing index on existing collection")
         except Exception as e:
-            print(f"⚠️ ensure index failed: {e}")
+            print(f" ensure index failed: {e}")
 
     def _replace_doc_if_needed(self, doc_id: str) -> None:
         """같은 doc_id 문서를 교체(삭제 후 재삽입)하고 싶을 때 사용.
@@ -245,7 +245,7 @@ class MilvusStoreV2:
             deleted = self._delete_by_doc_id(doc_id)
             print(f"replaced doc: {doc_id} (deleted {deleted})")
         except Exception as e:
-            print(f"⚠️ replace_doc failed: {e}")
+            print(f" replace_doc failed: {e}")
 
     # ---------------- public ----------------
 
@@ -350,7 +350,7 @@ class MilvusStoreV2:
         # 디버그 로그
         for i, (orig, safe) in enumerate(zip(raw_texts, final_texts)):
             if len(orig) > len(safe):
-                print(f"⚠️ Chunk {i} truncated: {len(orig)} → {len(safe)} chars")
+                print(f" Chunk {i} truncated: {len(orig)} → {len(safe)} chars")
 
         # -------- 5) 임베딩 생성 (이제 안전하게 잘린 텍스트로)
         print(f"[Milvus] Embedding {len(final_texts)} chunks...")
@@ -389,7 +389,7 @@ class MilvusStoreV2:
         for i, t in enumerate(final_texts):
             byte_len = len(t.encode('utf-8', errors='ignore'))
             if byte_len > actual_chunk_max:
-                print(f"⚠️ CRITICAL: Chunk {i} still exceeds limit! {byte_len} > {actual_chunk_max}")
+                print(f" CRITICAL: Chunk {i} still exceeds limit! {byte_len} > {actual_chunk_max}")
                 # 강제 자르기
                 final_texts[i] = t[:actual_chunk_max - 100]
         

@@ -139,7 +139,7 @@ async def send_webhook(url: str, payload: WebhookPayload, secret: str):
             
             resp = await client.post(url, json=payload.model_dump(), headers=headers)
             resp.raise_for_status()
-            print(f"[WEBHOOK] ✅ Sent to {url}: {payload.status}")
+            print(f"[WEBHOOK] Sent to {url}: {payload.status}")
     except Exception as e:
         print(f"[WEBHOOK] ❌ Failed: {e}")
 
@@ -257,7 +257,7 @@ def _coerce_chunks_for_milvus(chs):
             "bboxes": meta.get("bboxes", {}),
         }
 
-        # ✅ 여기서 한 번 더 길이 체크 + 분할
+        # 여기서 한 번 더 길이 체크 + 분할
         #    (각 청커 구현이 길이 제한을 안 지켜도 여기서 최종 방어)
         split_items = _split_for_milvus(text, base_meta)
         safe.extend(split_items)
@@ -669,7 +669,7 @@ async def process_convert_and_index_prod(
                 content_type="application/pdf",
                 length=len(pdf_bytes),
             )
-            print(f"[PROD] ✅ PDF uploaded to MinIO: {object_pdf}")
+            print(f"[PROD] PDF uploaded to MinIO: {object_pdf}")
         
         else:
             # (B) PDF가 아니면: 변환 → MinIO 업로드 → 동일 폴더에 *.pdf 저장 → DB에는 file_id만 *.pdf로 변경
@@ -691,15 +691,15 @@ async def process_convert_and_index_prod(
                     if not temp_pdf_path or not Path(temp_pdf_path).exists():
                         raise ConvertError(f"PDF 변환 실패(출력 없음): {src_ext}")
 
-                    # ✅ 핵심: temp_pdf_path를 converted_pdf_path로 사용
+                    # temp_pdf_path를 converted_pdf_path로 사용
                     converted_pdf_path = temp_pdf_path
-                    print(f"[PROD] ✅ Local converter success: {converted_pdf_path}")
+                    print(f"[PROD] Local converter success: {converted_pdf_path}")
 
                     with open(converted_pdf_path, "rb") as f:
                         pdf_bytes = f.read()
 
                 assert pdf_bytes is not None and len(pdf_bytes) > 0, "pdf_bytes is None or empty"
-                print(f"[PROD] ✅ PDF converted: {len(pdf_bytes)} bytes")
+                print(f"[PROD] PDF converted: {len(pdf_bytes)} bytes")
 
                 # 3) MinIO 업로드
                 m.upload_bytes(
@@ -708,7 +708,7 @@ async def process_convert_and_index_prod(
                     content_type="application/pdf",
                     length=len(pdf_bytes),
                 )
-                print(f"[PROD] ✅ PDF uploaded to MinIO: {object_pdf}")
+                print(f"[PROD] PDF uploaded to MinIO: {object_pdf}")
 
                 # 4) bytes 변환 성공 시에만 파일 저장 (로컬 변환은 이미 저장됨)
                 if converted_pdf_path is None:
@@ -717,16 +717,16 @@ async def process_convert_and_index_prod(
                     with open(save_path, "wb") as fw:
                         fw.write(pdf_bytes)
                     converted_pdf_path = str(save_path)
-                    print(f"[PROD] ✅ PDF saved to volume: {converted_pdf_path}")
+                    print(f"[PROD] PDF saved to volume: {converted_pdf_path}")
 
                 # 5) DB에는 file_id만 *.pdf로 업데이트 (폴더는 건드리지 않음)
-                # ✅ 핵심 수정: converted_pdf_path에서 직접 추출
+                # 핵심 수정: converted_pdf_path에서 직접 추출
                 new_file_id_pdf = Path(converted_pdf_path).name  # ex) f20231212M3Uv.pdf
                 db.update_file_id_only(data_id, new_file_id_pdf)
 
             except Exception as e:
                 error_msg = f"PDF 변환 실패 ({src_ext}): {e}"
-                print(f"[PROD] ❌ {error_msg}")
+                print(f"[PROD] {error_msg}")
                 raise ConvertError(error_msg)
 
         # converted_pdf_path가 설정되지 않았다면 문제 발생
@@ -736,7 +736,7 @@ async def process_convert_and_index_prod(
         if not Path(converted_pdf_path).exists():
             raise RuntimeError(f"converted_pdf_path가 존재하지 않음: {converted_pdf_path}")
 
-        print(f"[PROD] ✅ Final PDF path for parsing: {converted_pdf_path}")          
+        print(f"[PROD] Final PDF path for parsing: {converted_pdf_path}")          
         # ========== Step 3: OCR 시작 마킹 ==========
         db.mark_ocr_start(data_id)
         
@@ -761,7 +761,7 @@ async def process_convert_and_index_prod(
         
         # OCR 성공 마킹 (parse_yn='S')
         db.mark_ocr_success(data_id)
-        print(f"[PROD-OCR-DB] ✅ OCR completed and saved to DB: {len(pages)} pages")
+        print(f"[PROD-OCR-DB] OCR completed and saved to DB: {len(pages)} pages")
         
         # ========== Step 6: 레이아웃 정보 추출 ==========
         blocks_by_page_list = parse_pdf_blocks(converted_pdf_path)
@@ -810,7 +810,7 @@ async def process_convert_and_index_prod(
             embed_fn=embed
         )
         
-        print(f"[PROD] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
+        print(f"[PROD] Successfully indexed: {result.get('inserted', 0)} chunks")
         
         # ========== Step 11: RAG 완료 처리 ==========
         pages_count = len(pages_std)
@@ -823,7 +823,7 @@ async def process_convert_and_index_prod(
                 doc_id = str(data_id)
                 pdf_path_for_upload = converted_pdf_path
 
-                # 🔹 DB에서 제목/코드 등 메타 읽기
+                # DB에서 제목/코드 등 메타 읽기
                 row = None
                 try:
                     row = db.get_file_by_id(data_id)  # { data_title, data_code, ... }
@@ -850,7 +850,7 @@ async def process_convert_and_index_prod(
                     except Exception:
                         meta = {}
 
-                    # 🔹 DB 메타를 함께 저장(필터에 쓰고 싶으면 프론트에서 활용 가능)
+                    # DB 메타를 함께 저장(필터에 쓰고 싶으면 프론트에서 활용 가능)
                     extra_meta = {}
                     if isinstance(row, dict):
                         for k in [
@@ -862,10 +862,10 @@ async def process_convert_and_index_prod(
 
                     meta.update({
                         "doc_id": doc_id,
-                        "title": display_title,                 # ✅ DB data_title
-                        "pdf_key": object_pdf,                  # ✅ MinIO 변환 PDF
-                        "original_key": None,                   # ✅ MinIO 오브젝트가 아니면 None
-                        "original_fs_path": str(full_path),     # ✅ 로컬 경로는 별도 필드에
+                        "title": display_title,                 # DB data_title
+                        "pdf_key": object_pdf,                  # MinIO 변환 PDF
+                        "original_key": None,                   # MinIO 오브젝트가 아니면 None
+                        "original_fs_path": str(full_path),     # 로컬 경로는 별도 필드에
                         "original_name": Path(full_path).name,
                         "is_pdf_original": is_already_pdf,
                         "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -876,15 +876,15 @@ async def process_convert_and_index_prod(
                     })
                     m.put_json(META_KEY(doc_id), meta)
 
-                    print(f"[PROD-MINIO] ✅ synced: {object_pdf} (title='{display_title}', chunks={chunk_count})")
+                    print(f"[PROD-MINIO] synced: {object_pdf} (title='{display_title}', chunks={chunk_count})")
                 else:
-                    print("[PROD-MINIO] ⚠️ skip: no local pdf to upload")
+                    print("[PROD-MINIO] skip: no local pdf to upload")
             else:
-                print("[PROD-MINIO] ⏭️ skip: JAVA_SYNC_TO_MINIO=0")
+                print("[PROD-MINIO] ⏭skip: JAVA_SYNC_TO_MINIO=0")
         except Exception as e:
-            print(f"[PROD-MINIO] ❌ sync failed: {e}")
+            print(f"[PROD-MINIO] sync failed: {e}")
 
-        print(f"[PROD] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
+        print(f"[PROD] Indexing completed: {pages_count} pages, {chunk_count} chunks")
         # RAG 완료 마킹 (parse_yn='S' 유지, 히스토리 로깅)
         db.update_rag_completed(data_id)
         
@@ -916,7 +916,7 @@ async def process_convert_and_index_prod(
     except Exception as e:
         job_state.fail(job_id, str(e))
         db.update_rag_error(data_id, str(e))
-        print(f"[PROD] ❌ Error: {e}")
+        print(f"[PROD] Error: {e}")
         
         if callback_url:
             payload = WebhookPayload(
@@ -1018,13 +1018,13 @@ async def process_manual_ocr_and_index(
             embed_fn=embed
         )
         
-        print(f"[MANUAL-OCR] ✅ Successfully indexed: {result.get('inserted', 0)} chunks")
+        print(f"[MANUAL-OCR] Successfully indexed: {result.get('inserted', 0)} chunks")
         
         # ========== Step 5: RAG 완료 처리 ==========
         pages_count = len(pages_std)
         chunk_count = result.get('inserted', len(chunks))
         
-        print(f"[MANUAL-OCR] ✅ Indexing completed: {pages_count} pages, {chunk_count} chunks")
+        print(f"[MANUAL-OCR] Indexing completed: {pages_count} pages, {chunk_count} chunks")
         # RAG 완료 마킹 (parse_yn='S' 유지, 히스토리 로깅)
         db.update_rag_completed(data_id)
         
@@ -1598,87 +1598,17 @@ async def process_update_metadata(
         
         except Exception as e:
             print(f"[META-UPDATE] MinIO update failed: {e}")
-            # MinIO 업데이트 실패해도 Milvus는 계속 진행
-        
-        # ========== Step 3: Milvus 메타데이터 업데이트 (백그라운드) ==========
-        job_state.update(job_id, status="updating_milvus", step="Updating Milvus metadata")
-        
-        search_results = []
-        try:
-            from app.services.milvus_store_v2 import MilvusStoreV2
-            from app.services.embedding_model import get_sentence_embedding_dimension
-            
-            mvs = MilvusStoreV2(dim=get_sentence_embedding_dimension())
-            
-            # 기존 청크들 조회
-            print(f"[META-UPDATE] Fetching chunks from Milvus for doc_id={data_id}")
-            
-            # Milvus에서 해당 문서의 모든 청크 조회
-            search_results = mvs.collection.query(
-                expr=f'doc_id == "{data_id}"',
-                output_fields=["id", "doc_id", "chunk_index", "text", "page", "pages", "metadata"]
-            )
-            
-            if not search_results:
-                print(f"[META-UPDATE] No chunks found in Milvus for data_id={data_id}")
-            else:
-                print(f"[META-UPDATE] Found {len(search_results)} chunks in Milvus")
-                
-                # 청크별 메타데이터 업데이트
-                updated_count = 0
-                for chunk in search_results:
-                    chunk_id = chunk.get("id")
-                    
-                    # metadata 필드가 문자열(JSON)인 경우 파싱
-                    current_metadata = chunk.get("metadata", {})
-                    if isinstance(current_metadata, str):
-                        try:
-                            import json
-                            current_metadata = json.loads(current_metadata)
-                        except:
-                            current_metadata = {}
-                    
-                    # 메타데이터 업데이트
-                    updated_metadata = current_metadata.copy() if isinstance(current_metadata, dict) else {}
-                    updated_metadata.update({
-                        "data_title": row.get("data_title"),
-                        "data_code": row.get("data_code"),
-                        "data_code_detail": row.get("data_code_detail"),
-                        "data_code_detail_sub": row.get("data_code_detail_sub"),
-                        "last_metadata_updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                    })
-                    
-                    # Milvus 업데이트
-                    try:
-                        # metadata를 JSON 문자열로 변환
-                        import json
-                        metadata_str = json.dumps(updated_metadata, ensure_ascii=False)
-                        
-                        mvs.collection.upsert([{
-                            "id": chunk_id,
-                            "metadata": metadata_str
-                        }])
-                        updated_count += 1
-                    except Exception as e:
-                        print(f"[META-UPDATE] Failed to update chunk {chunk_id}: {e}")
-                
-                print(f"[META-UPDATE] Updated {updated_count}/{len(search_results)} chunks in Milvus")
-        
-        except Exception as e:
-            print(f"[META-UPDATE] Milvus update failed: {e}")
-            import traceback
-            print(traceback.format_exc())
-            # Milvus 업데이트 실패해도 완료 처리
+
+ 
         
         # ========== Step 4: 완료 처리 ==========
         job_state.complete(
             job_id,
             pages=0,
-            chunks=len(search_results)
+            chunks=0
         )
         
         print(f"[META-UPDATE] Metadata update completed for data_id={data_id}")
-        print(f"[META-UPDATE] Summary: MinIO updated, Milvus {len(search_results)} chunks updated")
     
     except Exception as e:
         job_state.fail(job_id, str(e))

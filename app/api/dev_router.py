@@ -96,7 +96,7 @@ async def send_dev_webhook(url: str, payload: DevWebhookPayload, secret: str):
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, content=payload_json, headers=headers)
             response.raise_for_status()
-            print(f"[DEV-WEBHOOK] ✅ Sent to {url}")
+            print(f"[DEV-WEBHOOK] Sent to {url}")
     except Exception as e:
         print(f"[DEV-WEBHOOK] ❌ Failed: {e}")
 
@@ -160,7 +160,7 @@ async def process_dev_convert_and_index(
                     length=len(pdf_bytes)
                 )
                 
-                print(f"[DEV] ✅ PDF converted and uploaded: {pdf_key}")
+                print(f"[DEV] PDF converted and uploaded: {pdf_key}")
                     
             except ConvertError as ce:
                 raise RuntimeError(f"PDF 변환 실패: {ce}")
@@ -273,13 +273,13 @@ async def process_dev_convert_and_index(
                 }
             )
         
-        print(f"[DEV-CHUNK] ✅ Successfully indexed {len(chunks)} chunks")
+        print(f"[DEV-CHUNK] Successfully indexed {len(chunks)} chunks")
         
         # ========== Step 4: 결과 조회 및 웹훅 전송 ==========
         pages = len(pages_std)
         chunk_count = len(chunks)
         
-        print(f"[DEV] ✅ Completed: {pages} pages, {chunk_count} chunks")
+        print(f"[DEV] Completed: {pages} pages, {chunk_count} chunks")
         
         # Job 상태 업데이트 (DB 업데이트는 하지 않음)
         job_state.complete(

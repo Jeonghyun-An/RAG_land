@@ -77,9 +77,9 @@ class DBConnector:
                 cur = conn.cursor()
                 cur.execute(sql, (file_folder, file_id, data_id))
                 cur.close()
-            print(f"[DB] ✅ Updated file path for data_id={data_id}: {file_folder}/{file_id}")
+            print(f"[DB] Updated file path for data_id={data_id}: {file_folder}/{file_id}")
         except Exception as e:
-            print(f"[DB] ❌ update_converted_file_path failed: {e}")
+            print(f"[DB] update_converted_file_path failed: {e}")
 
     # ==================== 2. OCR 추출 시작 ====================
     def mark_ocr_start(self, data_id: str | int):
@@ -99,9 +99,9 @@ class DBConnector:
                 cur = conn.cursor()
                 cur.execute(sql, (data_id,))
                 cur.close()
-            print(f"[DB] ✅ Marked OCR start for data_id={data_id} (parse_yn='L')")
+            print(f"[DB] Marked OCR start for data_id={data_id} (parse_yn='L')")
         except Exception as e:
-            print(f"[DB] ❌ mark_ocr_start failed: {e}")
+            print(f"[DB] mark_ocr_start failed: {e}")
 
     # ==================== 3. OCR 성공 ====================
     def mark_ocr_success(self, data_id: str | int):
@@ -121,9 +121,9 @@ class DBConnector:
                 cur = conn.cursor()
                 cur.execute(sql, (data_id,))
                 cur.close()
-            print(f"[DB] ✅ Marked OCR success for data_id={data_id} (parse_yn='S')")
+            print(f"[DB] Marked OCR success for data_id={data_id} (parse_yn='S')")
         except Exception as e:
-            print(f"[DB] ❌ mark_ocr_success failed: {e}")
+            print(f"[DB] mark_ocr_success failed: {e}")
 
     def insert_ocr_result(self, data_id: str | int, page: int, text: str):
         """
@@ -147,9 +147,9 @@ class DBConnector:
                 cur = conn.cursor()
                 cur.execute(sql, (data_id, page, text, data_id, page, text))
                 cur.close()
-            print(f"[DB] ✅ Inserted OCR result: data_id={data_id}, page={page}")
+            print(f"[DB] Inserted OCR result: data_id={data_id}, page={page}")
         except Exception as e:
-            print(f"[DB] ❌ insert_ocr_result failed: {e}")
+            print(f"[DB] insert_ocr_result failed: {e}")
 
     # ==================== 4. OCR 실패 ====================
     def mark_ocr_failure(self, data_id: str | int, error_msg: str = None):
@@ -169,13 +169,13 @@ class DBConnector:
                 cur = conn.cursor()
                 cur.execute(sql, (data_id,))
                 cur.close()
-            print(f"[DB] ✅ Marked OCR failure for data_id={data_id} (parse_yn='F')")
+            print(f"[DB] Marked OCR failure for data_id={data_id} (parse_yn='F')")
             
             # 히스토리 로그
             if error_msg:
                 self.insert_ocr_history(data_id, 'F', error_msg)
         except Exception as e:
-            print(f"[DB] ❌ mark_ocr_failure failed: {e}")
+            print(f"[DB] mark_ocr_failure failed: {e}")
 
     # ==================== 5. OCR 히스토리 로그 ====================
     def insert_ocr_history(self, data_id: str | int, parse_yn: str, error_msg: str = None):
@@ -202,9 +202,9 @@ class DBConnector:
                 cur = conn.cursor()
                 cur.execute(sql, (data_id, parse_yn, error_msg))
                 cur.close()
-            print(f"[DB] ✅ Logged OCR history: data_id={data_id}, parse_yn={parse_yn}")
+            print(f"[DB] Logged OCR history: data_id={data_id}, parse_yn={parse_yn}")
         except Exception as e:
-            print(f"[DB] ❌ insert_ocr_history failed: {e}")
+            print(f"[DB] insert_ocr_history failed: {e}")
 
     # ==================== 6. OCR 텍스트 가져오기 (Manual OCR용) ====================
     def get_ocr_text_by_data_id(self, data_id: str | int) -> List[Tuple[int, str]]:
@@ -233,15 +233,15 @@ class DBConnector:
                 cur.close()
             
             if not rows:
-                print(f"[DB] ⚠️  No OCR text found for data_id={data_id}")
+                print(f"[DB] No OCR text found for data_id={data_id}")
                 return []
             
             result = [(int(row[0]), str(row[1] or '').strip()) for row in rows]
-            print(f"[DB] ✅ Retrieved {len(result)} pages of OCR text for data_id={data_id}")
+            print(f"[DB] Retrieved {len(result)} pages of OCR text for data_id={data_id}")
             return result
             
         except Exception as e:
-            print(f"[DB] ❌ get_ocr_text_by_data_id failed: {e}")
+            print(f"[DB] get_ocr_text_by_data_id failed: {e}")
             return []
     
     def get_ocr_page_count(self, data_id: str | int) -> int:
@@ -421,15 +421,15 @@ class DBConnector:
                 cur.close()
             
             if not row:
-                print(f"[DB] ⚠️  No SC document found for data_id={data_id}")
+                print(f"[DB] No SC document found for data_id={data_id}")
                 return None
             
             result = dict(zip(cols, row))
-            print(f"[DB] ✅ Retrieved SC document: sc_id={result.get('sc_id')}, data_id={data_id}")
+            print(f"[DB] Retrieved SC document: sc_id={result.get('sc_id')}, data_id={data_id}")
             return result
             
         except Exception as e:
-            print(f"[DB] ❌ get_sc_document failed: {e}")
+            print(f"[DB] get_sc_document failed: {e}")
             return None
     
     def get_sc_combined_text(self, data_id: str | int) -> Optional[str]:
@@ -467,7 +467,7 @@ class DBConnector:
         
         # 두 줄바꿈으로 구분하여 합치기
         combined = "\n\n".join(parts)
-        print(f"[DB] ✅ Combined SC text: {len(combined)} chars from {len(parts)} sections")
+        print(f"[DB] Combined SC text: {len(combined)} chars from {len(parts)} sections")
         return combined
     
     def get_sc_document_with_structure(self, data_id: str | int) -> Optional[Dict[str, Any]]:
@@ -572,9 +572,9 @@ class DBConnector:
                 cur = conn.cursor()
                 cur.execute(sql, (new_file_id, data_id))
                 cur.close()
-            print(f"[DB] ✅ Updated file_id only: data_id={data_id} -> {new_file_id}")
+            print(f"[DB] Updated file_id only: data_id={data_id} -> {new_file_id}")
         except Exception as e:
-            print(f"[DB] ❌ update_file_id_only failed: {e}")
+            print(f"[DB] update_file_id_only failed: {e}")
             
     # ==================== 12. 카테고리별 문서 목록 조회 (신규 추가) ====================
     def fetch_docs_by_code(
@@ -631,7 +631,7 @@ class DBConnector:
                 cur.close()
             
             result = [dict(zip(cols, row)) for row in rows]
-            print(f"[DB] ✅ fetch_docs_by_code: {len(result)} documents (code={data_code}, detail={data_code_detail}, sub={data_code_detail_sub})")
+            print(f"[DB] fetch_docs_by_code: {len(result)} documents (code={data_code}, detail={data_code_detail}, sub={data_code_detail_sub})")
             return result
             
         except Exception as e:
