@@ -98,7 +98,7 @@ async def send_dev_webhook(url: str, payload: DevWebhookPayload, secret: str):
             response.raise_for_status()
             print(f"[DEV-WEBHOOK] Sent to {url}")
     except Exception as e:
-        print(f"[DEV-WEBHOOK] ❌ Failed: {e}")
+        print(f"[DEV-WEBHOOK] Failed: {e}")
 
 
 def generate_minio_pdf_key(data_id: str) -> str:
@@ -165,7 +165,7 @@ async def process_dev_convert_and_index(
             except ConvertError as ce:
                 raise RuntimeError(f"PDF 변환 실패: {ce}")
             except Exception as e:
-                print(f"[DEV] ❌ Upload error: {e}")
+                print(f"[DEV] Upload error: {e}")
                 raise RuntimeError(f"MinIO 업로드 실패: {e}")
         
         # PDF 변환 완료 웹훅
@@ -308,7 +308,7 @@ async def process_dev_convert_and_index(
     
     except Exception as e:
         job_state.fail(job_id, str(e))
-        print(f"[DEV] ❌ Error: {e}")
+        print(f"[DEV] Error: {e}")
         
         if callback_url:
             payload = DevWebhookPayload(

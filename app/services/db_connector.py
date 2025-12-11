@@ -307,7 +307,7 @@ class DBConnector:
             return None
             
         except Exception as e:
-            print(f"[DB] ❌ get_ocr_text_by_page failed: {e}")
+            print(f"[DB] get_ocr_text_by_page failed: {e}")
             return None
 
     # ==================== 8. 기본 조회 ====================
@@ -635,7 +635,7 @@ class DBConnector:
             return result
             
         except Exception as e:
-            print(f"[DB] ❌ fetch_docs_by_code failed: {e}")
+            print(f"[DB] fetch_docs_by_code failed: {e}")
             return []
 
     # ==================== 호환성 유지 메서드 ====================

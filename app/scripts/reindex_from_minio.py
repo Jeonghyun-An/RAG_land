@@ -180,7 +180,7 @@ def process_single_document(
         
         inserted_count = insert_result.get("inserted", 0)
         
-        print(f"[완료] ✅ {inserted_count}개 청크 인덱싱 완료")
+        print(f"[완료] {inserted_count}개 청크 인덱싱 완료")
         
         result["status"] = "success"
         result["chunks"] = inserted_count
@@ -225,11 +225,11 @@ def main():
     try:
         minio = MinIOStore()
         if not minio.healthcheck():
-            print("❌ MinIO 연결 실패!")
+            print("MinIO 연결 실패!")
             return 1
-        print("✅ MinIO 연결 성공")
+        print("MinIO 연결 성공")
     except Exception as e:
-        print(f"❌ MinIO 초기화 실패: {e}")
+        print(f"MinIO 초기화 실패: {e}")
         return 1
     
     # Milvus 연결
@@ -237,9 +237,9 @@ def main():
     try:
         dim = get_sentence_embedding_dimension()
         mvs = MilvusStoreV2(dim=dim)
-        print(f"✅ Milvus 연결 성공 (dim={dim})")
+        print(f"Milvus 연결 성공 (dim={dim})")
     except Exception as e:
-        print(f"❌ Milvus 초기화 실패: {e}")
+        print(f"Milvus 초기화 실패: {e}")
         return 1
     
     print()
@@ -248,7 +248,7 @@ def main():
     if args.doc_id:
         object_name = f"uploaded/{args.doc_id}.pdf"
         if not minio.exists(object_name):
-            print(f"❌ 문서를 찾을 수 없습니다: {object_name}")
+            print(f"문서를 찾을 수 없습니다: {object_name}")
             return 1
         objects = [object_name]
     else:
@@ -299,11 +299,11 @@ def main():
         results[status].append(result)
         
         if status == "success":
-            print(f"  ✅ 성공: {result['chunks']}개 청크")
+            print(f"  성공: {result['chunks']}개 청크")
         elif status == "skipped":
-            print(f"  ⏭️  스킵: {result['message']}")
+            print(f"  ⏭스킵: {result['message']}")
         else:
-            print(f"  ❌ 실패: {result['message']}")
+            print(f"  실패: {result['message']}")
             if not args.skip_errors:
                 print("\n재인덱싱 중단됨 (--skip-errors 옵션으로 계속 진행 가능)")
                 break
@@ -317,9 +317,9 @@ def main():
     print("=" * 80)
     print(f"총 처리 시간: {elapsed:.1f}초")
     print(f"총 문서 수: {len(objects)}개")
-    print(f"  ✅ 성공: {len(results['success'])}개")
-    print(f"  ⏭️  스킵: {len(results['skipped'])}개")
-    print(f"  ❌ 실패: {len(results['error'])}개")
+    print(f"  성공: {len(results['success'])}개")
+    print(f"  ⏭스킵: {len(results['skipped'])}개")
+    print(f"  실패: {len(results['error'])}개")
     
     if results['success']:
         total_chunks = sum(r['chunks'] for r in results['success'])

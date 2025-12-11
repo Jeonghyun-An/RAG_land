@@ -801,4 +801,4 @@ class SmartOCRRouter:
                 f"ℹ️  {len(legal_pages)}개 법률 문서 페이지 감지 → 높은 정확도 요구"
             )
         
-        return recommendations or ["✅ 모든 페이지 품질 양호"]
+        return recommendations or ["모든 페이지 품질 양호"]

@@ -91,13 +91,13 @@ def _register_korean_font():
         if os.path.exists(font_path):
             try:
                 pdfmetrics.registerFont(TTFont("NanumGothic", font_path))
-                print(f"[FONT] ✅ Registered Korean font: {font_path}")
+                print(f"[FONT] Registered Korean font: {font_path}")
                 return "NanumGothic"
             except Exception as e:
-                print(f"[FONT] ⚠️ Failed to register {font_path}: {e}")
+                print(f"[FONT] Failed to register {font_path}: {e}")
                 continue
     
-    print("[FONT] ⚠️ No Korean font found")
+    print("[FONT] No Korean font found")
     return "Helvetica"
 
 # ========== TXT → PDF 변환 (한글 지원) ==========
@@ -201,12 +201,12 @@ def _extract_text_from_hwpx(hwpx_path: Path) -> str:
                         for fallback_enc in ['utf-16', 'utf-16-le', 'utf-8', 'cp949', 'euc-kr']:
                             try:
                                 content_str = raw_content.decode(fallback_enc)
-                                print(f"[HWPX] ✅ Fallback encoding worked: {fallback_enc}")
+                                print(f"[HWPX] Fallback encoding worked: {fallback_enc}")
                                 break
                             except:
                                 continue
                         else:
-                            print(f"[HWPX] ⚠️ All encodings failed for {section_file}")
+                            print(f"[HWPX] All encodings failed for {section_file}")
                             continue
                     
                     root = ET.fromstring(content_str.encode('utf-8'))
@@ -235,7 +235,7 @@ def _extract_text_from_hwpx(hwpx_path: Path) -> str:
         if not full_text.strip():
             raise ValueError("HWPX에서 텍스트를 추출할 수 없습니다")
         
-        print(f"[HWPX] ✅ Total extracted: {len(full_text)} characters")
+        print(f"[HWPX] Total extracted: {len(full_text)} characters")
         return full_text
         
     except zipfile.BadZipFile:
@@ -281,7 +281,7 @@ def _hwp_to_pdf_via_text(src: Path, out: Path):
         
         os.unlink(txt_path)
         
-        print(f"[CONVERT] ✅ HWP→PDF via pyhwp 성공: {out}")
+        print(f"[CONVERT] HWP→PDF via pyhwp 성공: {out}")
         
     except subprocess.TimeoutExpired:
         if os.path.exists(txt_path):
@@ -309,7 +309,7 @@ def _hwp_to_pdf(src: Path, out: Path):
             with open(out, 'wb') as f:
                 f.write(pdf_bytes)
             
-            print(f"[CONVERT] ✅ HWPX→PDF via XML parsing 성공: {out}")
+            print(f"[CONVERT] HWPX→PDF via XML parsing 성공: {out}")
             return
         except Exception as e:
             print(f"[CONVERT] HWPX XML parsing 실패: {e}")
@@ -332,7 +332,7 @@ def _hwp_to_pdf(src: Path, out: Path):
             if pdf_bytes:
                 with open(out, "wb") as fw:
                     fw.write(pdf_bytes)
-                print(f"[CONVERT] ✅ HWP/HWPX→PDF via DOC_CONVERTER_URL: {out}")
+                print(f"[CONVERT] HWP/HWPX→PDF via DOC_CONVERTER_URL: {out}")
                 return
         except Exception as e:
             print(f"[CONVERT] DOC_CONVERTER_URL 실패: {e}")

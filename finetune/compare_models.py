@@ -287,7 +287,7 @@ def compare_models(base_url: str, finetuned_url: str, output_dir: str = "./compa
         base_better = [r for r in results if r["winner"] == "base"][:3]
         
         if finetuned_better:
-            f.write("✅ Finetuned 모델이 우수한 케이스:\n\n")
+            f.write(" Finetuned 모델이 우수한 케이스:\n\n")
             for r in finetuned_better:
                 f.write(f"[{r['category']}] {r['question']}\n")
                 f.write(f"Base 점수: {r['base_model']['evaluation']['total_score']:.3f}\n")
@@ -295,7 +295,7 @@ def compare_models(base_url: str, finetuned_url: str, output_dir: str = "./compa
                 f.write("-"*80 + "\n\n")
         
         if base_better:
-            f.write("❌ Base 모델이 우수한 케이스:\n\n")
+            f.write(" Base 모델이 우수한 케이스:\n\n")
             for r in base_better:
                 f.write(f"[{r['category']}] {r['question']}\n")
                 f.write(f"Base 점수: {r['base_model']['evaluation']['total_score']:.3f}\n")

@@ -141,7 +141,7 @@ async def send_webhook(url: str, payload: WebhookPayload, secret: str):
             resp.raise_for_status()
             print(f"[WEBHOOK] Sent to {url}: {payload.status}")
     except Exception as e:
-        print(f"[WEBHOOK] ❌ Failed: {e}")
+        print(f"[WEBHOOK] Failed: {e}")
 
 
 def _normalize_pages_for_chunkers(pages) -> List[Tuple[int, str]]:
@@ -1056,7 +1056,7 @@ async def process_manual_ocr_and_index(
     except Exception as e:
         job_state.fail(job_id, str(e))
         db.update_rag_error(data_id, str(e))
-        print(f"[MANUAL-OCR] ❌ Error: {e}")
+        print(f"[MANUAL-OCR] Error: {e}")
         
         if callback_url:
             payload = WebhookPayload(
@@ -1482,7 +1482,7 @@ async def process_delete_document(
             await send_webhook(callback_url, payload, SHARED_SECRET)
     
     except Exception as e:
-        print(f"[DELETE] ❌ Error: {e}")
+        print(f"[DELETE] Error: {e}")
         
         if callback_url:
             payload = WebhookPayload(

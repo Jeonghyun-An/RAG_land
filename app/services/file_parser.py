@@ -76,7 +76,7 @@ def parse_any_bytes(name_hint: str, content: bytes) -> dict:
             pdf_bytes = convert_bytes_to_pdf_bytes(content, ext)
             
             if pdf_bytes:
-                print(f"[PARSE] ✅ HWP→PDF bytes conversion successful: {len(pdf_bytes)} bytes")
+                print(f"[PARSE] HWP→PDF bytes conversion successful: {len(pdf_bytes)} bytes")
                 pages = parse_pdf_pages_from_bytes(pdf_bytes)
                 blocks = parse_pdf_blocks_from_bytes(pdf_bytes)
                 return {"kind": "pdf", "ext": ".pdf", "pages": pages, "blocks": blocks}
@@ -92,17 +92,17 @@ def parse_any_bytes(name_hint: str, content: bytes) -> dict:
             pdf_bytes = convert_stream_to_pdf_bytes(content, ext)
             
             if pdf_bytes:
-                print(f"[PARSE] ✅ HWP→PDF stream conversion successful: {len(pdf_bytes)} bytes")
+                print(f"[PARSE] HWP→PDF stream conversion successful: {len(pdf_bytes)} bytes")
                 pages = parse_pdf_pages_from_bytes(pdf_bytes)
                 blocks = parse_pdf_blocks_from_bytes(pdf_bytes)
                 return {"kind": "pdf", "ext": ".pdf", "pages": pages, "blocks": blocks}
         except ConvertStreamError as e:
-            print(f"[PARSE] ⚠️ HWP stream conversion failed: {e}")
+            print(f"[PARSE] HWP stream conversion failed: {e}")
         except Exception as e:
-            print(f"[PARSE] ❌ HWP conversion error: {e}")
+            print(f"[PARSE] HWP conversion error: {e}")
         
         # 3순위: 실패 시 평문 반환 (fallback)
-        print(f"[PARSE] ⚠️ All HWP conversion attempts failed, returning as plain text")
+        print(f"[PARSE] All HWP conversion attempts failed, returning as plain text")
         return {"kind": "plain", "ext": ext, "items": parse_plaintext_bytes(content)}
 
     # 기타 파일 형식
@@ -146,7 +146,7 @@ def parse_any(path: str) -> List[Tuple[int, str]]:
             from app.services.pdf_converter import convert_to_pdf, ConvertError
             try:
                 pdf_path = convert_to_pdf(path)
-                print(f"[PARSE] ✅ HWP→PDF conversion successful: {pdf_path}")
+                print(f"[PARSE] HWP→PDF conversion successful: {pdf_path}")
                 return parse_pdf(pdf_path, by_page=True)
             except ConvertError as e:
                 raise RuntimeError(f"HWP 변환 실패: {e}")
@@ -460,7 +460,7 @@ def parse_xlsx_tables(path: str) -> List[Tuple[int, str]]:
 def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, str]]]:
     """
     PDF 파싱 with OCR 지원
-    ✅ HWP 변환 PDF는 OCR 스킵
+    HWP 변환 PDF는 OCR 스킵
     """
     import fitz
     
@@ -470,7 +470,7 @@ def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, st
         metadata = doc.metadata
         if metadata.get('subject') == 'NO_OCR_NEEDED' or metadata.get('title') == 'HWP_CONVERTED':
             skip_ocr = True
-            print(f"[PARSE] ✅ Detected HWP-converted PDF, skipping OCR")
+            print(f"[PARSE] Detected HWP-converted PDF, skipping OCR")
         doc.close()
     except Exception:
         pass

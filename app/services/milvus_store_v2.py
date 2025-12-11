@@ -231,7 +231,7 @@ class MilvusStoreV2:
                         "params": {"M": 16, "efConstruction": 200},
                     },
                 )
-                print("✅created missing index on existing collection")
+                print("created missing index on existing collection")
         except Exception as e:
             print(f" ensure index failed: {e}")
 

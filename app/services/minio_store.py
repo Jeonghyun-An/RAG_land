@@ -278,7 +278,7 @@ class MinIOStore:
             objs = self.client.list_objects(self.bucket, prefix=prefix, recursive=True)
             return [obj.object_name for obj in objs]
         except S3Error as e:
-            print(f"❌ MinIO 리스트 조회 오류: {e}")
+            print(f" MinIO 리스트 조회 오류: {e}")
             return []
 
     # ---------- Presigned URL 재작성 ----------

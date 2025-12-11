@@ -33,9 +33,9 @@ class MilvusStore:
         try:
             if not connections.has_connection("default"):
                 connections.connect(alias="default", host=host, port=port)
-            print(f"✅ Milvus 연결 성공: {host}:{port}")
+            print(f"Milvus 연결 성공: {host}:{port}")
         except Exception as e:
-            print(f"❌ Milvus 연결 실패: {e}")
+            print(f"Milvus 연결 실패: {e}")
             raise
 
         # 컬렉션 없으면 생성
@@ -49,7 +49,7 @@ class MilvusStore:
             if self.collection.num_entities > 0:
                 self.collection.load()
         except MilvusException as e:
-            print(f"⚠️ load 스킵 (사유: {e})")
+            print(f"load 스킵 (사유: {e})")
 
     # ---- 내부 유틸 ----
     def _create_collection(self) -> None:
@@ -74,18 +74,18 @@ class MilvusStore:
             "params": {"nlist": 128},
         }
         collection.create_index(field_name="embedding", index_params=index_params)
-        print(f"✅ 컬렉션 생성 완료: {self.collection_name} (dim={self.embedding_dim})")
+        print(f"컬렉션 생성 완료: {self.collection_name} (dim={self.embedding_dim})")
 
     # ---- public API ----
     def add_texts(self, texts: List[str]) -> MutationResult:
         if not texts:
-            raise ValueError("❌ texts가 비었습니다.")
+            raise ValueError(" texts가 비었습니다.")
 
         # Sentence-Transformers는 기본적으로 cosine 유사도를 잘 쓰므로
         # embed()에서 normalize=True로 단위벡터 → L2와 cosine이 거의 동일하게 작동
         vectors = embed(texts)  # List[List[float]]
         if not vectors:
-            raise ValueError("❌ 임베딩 결과가 없습니다.")
+            raise ValueError(" 임베딩 결과가 없습니다.")
 
         # 스키마에서 auto_id=True이므로 id는 넣지 않음. 순서는 (chunk, embedding)
         mr = self.collection.insert([texts, vectors])
@@ -103,7 +103,7 @@ class MilvusStore:
         if not query:
             return []
         if getattr(self.collection, "num_entities", 0) == 0:
-            raise RuntimeError("❌ Milvus 컬렉션에 데이터가 없습니다. 먼저 업서트하세요.")
+            raise RuntimeError(" Milvus 컬렉션에 데이터가 없습니다. 먼저 업서트하세요.")
 
         qvec = embed([query])[0]
 
@@ -133,9 +133,9 @@ class MilvusStore:
                     connections.connect(alias="default", host=host, port=port)
                 # 응답성 체크
                 _ = utility.list_collections()
-                print("✅ Milvus가 준비되었습니다.")
+                print(" Milvus가 준비되었습니다.")
                 return
             except Exception:
-                print(f"⏳ Milvus 연결 재시도 중... ({i + 1}/{timeout})")
+                print(f" Milvus 연결 재시도 중... ({i + 1}/{timeout})")
                 time.sleep(1)
-        raise RuntimeError("❌ Milvus가 준비되지 않았습니다.")
+        raise RuntimeError(" Milvus가 준비되지 않았습니다.")
