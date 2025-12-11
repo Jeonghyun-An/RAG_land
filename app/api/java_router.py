@@ -1078,12 +1078,13 @@ async def process_sc_index(
     """
     운영용 백그라운드 처리 - sc-index (SC 문서 전용)
     
-    프로세스:
-    1. osk_data_sc 테이블에서 data_id 조회
-    2. preface_text + contents_text + conclusion_text 합치기
-    3. 단일 청크로 처리 (1~2 페이지 분량)
-    4. 임베딩 후 Milvus 저장
-    5. osk_data.parse_yn = 'S', osk_ocr_hist 로깅
+    1. osk_data_sc 테이블에서 구조화된 데이터 조회
+    2. 헤더(문서번호 + 수신처 + 제목 + 발신일) 생성
+    3. 본문, 맺음말 포함 전체 텍스트 조합
+    4. 각 청크에 SC 메타데이터 첨부
+    5. 토큰 수에 따라 청크 분할 (필요시)
+    6. 임베딩 및 Milvus 저장
+    7. osk_data.parse_yn = 'S', osk_ocr_hist 로깅
     """
     db = DBConnector()
     m = MinIOStore()
@@ -1096,17 +1097,31 @@ async def process_sc_index(
         db.mark_ocr_start(data_id)
         print(f"[SC-INDEX] 신규 SC 문서 작업: data_id={data_id}, parse_yn='L'")
         
-        # ========== Step 2: DB에서 SC 문서 텍스트 가져오기 ==========
-        job_state.update(job_id, status="loading", step="Loading SC document from DB")
+        # ========== Step 2: DB에서 SC 문서 구조화 데이터 가져오기 ==========
+        job_state.update(job_id, status="loading", step="Loading structured SC document from DB")
         
-        print(f"[SC-INDEX] Loading SC document from osk_data_sc for data_id={data_id}")
+        print(f"[SC-INDEX] Loading structured SC document from osk_data_sc for data_id={data_id}")
         
-        combined_text = db.get_sc_combined_text(data_id)
+        sc_data = db.get_sc_document_with_structure(data_id)
         
-        if not combined_text:
+        if not sc_data or not sc_data.get('full_text'):
             raise RuntimeError(f"SC 문서 텍스트가 비어있습니다: data_id={data_id}")
         
-        print(f"[SC-INDEX] Loaded SC text: {len(combined_text)} characters")
+        metadata = sc_data['metadata']
+        header = sc_data['header']
+        contents = sc_data['contents']
+        conclusion = sc_data['conclusion']
+        full_text = sc_data['full_text']
+        
+        print(f"[SC-INDEX] Loaded SC document:")
+        print(f"     문서번호: {metadata['sc_code']}")
+        print(f"     수신처: {metadata['receiver_agency']}")
+        print(f"     제목: {metadata['sc_title']}")
+        print(f"     발신일: {metadata['send_date']}")
+        print(f"     Full text: {len(full_text)} characters")
+        print(f"     Header: {len(header)} characters")
+        print(f"     Contents: {len(contents)} characters")
+        print(f"     Conclusion: {len(conclusion)} characters")
         
         # ========== Step 3: 청크 생성 (토큰 길이에 따라 분할) ==========
         job_state.update(job_id, status="chunking", step="Creating chunks for SC document")
@@ -1129,32 +1144,45 @@ async def process_sc_index(
         
         # 전체 토큰 수 계산
         if tokenizer:
-            tokens = tokenizer.encode(combined_text, add_special_tokens=False)
+            tokens = tokenizer.encode(full_text, add_special_tokens=False)
             total_token_count = len(tokens)
         else:
             # tokenizer 없으면 대략적 추정
-            total_token_count = len(combined_text) // 4
+            total_token_count = len(full_text) // 4
             tokens = None
         
         print(f"[SC-INDEX] SC document total token count: {total_token_count}")
         
+        # ========== Step 3.1: SC 메타데이터 준비 ==========
+        # 모든 청크에 공통으로 들어갈 SC 메타데이터
+        sc_metadata = {
+            "sc_code": metadata['sc_code'] or "",              # 문서번호
+            "receiver_agency": metadata['receiver_agency'] or "",  # 수신처
+            "sc_title": metadata['sc_title'] or "",            # 제목
+            "send_date": metadata['send_date'] or "",          # 발신일
+            "sender_file_id": metadata['sender_file_id'] or "",  # 발신 파일 ID
+        }
+        
         chunks = []
         
+        # ========== Step 3.2: 청크 생성 로직 ==========
         # 토큰 수가 안전 범위 내면 단일 청크
         if total_token_count <= safe_max_tokens:
             print(f"[SC-INDEX] Creating single chunk (within token limit)")
-            chunk = (
-                combined_text,
-                {
-                    "page": 1,
-                    "pages": [1],
-                    "section": "SC Document",
-                    "token_count": total_token_count,
-                    "bboxes": {},
-                    "type": "sc_document"
-                }
-            )
+            
+            chunk_metadata = {
+                "page": 1,
+                "pages": [1],
+                "section": "SC Document",
+                "token_count": total_token_count,
+                "bboxes": {},
+                "type": "sc_document",
+                **sc_metadata  # SC 메타데이터 추가
+            }
+            
+            chunk = (full_text, chunk_metadata)
             chunks = [chunk]
+            
         else:
             # 토큰 수 초과 시 분할
             print(f"[SC-INDEX] Token count ({total_token_count}) exceeds limit ({safe_max_tokens}), splitting into multiple chunks")
@@ -1170,41 +1198,51 @@ async def process_sc_index(
                     chunk_tokens = tokens[start_idx:end_idx]
                     chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
                     
-                    chunk = (
-                        chunk_text,
-                        {
-                            "page": i + 1,
-                            "pages": [i + 1],
-                            "section": f"SC Document (Part {i + 1}/{num_chunks})",
-                            "token_count": len(chunk_tokens),
-                            "bboxes": {},
-                            "type": "sc_document_part"
-                        }
-                    )
+                    # 각 청크에 헤더 정보 추가 (첫 청크 제외)
+                    # 전략: 모든 청크에 헤더 포함하여 컨텍스트 유지
+                    if i > 0:
+                        # 나머지 청크에는 간략한 헤더 추가
+                        chunk_text = f"[계속]\n{header}\n\n{chunk_text}"
+                    
+                    chunk_metadata = {
+                        "page": i + 1,
+                        "pages": [i + 1],
+                        "section": f"SC Document (Part {i + 1}/{num_chunks})",
+                        "token_count": len(chunk_tokens),
+                        "bboxes": {},
+                        "type": "sc_document_part",
+                        **sc_metadata  # SC 메타데이터 추가
+                    }
+                    
+                    chunk = (chunk_text, chunk_metadata)
                     chunks.append(chunk)
                     print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: {len(chunk_tokens)} tokens")
             else:
                 # tokenizer 없으면 문자 기반 분할 (대략적)
                 chars_per_chunk = safe_max_tokens * 4  # 1 토큰 ≈ 4자
-                num_chunks = (len(combined_text) + chars_per_chunk - 1) // chars_per_chunk
+                num_chunks = (len(full_text) + chars_per_chunk - 1) // chars_per_chunk
                 print(f"[SC-INDEX] Splitting into {num_chunks} chunks (character-based)")
                 
                 for i in range(num_chunks):
                     start_idx = i * chars_per_chunk
-                    end_idx = min((i + 1) * chars_per_chunk, len(combined_text))
-                    chunk_text = combined_text[start_idx:end_idx]
+                    end_idx = min((i + 1) * chars_per_chunk, len(full_text))
+                    chunk_text = full_text[start_idx:end_idx]
                     
-                    chunk = (
-                        chunk_text,
-                        {
-                            "page": i + 1,
-                            "pages": [i + 1],
-                            "section": f"SC Document (Part {i + 1}/{num_chunks})",
-                            "token_count": len(chunk_text) // 4,
-                            "bboxes": {},
-                            "type": "sc_document_part"
-                        }
-                    )
+                    # 각 청크에 헤더 정보 추가
+                    if i > 0:
+                        chunk_text = f"[계속]\n{header}\n\n{chunk_text}"
+                    
+                    chunk_metadata = {
+                        "page": i + 1,
+                        "pages": [i + 1],
+                        "section": f"SC Document (Part {i + 1}/{num_chunks})",
+                        "token_count": len(chunk_text) // 4,
+                        "bboxes": {},
+                        "type": "sc_document_part",
+                        **sc_metadata  # SC 메타데이터 추가
+                    }
+                    
+                    chunk = (chunk_text, chunk_metadata)
                     chunks.append(chunk)
                     print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: ~{len(chunk_text)} chars")
         
@@ -1239,24 +1277,25 @@ async def process_sc_index(
             embed_fn=embed
         )
         
-        print(f"[SC-INDEX] ✅ Successfully indexed: {result.get('inserted', 0)} chunk(s)")
+        print(f"[SC-INDEX] Successfully indexed: {result.get('inserted', 0)} chunk(s)")
 
-        # ========== Step 6.5: MinIO sync (SC) ==========
+ # ========== Step 6: MinIO sync (SC) ==========
         try:
             SYNC_TO_MINIO = os.getenv("JAVA_SYNC_TO_MINIO", "1") == "1"
             if SYNC_TO_MINIO:
                 doc_id = str(data_id)
-                m = MinIOStore()
 
-                # 표시용 타이틀: osk_data.data_title 우선
-                row = None
-                try:
-                    row = db.get_file_by_id(data_id)  # { data_title, ... }
-                except Exception:
-                    row = None
-                display_title = None
-                if isinstance(row, dict):
-                    display_title = (row.get("data_title") or "").strip() or None
+                # 표시용 타이틀: SC 제목 우선, 없으면 osk_data.data_title
+                display_title = metadata['sc_title'] or ""
+                
+                if not display_title:
+                    try:
+                        row = db.get_file_by_id(data_id)
+                        if isinstance(row, dict):
+                            display_title = (row.get("data_title") or "").strip()
+                    except Exception:
+                        pass
+                
                 if not display_title:
                     display_title = f"SC Document {doc_id}"
 
@@ -1267,55 +1306,58 @@ async def process_sc_index(
                 local_pdf = _Path(tmpdir) / f"sc_{doc_id}.pdf"
 
                 try:
-                    _render_text_pdf(combined_text, str(local_pdf))
+                    _render_text_pdf(full_text, str(local_pdf))
                 except ImportError as e:
                     # reportlab 미설치 시 안내 로그
-                    raise RuntimeError(
-                        "reportlab이 설치되어 있지 않아 SC PDF 생성을 할 수 없습니다. "
-                        "컨테이너/환경에 'pip install reportlab'을 추가해 주세요."
-                    ) from e
+                    print(f"[SC-MINIO] reportlab not installed, skipping PDF generation")
+                    local_pdf = None
+                except Exception as e:
+                    print(f"[SC-MINIO] PDF generation failed: {e}")
+                    local_pdf = None
 
-                # PDF 업로드
-                object_pdf = f"uploaded/{doc_id}.pdf"
-                with open(local_pdf, "rb") as f:
-                    data = f.read()
-                m.upload_bytes(
-                    data,
-                    object_name=object_pdf,
-                    content_type="application/pdf",
-                    length=len(data),
-                )
+                # MinIO 업로드 (PDF가 생성된 경우만)
+                if local_pdf and local_pdf.exists():
+                    object_pdf = f"uploaded/sc/{doc_id}.pdf"
+                    
+                    # upload_bytes 메서드 사용
+                    with open(local_pdf, "rb") as f:
+                        pdf_bytes = f.read()
+                        m.upload_bytes(
+                            data=pdf_bytes,
+                            object_name=object_pdf,
+                            content_type="application/pdf",
+                            length=len(pdf_bytes)
+                        )
 
-                # meta.json merge
-                def META_KEY(doc_id: str) -> str:
-                    return f"uploaded/__meta__/{doc_id}/meta.json"
+                    print(f"[SC-MINIO] Uploaded SC PDF: {object_pdf}")
+                    
+                    # 임시 파일 삭제
+                    try:
+                        local_pdf.unlink()
+                    except:
+                        pass
 
+                # meta.json 생성/업데이트
+                extra_meta = {
+                    "sc_code": metadata['sc_code'],
+                    "receiver_agency": metadata['receiver_agency'],
+                    "sc_title": metadata['sc_title'],
+                    "send_date": metadata['send_date'],
+                }
+                
+                # get_json도 예외 처리
                 meta = {}
                 try:
                     if m.exists(META_KEY(doc_id)):
                         meta = m.get_json(META_KEY(doc_id)) or {}
-                except Exception:
+                except Exception as e:
+                    print(f"[SC-MINIO]  Failed to load existing meta.json: {e}")
                     meta = {}
-
-                # DB 메타를 조금 더 넣고 싶다면 추가
-                extra_meta = {}
-                if isinstance(row, dict):
-                    for k in [
-                        "data_id","data_title","data_code","data_code_detail","data_code_detail_sub",
-                        "file_folder","file_id","reg_nm","reg_id","reg_dt","reg_type","parse_yn"
-                    ]:
-                        if k in row:
-                            extra_meta[k] = row[k]
-
+                
                 meta.update({
                     "doc_id": doc_id,
-                    "title": display_title,           # ✅ 프론트 목록/뷰어 제목
-                    "pdf_key": object_pdf,            # ✅ 프론트가 여는 키
-                    "original_key": None,             # 파일 원본 개념 없음
-                    "original_fs_path": None,
-                    "original_name": f"sc_{doc_id}.pdf",
-                    "is_pdf_original": True,
-                    "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "title": display_title,
+                    "indexed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "indexed": True,
                     "chunk_count": int(result.get('inserted', 0)),
                     "last_indexed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1324,22 +1366,25 @@ async def process_sc_index(
                 })
                 m.put_json(META_KEY(doc_id), meta)
 
-                print(f"[SC-MINIO] ✅ synced: {object_pdf} (title='{display_title}', chunks={result.get('inserted', 0)})")
+                print(f"[SC-MINIO] synced meta.json: title='{display_title}', chunks={result.get('inserted', 0)}")
+                
             else:
-                print("[SC-MINIO] ⏭️ skip: JAVA_SYNC_TO_MINIO=0")
+                print("[SC-MINIO] skip: JAVA_SYNC_TO_MINIO=0")
         except Exception as e:
-            print(f"[SC-MINIO] ❌ sync failed: {e}")
+            import traceback
+            print(f"[SC-MINIO] sync failed: {e}")
+            print(traceback.format_exc())
 
-        # ========== Step 6: OCR 성공 마킹 ==========
+        # ========== Step 7: OCR 성공 마킹 ==========
         # SC 문서는 페이지 개념이 없으므로 osk_ocr_data에 저장하지 않음
         # 바로 OCR 성공 처리
         db.mark_ocr_success(data_id)
-        print(f"[SC-INDEX] ✅ Marked OCR success for SC document: data_id={data_id}")
+        print(f"[SC-INDEX] Marked OCR success for SC document: data_id={data_id}")
         
-        # ========== Step 7: RAG 완료 처리 ==========
+        # ========== Step 8: RAG 완료 처리 ==========
         chunk_count = result.get('inserted', len(chunks))
         
-        print(f"[SC-INDEX] ✅ Indexing completed: 1 SC document, {chunk_count} chunk(s)")
+        print(f"[SC-INDEX] Indexing completed: 1 SC document, {chunk_count} chunk(s)")
         # RAG 완료 마킹 (parse_yn='S' 유지, 히스토리 로깅)
         db.update_rag_completed(data_id)
         
@@ -1349,7 +1394,7 @@ async def process_sc_index(
             chunks=chunk_count
         )
         
-        # ========== Step 8: 완료 & Webhook ==========
+        # ========== Step 9: 완료 & Webhook ==========
         end_time = datetime.utcnow()
         
         if callback_url:
@@ -1359,24 +1404,23 @@ async def process_sc_index(
                 status="sc_indexed",
                 converted=False,
                 metrics={
-                    "pages": 1, 
-                    "chunks": chunk_count, 
-                    "type": "sc_document",
-                    "was_split": chunk_count > 1,
-                    "total_tokens": total_token_count
+                    "pages": 1,
+                    "chunks": chunk_count,
+                    "sc_metadata": sc_metadata
                 },
                 chunk_count=chunk_count,
                 timestamps={
-                    "start": start_time.isoformat(), 
+                    "start": start_time.isoformat(),
                     "end": end_time.isoformat()
                 },
-                message=f"indexed successfully (SC document {'split into ' + str(chunk_count) + ' chunks' if chunk_count > 1 else 'single chunk'})"
+                message="SC document indexed successfully with structured metadata"
             )
             await send_webhook(callback_url, payload, SHARED_SECRET)
     
     except Exception as e:
         job_state.fail(job_id, str(e))
-        print(f"[SC-INDEX] ❌ Error: {e}")
+        db.update_rag_error(data_id, str(e))
+        print(f"[SC-INDEX] Error: {e}")
         
         if callback_url:
             payload = WebhookPayload(

@@ -355,9 +355,9 @@ class DBConnector:
             
             # 성공 히스토리 로그
             self.insert_ocr_history(data_id, 'S', None)
-            print(f"[DB] ✅ RAG indexing completed for data_id={data_id}")
+            print(f"[DB] RAG indexing completed for data_id={data_id}")
         except Exception as e:
-            print(f"[DB] ❌ update_rag_completed failed: {e}")
+            print(f"[DB] update_rag_completed failed: {e}")
 
     # ==================== 10. RAG 인덱싱 에러 ====================
     def update_rag_error(self, data_id: str | int, error_msg: str):
@@ -380,9 +380,9 @@ class DBConnector:
             
             # 실패 히스토리 로그
             self.insert_ocr_history(data_id, 'F', error_msg)
-            print(f"[DB] ✅ RAG indexing error logged for data_id={data_id}")
+            print(f"[DB] RAG indexing error logged for data_id={data_id}")
         except Exception as e:
-            print(f"[DB] ❌ update_rag_error failed: {e}")
+            print(f"[DB] update_rag_error failed: {e}")
 
     # ==================== 11. SC 문서 조회 (신규 추가) ====================
     def get_sc_document(self, data_id: str | int) -> Optional[Dict[str, Any]]:
@@ -397,15 +397,19 @@ class DBConnector:
                 'sc_id': int,
                 'data_id': str,
                 'preface_text': str,
-                'contents_text': str,
                 'conclusion_text': str,
-                'upt_dt': datetime
+                'upt_dt': datetime,
+                'sc_title': str,
+                'reciever_agency': str,
+                'sc_code': str,
+                'send_date': str,
             }
             문서가 없으면 None 반환
         """
         try:
             sql = """
-            SELECT sc_id, data_id, preface_text, contents_text, conclusion_text, upt_dt
+            SELECT sc_id, data_id, contents_text, conclusion_text, upt_dt,
+            sc_title, receiver_agency, sc_code, send_date
             FROM osk_data_sc
             WHERE data_id = ?
             """
@@ -466,6 +470,93 @@ class DBConnector:
         print(f"[DB] ✅ Combined SC text: {len(combined)} chars from {len(parts)} sections")
         return combined
     
+    def get_sc_document_with_structure(self, data_id: str | int) -> Optional[Dict[str, Any]]:
+        """
+        SC 문서를 구조화된 형태로 반환 (새로운 필드 포함)
+        
+        Args:
+            data_id: 문서 ID
+        
+        Returns:
+            {
+                'metadata': {
+                    'sc_code': str,           # 문서번호
+                    'receiver_agency': str,   # 수신처
+                    'sc_title': str,          # 제목
+                    'send_date': str,         # 발신일
+                    'sender_file_id': str,    # 발신 파일 ID
+                    'sc_id': int,
+                    'data_id': str,
+                    'upt_dt': datetime
+                },
+                'header': str,                # 문서번호 + 수신처 + 제목 + 발신일 조합
+                'contents': str,              # 본문
+                'conclusion': str,            # 맺음말
+                'full_text': str              # 전체 텍스트 (header + contents + conclusion)
+            }
+        """
+        doc = self.get_sc_document(data_id)
+        if not doc:
+            return None
+        
+        # 메타데이터 추출
+        metadata = {
+            'sc_code': (doc.get('sc_code') or '').strip(),
+            'receiver_agency': (doc.get('receiver_agency') or '').strip(),
+            'sc_title': (doc.get('sc_title') or '').strip(),
+            'send_date': (doc.get('send_date') or '').strip(),
+            'sender_file_id': (doc.get('sender_file_id') or '').strip(),
+            'sc_id': doc.get('sc_id'),
+            'data_id': doc.get('data_id'),
+            'upt_dt': doc.get('upt_dt')
+        }
+        
+        # 헤더 구성 (문서번호 + 수신처 + 제목 + 발신일)
+        header_parts = []
+        
+        if metadata['sc_code']:
+            header_parts.append(f"문서번호: {metadata['sc_code']}")
+        
+        if metadata['receiver_agency']:
+            header_parts.append(f"수신처: {metadata['receiver_agency']}")
+        
+        if metadata['sc_title']:
+            header_parts.append(f"제목: {metadata['sc_title']}")
+        
+        if metadata['send_date']:
+            header_parts.append(f"발신일: {metadata['send_date']}")
+        
+        header = "\n".join(header_parts) if header_parts else ""
+        
+        # 본문 및 맺음말 추출
+        contents = (doc.get('contents_text') or '').strip()
+        conclusion = (doc.get('conclusion_text') or '').strip()
+        
+        # 전체 텍스트 조합
+        full_text_parts = []
+        if header:
+            full_text_parts.append(header)
+        if contents:
+            full_text_parts.append(contents)
+        if conclusion:
+            full_text_parts.append(conclusion)
+        
+        full_text = "\n\n".join(full_text_parts)
+        
+        if not full_text:
+            print(f"[DB] ⚠️  SC document has no text content: data_id={data_id}")
+            return None
+        
+        result = {
+            'metadata': metadata,
+            'header': header,
+            'contents': contents,
+            'conclusion': conclusion,
+            'full_text': full_text
+        }
+        
+        return result
+
     def update_file_id_only(self, data_id: str | int, new_file_id: str) -> None:
         """
         osk_data.file_id만 변경. file_folder는 변경하지 않음.
