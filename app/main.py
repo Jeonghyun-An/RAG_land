@@ -13,6 +13,7 @@ from app.api.llama_router import router as llama_router
 from app.api.db_router import router as db_router
 from app.api.java_router import router as java_router  # 운영용
 from app.api.dev_router import router as dev_router    # 개발용
+from app.api.stt_router import router as stt_router  # STT 라우터
 from app.services.embedding_model import get_embedding_model
 get_embedding_model()  # 앱 시작 시 미리 로드
 
@@ -40,6 +41,7 @@ app.include_router(llama_router, prefix=API_BASE)
 app.include_router(db_router, prefix=API_BASE)
 app.include_router(java_router, prefix=API_BASE)  # /llama/java - 운영용
 app.include_router(dev_router, prefix=API_BASE)   # /llama/dev - 개발용
+app.include_router(stt_router, prefix=API_BASE)  # stt 라우터
 
 @app.get(f"{API_BASE}/healthz")
 def healthz():
@@ -49,7 +51,8 @@ def healthz():
             "llama": "LLM 및 RAG 쿼리",
             "db": "DB 조회",
             "java": "Java 연동 (운영)",
-            "dev": "개발/테스트 (로컬)"
+            "dev": "개발/테스트 (로컬)",
+            "stt": "음성-텍스트 변환 (STT)"
         }
     }
 
@@ -59,5 +62,6 @@ def root():
         "message": "Nuclear RAG API",
         "docs": f"{API_BASE}/docs",
         "production_endpoint": f"{API_BASE}/java",
-        "development_endpoint": f"{API_BASE}/dev"
+        "development_endpoint": f"{API_BASE}/dev",
+        "stt_endpoint": f"{API_BASE}/stt"
     }
