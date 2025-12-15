@@ -8,7 +8,7 @@ echo "🎤 Starting STT Service"
 echo "========================================"
 echo "Model: ${STT_MODEL_SIZE:-medium}"
 echo "Device: ${STT_DEVICE:-cuda}"
-echo "Compute: ${STT_COMPUTE_TYPE:-int8}"
+echo "Compute: ${STT_COMPUTE_TYPE:-float16}"
 echo "========================================"
 
 # CUDA 확인

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ==================== 환경 변수 ====================
 MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "medium")  # tiny, base, small, medium, large-v3
 DEVICE = os.getenv("STT_DEVICE", "cuda")  # cuda, cpu
-COMPUTE_TYPE = os.getenv("STT_COMPUTE_TYPE", "int8")  # int8, float16, float32
+COMPUTE_TYPE = os.getenv("STT_COMPUTE_TYPE", "float16")  # int8, float16, float32
 DOWNLOAD_ROOT = os.getenv("HF_HOME", "/models")
 BEAM_SIZE = int(os.getenv("STT_BEAM_SIZE", "5"))
 VAD_FILTER = os.getenv("STT_VAD_FILTER", "true").lower() == "true"
