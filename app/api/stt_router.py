@@ -1,8 +1,3 @@
-# app/api/stt_router.py
-"""
-STT 마이크로서비스 프록시 라우터
-- 프론트엔드에서 /api/stt/* 요청을 stt-whisper 서비스로 전달
-"""
 import os
 import logging
 import httpx
@@ -46,42 +41,15 @@ async def transcribe_audio(
     use_nuclear_context: bool = Form(True),
     return_segments: bool = Form(False),
 ):
-    """
-    음성을 텍스트로 변환 (STT 서비스로 프록시)
-    
-    Parameters:
-    -----------
-    audio : UploadFile
-        오디오 파일
-    language : str
-        언어 코드 (ko, en, auto)
-    task : str
-        transcribe 또는 translate
-    use_nuclear_context : bool
-        원자력 전문 용어 컨텍스트 사용
-    return_segments : bool
-        상세 세그먼트 반환 여부
-    
-    Returns:
-    --------
-    {
-        "text": str,
-        "language": str,
-        "duration": float,
-        "segments": List[dict] (선택)
-    }
-    """
-    
+    """음성을 텍스트로 변환"""
     if not STT_ENABLED:
         raise HTTPException(status_code=503, detail="STT service is disabled")
     
     logger.info(f"[STT] Transcribe request: {audio.filename}, lang={language}")
     
     try:
-        # 오디오 파일 읽기
         audio_content = await audio.read()
         
-        # STT 서비스로 전달
         async with httpx.AsyncClient(timeout=STT_TIMEOUT) as client:
             files = {"audio": (audio.filename, audio_content, audio.content_type)}
             data = {
@@ -105,13 +73,20 @@ async def transcribe_audio(
                 )
             
             result = response.json()
-            logger.info(f"[STT] Success: {len(result.get('text', ''))} chars transcribed")
+            logger.info(f"[STT] Success: {len(result.get('text', ''))} chars")
             
             return JSONResponse(content=result)
             
     except httpx.TimeoutException:
         logger.error("[STT] Request timeout")
-        raise HTTPException(status_code=504, detail="STT service timeout")
+        raise HTTPException(status_code=504, detail="STT request timeout")
+        
+    except httpx.ConnectError as e:
+        logger.error(f"[STT] Connection failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Cannot connect to STT service. Check if stt-whisper container is running."
+        )
         
     except Exception as e:
         logger.error(f"[STT] Transcription failed: {e}", exc_info=True)

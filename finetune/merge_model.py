@@ -65,10 +65,10 @@ try:
     print(f"   Applying LoRA adapter: {LORA_PATH}")
     model = PeftModel.from_pretrained(base_model, LORA_PATH)
     
-    print("✅ Models loaded successfully")
+    print(" Models loaded successfully")
 
 except Exception as e:
-    print(f"❌ Failed to load models: {e}")
+    print(f" Failed to load models: {e}")
     import traceback
     traceback.print_exc()
     sys.exit(1)
@@ -81,10 +81,10 @@ try:
     # LoRA 가중치를 베이스 모델에 병합
     merged_model = model.merge_and_unload()
     
-    print("✅ Merge completed successfully")
+    print(" Merge completed successfully")
 
 except Exception as e:
-    print(f"❌ Failed to merge models: {e}")
+    print(f" Failed to merge models: {e}")
     import traceback
     traceback.print_exc()
     sys.exit(1)
@@ -123,16 +123,16 @@ try:
     with open(metadata_file, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
     
-    print("✅ Model saved successfully")
+    print(" Model saved successfully")
 
 except Exception as e:
-    print(f"❌ Failed to save model: {e}")
+    print(f" Failed to save model: {e}")
     import traceback
     traceback.print_exc()
     sys.exit(1)
 
 # ==================== 검증 ====================
-print("\n🔍 Verifying saved model...")
+print("\n Verifying saved model...")
 
 try:
     # 저장된 모델이 로드 가능한지 확인
@@ -147,16 +147,16 @@ try:
         trust_remote_code=True
     )
     
-    print("✅ Verification successful")
+    print(" Verification successful")
     
     # 모델 크기 정보
     total_params = sum(p.numel() for p in test_model.parameters())
-    print(f"\n📊 Merged Model Info:")
+    print(f"\n Merged Model Info:")
     print(f"   Total parameters: {total_params:,}")
     print(f"   Model size: ~{total_params * 2 / 1e9:.2f} GB (bfloat16)")
     
     # 간단한 테스트
-    print("\n🧪 Quick test:")
+    print("\n Quick test:")
     test_input = "원자력 안전의 중요성은?"
     prompt = f"""<|im_start|>system
 당신은 원자력 안전 전문가입니다.<|im_end|>
@@ -188,9 +188,9 @@ except Exception as e:
 
 # ==================== 완료 ====================
 print("\n" + "="*80)
-print("✅ 병합 완료!")
+print("병합 완료!")
 print("="*80)
-print(f"\n📂 출력 경로: {MERGED_OUTPUT_DIR}")
+print(f"\n출력 경로: {MERGED_OUTPUT_DIR}")
 print("\n다음 단계:")
 print("1. vLLM 설정에서 MODEL_NAME을 변경:")
 print(f"   MODEL_NAME={MERGED_OUTPUT_DIR}")
