@@ -1340,8 +1340,8 @@ def ask_question(req: AskReq):
             re_s = hit.get("re_score")
             emb_s = hit.get("score", 0.0)
             if re_s is not None:
-                return (re_s >= thr) or (emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.45")))
-            return emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.45"))
+                return (re_s >= thr) or (emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.55")))
+            return emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.55"))
 
         # Rerank
         topk = rerank(query_for_search, rerank_pool, top_k=configured_top_k)
