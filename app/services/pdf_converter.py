@@ -258,7 +258,7 @@ def _hwp_to_pdf_via_text(src: Path, out: Path):
         result = subprocess.run(
             ["hwp5txt", "--output", txt_path, str(src)],
             capture_output=True,
-            timeout=60,
+            timeout=120,
             text=True
         )
         

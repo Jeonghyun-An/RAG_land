@@ -7,7 +7,7 @@ from openai import OpenAI
 
 DEFAULT_BASE = os.getenv("OPENAI_BASE_URL", "http://vllm-a4000:8000/v1")
 API_KEY = os.getenv("OPENAI_API_KEY", "not-used")
-OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "60"))  # 초
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "180"))  # 초
 
 def _client(base_url: Optional[str] = None) -> OpenAI:
     return OpenAI(base_url=base_url or DEFAULT_BASE, api_key=API_KEY, timeout=OPENAI_TIMEOUT)

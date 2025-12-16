@@ -69,7 +69,7 @@ def test_vllm_api(base_url: str):
             f"{base_url}/v1/chat/completions",
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=60
+            timeout=120
         )
         
         if response.status_code == 200:
@@ -108,7 +108,7 @@ def test_vllm_api(base_url: str):
             response = requests.post(
                 f"{base_url}/v1/chat/completions",
                 json=payload,
-                timeout=60
+                timeout=120
             )
             
             if response.status_code == 200:

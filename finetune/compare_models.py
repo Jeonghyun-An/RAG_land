@@ -101,7 +101,7 @@ def query_rag_api(base_url: str, query: str, doc_filter: List[str] = None) -> Di
             endpoint,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=60
+            timeout=120
         )
         response.raise_for_status()
         return response.json()
