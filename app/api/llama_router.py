@@ -84,6 +84,12 @@ RESPONSE_MODE_CONFIG = {
         "context_style": "detailed",  # 상세한 컨텍스트
     }
 }
+# 모델별 최대 컨텍스트 길이 (토큰 단위)
+MODEL_MAX_CONTEXT = {
+    "qwen2.5-14b": 16384,
+    "qwen2.5-7b": 16384,
+    "default": 8192,
+}
 
 # --- 폴백 전용: pages 정규화 도우미 ---------------------------------
 def _normalize_pages_for_chunkers(pages):
@@ -608,6 +614,77 @@ def _detect_lang(text: str) -> str:
 
 def _t(lang: str, ko: str, en: str) -> str:
     return ko if lang == "ko" else en
+
+def _calculate_safe_max_tokens(
+    prompt: str,
+    model_name: str,
+    requested_max_tokens: int,
+    safety_margin: int = 800
+) -> int:
+    """
+    입력 프롬프트 길이를 고려하여 안전한 max_tokens 계산
+    
+    Args:
+        prompt: 입력 프롬프트 텍스트
+        model_name: 모델 이름
+        requested_max_tokens: 요청된 max_tokens
+        safety_margin: 안전 마진 (토큰)
+    
+    Returns:
+        조정된 max_tokens
+    """
+    # 모델 최대 컨텍스트 가져오기
+    max_context = MODEL_MAX_CONTEXT.get(model_name, MODEL_MAX_CONTEXT["default"])
+    
+    # 프롬프트 토큰 수 추정 (보수적)
+    korean_chars = len([c for c in prompt if '\uac00' <= c <= '\ud7a3'])
+    total_chars = len(prompt)
+    korean_ratio = korean_chars / total_chars if total_chars > 0 else 0
+    
+    # 보수적 추정 (실제 측정 데이터 반영)
+    # 실제: 20620자 → 12390 tokens = 1.66 chars/token
+    if korean_ratio > 0.5:
+        chars_per_token = 1.5  # 한글 중심 (기존 1.8 → 1.5)
+    elif korean_ratio > 0.2:
+        chars_per_token = 1.7  # 혼합 (기존 2.5 → 1.7)
+    else:
+        chars_per_token = 3.0  # 영어 중심 (기존 3.5 → 3.0)
+    estimated_prompt_tokens = int(total_chars / chars_per_token)
+    # 시스템 프롬프트 오버헤드 추가 (약 200~400 tokens)
+    system_overhead = 300
+    estimated_total_tokens = estimated_prompt_tokens + system_overhead
+    
+    # 사용 가능한 토큰 계산
+    available_tokens = max_context - estimated_total_tokens - safety_margin
+    
+    # 최소/최대 제한 적용
+    min_tokens = 512
+    # 최종 안전 토큰 수
+    if available_tokens < min_tokens:
+        safe_max_tokens = min_tokens
+        logger.warning(
+            f"[token_calc] INSUFFICIENT SPACE! "
+            f"est_tokens={estimated_total_tokens}, "
+            f"max_context={max_context}, "
+            f"available={available_tokens}, "
+            f"using min={min_tokens}"
+        )
+    else:
+        safe_max_tokens = min(requested_max_tokens, available_tokens)
+    
+    logger.info(
+        f"[token_calc] prompt_len={total_chars}, "
+        f"korean_ratio={korean_ratio:.2f}, "
+        f"chars_per_token={chars_per_token:.2f}, "
+        f"est_base={estimated_prompt_tokens}, "
+        f"system_overhead={system_overhead}, "
+        f"est_total={estimated_total_tokens}, "
+        f"available={available_tokens}, "
+        f"requested={requested_max_tokens}, "
+        f"safe={safe_max_tokens}"
+    )
+    
+    return safe_max_tokens
 
 # def _build_prompt(context: str, question: str, lang: str) -> str:
 #     if lang == "ko":
@@ -1147,7 +1224,7 @@ async def upload_document(
 @router.post("/ask", response_model=AskResp)
 def ask_question(req: AskReq):
     try:
-        # 🆕 response_type에 따른 파라미터 설정
+        # response_type에 따른 파라미터 설정
         mode_config = RESPONSE_MODE_CONFIG.get(req.response_type, RESPONSE_MODE_CONFIG["short"])
         configured_top_k = mode_config["top_k"] 
         max_tokens = mode_config["max_tokens"]
@@ -1263,8 +1340,8 @@ def ask_question(req: AskReq):
             re_s = hit.get("re_score")
             emb_s = hit.get("score", 0.0)
             if re_s is not None:
-                return (re_s >= thr) or (emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.28")))
-            return emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.28"))
+                return (re_s >= thr) or (emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.45")))
+            return emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.45"))
 
         # Rerank
         topk = rerank(query_for_search, rerank_pool, top_k=configured_top_k)
@@ -1286,7 +1363,7 @@ def ask_question(req: AskReq):
         # 로그
         try:
             dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
-            logger.info("[ask] rerank-top3 (re,emb)=%s | filtered=%d/%d | THRESH=%.3f",
+            logger.info("[ask] rerank (re,emb)=%s | filtered=%d/%d | THRESH=%.3f",
                         dbg, len(filtered_topk), len(topk), THRESH)
         except Exception as e:
             logger.warning("[ask] debug summarize failed: %s", e)
@@ -1305,7 +1382,7 @@ def ask_question(req: AskReq):
                 used_chunks=0,
                 sources=[]
             )
-
+            
         # 5) 컨텍스트/출처 구성
         context_lines = []
         sources = []
@@ -1325,24 +1402,39 @@ def ask_question(req: AskReq):
 
         # ========== 기존 로직 끝 ==========
 
-        # 6) 프롬프트 생성 (🆕 response_type 반영)
+        # 6) 프롬프트 생성 (response_type 반영)
         prompt = _build_prompt(
             context=context,
             question=req.question,
             lang=lang,
             response_type=req.response_type
         )
+        
+        # 동적 max_tokens 계산
+        safe_max_tokens = _calculate_safe_max_tokens(
+            prompt=prompt,
+            model_name=req.model_name,
+            requested_max_tokens=max_tokens,
+            safety_margin=800
+        )
 
-        # 7) 모델 호출 (🆕 파라미터 전달)
+        # 7) 모델 호출 (파라미터 전달)
         answer = generate_answer_unified(
             prompt=prompt,
             name_or_id=req.model_name,
-            max_tokens=max_tokens,
+            max_tokens=safe_max_tokens,
             temperature=temperature,
             top_p=top_p          
         )
         
-        answer = _clean_repetitive_answer(answer)
+        # answer = _clean_repetitive_answer(answer)
+        # 🆕 디버깅 로그
+        actual_chars = len(answer)
+        estimated_tokens = int(actual_chars / 0.7)  # 한글 기준
+        logger.info(
+            f"[ask] Generated: {actual_chars} chars, "
+            f"~{estimated_tokens} tokens, max={max_tokens}"
+        )
 
         return AskResp(
             answer=answer,
