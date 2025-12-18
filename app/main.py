@@ -13,9 +13,15 @@ from app.api.llama_router import router as llama_router
 from app.api.db_router import router as db_router
 from app.api.java_router import router as java_router  # 운영용
 from app.api.dev_router import router as dev_router    # 개발용
-from app.api.stt_router import router as stt_router  # STT 라우터
+from app.api.stt_router import router as stt_router    # STT 라우터
+
+# ========== 모델 미리 로드 (앱 시작 시) ==========
 from app.services.embedding_model import get_embedding_model
-get_embedding_model()  # 앱 시작 시 미리 로드
+from app.services.reranker import preload_reranker
+
+print("[STARTUP] Loading models...")
+get_embedding_model()  # 임베딩 모델 로드
+preload_reranker()     # 리랭커 모델 로드
 
 API_BASE = "/llama"
 
@@ -41,7 +47,7 @@ app.include_router(llama_router, prefix=API_BASE)
 app.include_router(db_router, prefix=API_BASE)
 app.include_router(java_router, prefix=API_BASE)  # /llama/java - 운영용
 app.include_router(dev_router, prefix=API_BASE)   # /llama/dev - 개발용
-app.include_router(stt_router, prefix=API_BASE)  # stt 라우터
+app.include_router(stt_router, prefix=API_BASE)   # /llama/stt - STT
 
 @app.get(f"{API_BASE}/healthz")
 def healthz():

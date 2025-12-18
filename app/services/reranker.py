@@ -79,3 +79,23 @@ def rerank(query: str, cands: List[Dict[str, Any]], top_k: int = 5) -> List[Dict
     # 내림차순 정렬
     cands.sort(key=lambda x: x.get("re_score", -1e9), reverse=True)
     return cands[:max(1, top_k)]
+
+def preload_reranker():
+    """
+    앱 시작 시 리랭커 모델을 미리 로드합니다.
+    첫 요청 시 발생하는 모델 로딩 지연을 제거합니다.
+    """
+    for backend in RERANKER_BACKENDS:
+        try:
+            if backend == "flag":
+                model = _load_flag_reranker()
+                if model:
+                    print(f"[RERANK] FLAG reranker preloaded")
+            elif backend == "ce":
+                model = _load_ce()
+                if model:
+                    print(f"[RERANK] CE reranker preloaded")
+        except Exception as e:
+            print(f"[RERANK] Failed to preload {backend}: {e}")
+    
+    print("[RERANK] Reranker preload complete")
