@@ -48,7 +48,7 @@ MILVUS_VARCHAR_MAX = int(os.getenv("MILVUS_VARCHAR_MAX", "8192"))
 # 영어: 1글자 ≈ 1바이트, 한글: 1글자 ≈ 3바이트
 # 5500자는 영어 문서 기준으로 충분히 안전한 크기
 # 실제 임베딩 전 단계에서 바이트 기준으로 다시 한번 체크됨
-SAFE_TEXT_LIMIT = int(os.getenv("RAG_SAFE_TEXT_LIMIT", "5500"))
+SAFE_TEXT_LIMIT = int(os.getenv("RAG_SAFE_TEXT_LIMIT", "2500"))
 
 def _split_by_limit(text: str, limit: int = SAFE_TEXT_LIMIT) -> list[str]:
     """
@@ -95,7 +95,7 @@ class EnglishTechnicalChunker:
     def __init__(
         self,
         encoder_fn: Callable,
-        target_tokens: int = 800,
+        target_tokens: int = 500,
         overlap_tokens: int = 0,
         cross_page_merge: bool = True,
     ):
@@ -103,7 +103,7 @@ class EnglishTechnicalChunker:
         self.target_tokens = target_tokens
         self.overlap_tokens = overlap_tokens  # v2에선 0 권장
         self.min_chunk_tokens = 100
-        self.max_chunk_tokens = int(target_tokens * 2.25)  # ≈1800
+        self.max_chunk_tokens = int(target_tokens * 2.25)  # ≈1125
         self.cross_page_merge = cross_page_merge
 
     # -------- 외부 진입점 --------

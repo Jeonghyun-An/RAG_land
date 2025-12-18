@@ -53,7 +53,7 @@ def build_chunks(
         try:
             from app.services.english_technical_chunker import english_technical_chunk_pages
             if job_id: print(f"[CHUNK-{job_id}] Trying English technical chunker...")
-            en_target_tokens = int(os.getenv("RAG_EN_TARGET_TOKENS", "800"))
+            en_target_tokens = int(os.getenv("RAG_EN_TARGET_TOKENS", "500"))
             ch = english_technical_chunk_pages(pages_std, enc, en_target_tokens, overlap_tokens, layout_map)
             if _nonempty(ch):
                 if job_id: print(f"[CHUNK-{job_id}] English technical chunker -> {len(ch)} chunks")
