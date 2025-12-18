@@ -78,7 +78,7 @@ RESPONSE_MODE_CONFIG = {
     },
     "long": {
         "top_k": 10,
-        "max_tokens": 2048,
+        "max_tokens": 3096,
         "top_p": 0.92,
         "temperature": 0.1,  # 약간의 다양성
         "context_style": "detailed",  # 상세한 컨텍스트
