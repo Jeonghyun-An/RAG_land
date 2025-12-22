@@ -7,14 +7,15 @@ import hashlib, tempfile
 import os, re
 import uuid
 from urllib.parse import unquote, quote
-from typing import List, Optional,Literal
+from typing import Dict, List, Optional,Literal,Any
 from starlette.responses import StreamingResponse
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import asyncio, json
 import numpy as np
 import logging
+
 logger = logging.getLogger("uvicorn.error")  # uvicorn 출력에 섞기
 
 from sse_starlette.sse import EventSourceResponse  # 요구사항: sse-starlette
@@ -90,6 +91,17 @@ MODEL_MAX_CONTEXT = {
     "qwen2.5-7b": 16384,
     "default": 8192,
 }
+# 리랭킹 설정
+RERANKER_BATCH_SIZE = int(os.getenv("RERANKER_BATCH_SIZE", "64"))
+RAG_ARTICLE_BOOST = float(os.getenv("RAG_ARTICLE_BOOST", "2.5"))
+
+# 컨텍스트 토큰 예산
+CONTEXT_BUDGET_TOKENS = int(os.getenv("RAG_CONTEXT_BUDGET_TOKENS", "1024"))
+
+# 적응형 임계값 설정
+USE_ADAPTIVE_THRESHOLD = os.getenv("RAG_USE_ADAPTIVE_THRESHOLD", "1") == "1"
+BASE_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.25"))
+EMB_BACKUP_THRESHOLD = float(os.getenv("RAG_EMB_BACKUP_THR", "0.55"))
 
 # --- 폴백 전용: pages 정규화 도우미 ---------------------------------
 def _normalize_pages_for_chunkers(pages):
@@ -1079,6 +1091,89 @@ def _maybe_translate_query_for_search(question: str, lang: str) -> str:
         logger.debug(f"[translate] {q[:50]} → {translated[:50]}")
     
     return translated
+# 적응형 임계값 계산
+def _calculate_adaptive_threshold(
+    candidates: List[Dict[str, Any]],
+    top_k: int,
+    base_threshold: float = BASE_SCORE_THRESHOLD,
+) -> float:
+    """
+    상위 top_k개의 리랭커 스코어 분포를 기반으로 적응형 임계값 계산
+    
+    로직:
+    - 평균 - 0.5*표준편차를 임계값으로 사용
+    - 최소값은 base_threshold (0.25)로 제한
+    - 최대값은 0.5로 제한 (너무 높은 임계값 방지)
+    """
+    re_scores = [
+        c.get("re_score", 0)
+        for c in candidates[:top_k]
+        if c.get("re_score") is not None
+    ]
+
+    if not re_scores or len(re_scores) < 2:
+        logger.info(f"[ADAPTIVE_THRESH] Not enough re_scores, using base={base_threshold}")
+        return base_threshold
+
+    mean_score = float(np.mean(re_scores))
+    std_score = float(np.std(re_scores))
+
+    # 평균 - 0.5*표준편차 (너무 낮아지지 않도록)
+    adaptive_thresh = mean_score - 0.5 * std_score
+
+    # 범위 제한: [base_threshold, 0.5]
+    adaptive_thresh = max(base_threshold, min(0.5, adaptive_thresh))
+
+    logger.info(
+        f"[ADAPTIVE_THRESH] mean={mean_score:.3f}, std={std_score:.3f}, "
+        f"adaptive={adaptive_thresh:.3f}, base={base_threshold}"
+    )
+
+    return adaptive_thresh
+
+
+# 컨텍스트 토큰 예산 적용
+def _apply_context_budget(
+    chunks: List[Dict[str, Any]],
+    budget_tokens: int = CONTEXT_BUDGET_TOKENS,
+) -> List[Dict[str, Any]]:
+    """
+    누적 토큰이 예산을 초과하지 않도록 청크 필터링
+    
+    Args:
+        chunks: 필터링된 청크 리스트
+        budget_tokens: 최대 토큰 예산
+    
+    Returns:
+        예산 내에 들어오는 청크 리스트
+    """
+    if budget_tokens <= 0:
+        return chunks
+
+    result = []
+    total_tokens = 0
+
+    for c in chunks:
+        # 대략적 토큰 추정 (한글: 1글자=1토큰, 영어: 4글자=1토큰)
+        chunk_text = c.get("chunk", "")
+        estimated_tokens = len(chunk_text) // 3  # 보수적 추정
+
+        if total_tokens + estimated_tokens > budget_tokens:
+            logger.info(
+                f"[CONTEXT_BUDGET] Budget exhausted: {total_tokens}/{budget_tokens} tokens, "
+                f"stopping at chunk {len(result)}/{len(chunks)}"
+            )
+            break
+
+        result.append(c)
+        total_tokens += estimated_tokens
+
+    logger.info(
+        f"[CONTEXT_BUDGET] Final: {len(result)} chunks, ~{total_tokens} tokens "
+        f"(budget={budget_tokens})"
+    )
+
+    return result
 # ---------- Routes ----------
 @router.get("/test")
 def test():
@@ -1233,8 +1328,6 @@ def ask_question(req: AskReq):
         
         logger.info(f"[ask] response_type={req.response_type}, max_tokens={max_tokens}")
 
-        # ========== 기존 로직 시작 (수정 없음) ==========
-        
         # 0) 모델/스토어 준비
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
@@ -1248,7 +1341,7 @@ def ask_question(req: AskReq):
         logger.info("[ask] q_search=%s", query_for_search[:120])
 
         # 초기 넉넉히 검색
-        raw_topk = max(40, configured_top_k * 6)
+        raw_topk = max(40, configured_top_k * 8)
         
         # 선택 문서가 있을 경우 doc 필터를 걸어서 검색하는 헬퍼
         def _search_with_optional_filter(q: str, topk: int):
@@ -1318,7 +1411,6 @@ def ask_question(req: AskReq):
             c["kw_boost"] = _kw_boost_score(c)
 
         # 조항 검색 부스트
-        ARTICLE_BOOST = float(os.getenv("RAG_ARTICLE_BOOST", "2.5"))
         if lang == "ko":
             m = re.search(r"제\s*(\d+)\s*조", req.question)
             if m:
@@ -1328,20 +1420,11 @@ def ask_question(req: AskReq):
                     sec = c.get("section") or ""
                     txt = c.get("chunk") or ""
                     if patt.search(sec) or patt.search(txt):
-                        c["kw_boost"] = c.get("kw_boost", 0.0) + ARTICLE_BOOST
+                        c["kw_boost"] = c.get("kw_boost", 0.0) + RAG_ARTICLE_BOOST
 
         cands.sort(key=lambda x: (x.get("kw_boost", 0), x.get("score", 0.0)), reverse=True)
-        rerank_pool = cands[:max(30, configured_top_k * 6)]
-
-        # 임계값 설정
-        THRESH = float(os.getenv("RAG_SCORE_THRESHOLD", "0.1"))
-
-        def _is_confident(hit: dict, thr: float) -> bool:
-            re_s = hit.get("re_score")
-            emb_s = hit.get("score", 0.0)
-            if re_s is not None:
-                return (re_s >= thr) or (emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.55")))
-            return emb_s >= float(os.getenv("RAG_EMB_BACKUP_THR", "0.55"))
+        rerank_pool_size = max(RERANKER_BATCH_SIZE, configured_top_k * 8)
+        rerank_pool = cands[:rerank_pool_size]
 
         # Rerank
         topk = rerank(query_for_search, rerank_pool, top_k=configured_top_k)
@@ -1354,34 +1437,62 @@ def ask_question(req: AskReq):
                 sources=[]
             )
 
-        # 임계값 필터링
+        # 적응형 임계값 계산
+        if USE_ADAPTIVE_THRESHOLD:
+            threshold = _calculate_adaptive_threshold(
+                topk, configured_top_k, BASE_SCORE_THRESHOLD
+            )
+        else:
+            threshold = BASE_SCORE_THRESHOLD
+            logger.info(f"[ASK] Using fixed threshold: {threshold}")
+
+        # 4) 임계값 필터링
+        def _is_confident(hit: dict, thr: float) -> bool:
+            re_s = hit.get("re_score")
+            emb_s = hit.get("score", 0.0)
+            if re_s is not None:
+                return (re_s >= thr) or (emb_s >= EMB_BACKUP_THRESHOLD)
+            return emb_s >= EMB_BACKUP_THRESHOLD
+
         filtered_topk = []
         for c in topk:
-            if _is_confident(c, THRESH):
+            if _is_confident(c, threshold):
                 filtered_topk.append(c)
         
         # 로그
         try:
             dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
-            logger.info("[ask] rerank (re,emb)=%s | filtered=%d/%d | THRESH=%.3f",
-                        dbg, len(filtered_topk), len(topk), THRESH)
+            logger.info(
+                f"[ASK] Rerank top3 (re_score, emb_score): {dbg} | "
+                f"filtered: {len(filtered_topk)}/{len(topk)} | "
+                f"threshold={threshold:.3f}"
+            )
         except Exception as e:
-            logger.warning("[ask] debug summarize failed: %s", e)
-        
+            logger.warning(f"[ASK] Debug log failed: {e}")
+
         if not filtered_topk:
             try:
                 dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
-                logger.info("[ask] LOW-CONF; all chunks filtered | top3 (re,emb)=%s | q_search=%s",
-                    dbg, query_for_search[:120])
+                logger.warning(
+                    f"[ASK] ALL CHUNKS FILTERED | top3: {dbg} | "
+                    f"threshold={threshold:.3f} | q_search={query_for_search[:80]}"
+                )
             except Exception as e:
-                logger.warning(f"[ask] debug print failed: {e}")
+                logger.warning(f"[ASK] Debug log failed: {e}")
+
             return AskResp(
-                answer=_t(lang,
-                          "문서에서 해당 질문에 대한 확실한 근거를 찾기 어렵습니다.",
-                          "It is hard to find a definitive answer to this question in the documents."),
+                answer=_t(
+                    lang,
+                    "문서에서 해당 질문에 대한 확실한 답변을 찾기 어렵습니다.",
+                    "Cannot find a definitive answer in the documents.",
+                ),
                 used_chunks=0,
-                sources=[]
+                sources=[],
             )
+
+        # 컨텍스트 토큰 예산 적용
+        filtered_topk = _apply_context_budget(filtered_topk, CONTEXT_BUDGET_TOKENS)
+
             
         # 5) 컨텍스트/출처 구성
         context_lines = []
@@ -1428,7 +1539,7 @@ def ask_question(req: AskReq):
         )
         
         # answer = _clean_repetitive_answer(answer)
-        # 🆕 디버깅 로그
+        # 디버깅 로그
         actual_chars = len(answer)
         estimated_tokens = int(actual_chars / 0.7)  # 한글 기준
         logger.info(

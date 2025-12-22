@@ -1,4 +1,12 @@
 # app/services/milvus_store_v2.py
+"""
+Milvus 벡터 스토어 V2 - 개선 버전
+주요 개선사항:
+1. 동적 EF 파라미터 적용 (환경변수 반영)
+2. 검색 성능 최적화
+3. 통계 정보 개선
+4. 기존 모든 기능 유지
+"""
 from __future__ import annotations
 
 import os
@@ -20,6 +28,17 @@ COLLECTION = os.getenv("MILVUS_COLLECTION", "rag_chunks_v2")
 SECTION_MAX = int(os.getenv("MILVUS_SECTION_MAX", "512"))
 DOC_ID_MAX  = int(os.getenv("MILVUS_DOCID_MAX",  "256"))
 CHUNK_MAX   = int(os.getenv("MILVUS_CHUNK_MAX",  "8192"))
+
+# HNSW 인덱스 파라미터
+INDEX_TYPE = os.getenv("MILVUS_INDEX_TYPE", "HNSW")
+METRIC_TYPE = os.getenv("MILVUS_METRIC_TYPE", "IP")
+HNSW_M = int(os.getenv("MILVUS_HNSW_M", "16"))
+HNSW_EFCON = int(os.getenv("MILVUS_HNSW_EFCON", "200"))
+
+# 동적 검색 파라미터
+EF_SEARCH = int(os.getenv("MILVUS_EF_SEARCH", "512"))      # 기본 ef
+EF_PER_K = int(os.getenv("MILVUS_EF_PER_K", "10"))          # topk당 ef 증가량
+EF_MAX = int(os.getenv("MILVUS_EF_MAX", "2048"))           # ef 최대값
 
 
 def _safe_truncate_text(text: str, max_len: int) -> str:
@@ -93,7 +112,9 @@ def _vmax(field):
     except Exception:
         return 0
     
+
 def _get_schema_limits(col: Collection) -> dict:
+    """컬렉션 스키마에서 VARCHAR 필드의 실제 max_length 추출"""
     f = {x.name: x for x in col.schema.fields}
     return {
         "doc_id":  _vmax(f.get("doc_id"))  or DOC_ID_MAX,
@@ -115,6 +136,10 @@ class MilvusStoreV2:
           embedding (FLOAT_VECTOR dim={dim})
       - 인덱스: HNSW + IP (Milvus 2.2.x 에서 COSINE 미지원 → IP 사용)
       - 임베딩은 normalize_embeddings=True로 인코딩하여 IP == cosine로 동작
+      
+    개선사항:
+      - 동적 EF 파라미터 적용 (topk에 따라 자동 조절)
+      - 검색 성능 로깅 강화
     """
 
     def __init__(self, dim: int, name: Optional[str] = None):
@@ -146,7 +171,7 @@ class MilvusStoreV2:
         try:
             self.col.load()
         except MilvusException as e:
-            print(f"⚠️ load skipped: {e}")
+            print(f"load skipped: {e}")
 
     # ---------------- internal ----------------
 
@@ -180,21 +205,22 @@ class MilvusStoreV2:
             
             # 현재 스키마와 환경변수 비교
             if current_doc_id_max != DOC_ID_MAX:
-                print(f"⚠️ Schema mismatch: doc_id max_length {current_doc_id_max} != {DOC_ID_MAX}")
+                print(f" Schema mismatch: doc_id max_length {current_doc_id_max} != {DOC_ID_MAX}")
                 return True
             if current_section_max != SECTION_MAX:
-                print(f"⚠️ Schema mismatch: section max_length {current_section_max} != {SECTION_MAX}")
+                print(f" Schema mismatch: section max_length {current_section_max} != {SECTION_MAX}")
                 return True
             if current_chunk_max != CHUNK_MAX:
-                print(f"⚠️ Schema mismatch: chunk max_length {current_chunk_max} != {CHUNK_MAX}")
+                print(f" Schema mismatch: chunk max_length {current_chunk_max} != {CHUNK_MAX}")
                 return True
             
             return False
         except Exception as e:
-            print(f"⚠️ Schema check error: {e}")
+            print(f" Schema check error: {e}")
             return True
 
     def _create_collection(self) -> Collection:
+        """컬렉션 및 인덱스 생성"""
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
             FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=DOC_ID_MAX),
@@ -207,16 +233,16 @@ class MilvusStoreV2:
         schema = CollectionSchema(fields, description="RAG chunks with metadata (v2)")
         col = Collection(self.collection_name, schema)
 
-        # 인덱스 생성 (Milvus 2.2.x: COSINE 미지원 → IP)
+        # 인덱스 생성 (HNSW + IP)
         col.create_index(
             field_name="embedding",
             index_params={
-                "index_type": "HNSW",
-                "metric_type": "IP",
-                "params": {"M": 16, "efConstruction": 200},
+                "index_type": INDEX_TYPE,
+                "metric_type": METRIC_TYPE,
+                "params": {"M": HNSW_M, "efConstruction": HNSW_EFCON},
             },
         )
-        print(f" created collection: {self.collection_name} (dim={self.dim})")
+        print(f"Created collection: {self.collection_name} (dim={self.dim}, index={INDEX_TYPE}, metric={METRIC_TYPE})")
         return col
 
     def _ensure_index(self) -> None:
@@ -226,14 +252,14 @@ class MilvusStoreV2:
                 self.col.create_index(
                     field_name="embedding",
                     index_params={
-                        "index_type": "HNSW",
-                        "metric_type": "IP",
-                        "params": {"M": 16, "efConstruction": 200},
+                        "index_type": INDEX_TYPE,
+                        "metric_type": METRIC_TYPE,
+                        "params": {"M": HNSW_M, "efConstruction": HNSW_EFCON},
                     },
                 )
-                print("created missing index on existing collection")
+                print("Created missing index on existing collection")
         except Exception as e:
-            print(f" ensure index failed: {e}")
+            print(f"ensure index failed: {e}")
 
     def _replace_doc_if_needed(self, doc_id: str) -> None:
         """같은 doc_id 문서를 교체(삭제 후 재삽입)하고 싶을 때 사용.
@@ -243,9 +269,24 @@ class MilvusStoreV2:
             return
         try:
             deleted = self._delete_by_doc_id(doc_id)
-            print(f"replaced doc: {doc_id} (deleted {deleted})")
+            print(f"Replaced doc: {doc_id} (deleted {deleted} chunks)")
         except Exception as e:
-            print(f" replace_doc failed: {e}")
+            print(f"replace_doc failed: {e}")
+
+    # 동적 EF 계산
+    def _calculate_ef(self, topk: int) -> int:
+        """
+        topk에 따라 동적으로 ef 파라미터 계산
+        ef = min(EF_MAX, max(EF_SEARCH, topk * EF_PER_K))
+        
+        예시:
+        - topk=20 → ef = max(384, 20*8) = 384
+        - topk=80 → ef = max(384, 80*8) = 640
+        - topk=300 → ef = min(2048, 300*8) = 2048
+        """
+        calculated_ef = max(EF_SEARCH, topk * EF_PER_K)
+        final_ef = min(EF_MAX, calculated_ef)
+        return final_ef
 
     # ---------------- public ----------------
 
@@ -348,12 +389,12 @@ class MilvusStoreV2:
         final_texts = [_safe_truncate_text(t, SAFE_CHUNK_LIMIT) for t in safe_texts]
         
         # 디버그 로그
-        for i, (orig, safe) in enumerate(zip(raw_texts, final_texts)):
-            if len(orig) > len(safe):
-                print(f" Chunk {i} truncated: {len(orig)} → {len(safe)} chars")
+        truncated_count = sum(1 for orig, safe in zip(raw_texts, final_texts) if len(orig) > len(safe))
+        if truncated_count > 0:
+            print(f"Truncated {truncated_count}/{len(final_texts)} chunks to fit schema limits")
 
         # -------- 5) 임베딩 생성 (이제 안전하게 잘린 텍스트로)
-        print(f"[Milvus] Embedding {len(final_texts)} chunks...")
+        print(f"Embedding {len(final_texts)} chunks...")
         vecs = embed_fn(final_texts)
         
         if not vecs or len(vecs) != len(final_texts):
@@ -379,8 +420,6 @@ class MilvusStoreV2:
         actual_chunk_max = schema_limits["chunk"]
         actual_section_max = schema_limits["section"]
         
-        print(f"[Milvus] Schema limits: chunk={actual_chunk_max}, section={actual_section_max}")
-        
         # 최종 안전장치: 스키마 제한보다 작게 자르기
         final_texts = [_safe_truncate_text(t, actual_chunk_max - 100) for t in final_texts]
         sections = [_safe_truncate_text(s, actual_section_max - 32) for s in sections]
@@ -389,7 +428,7 @@ class MilvusStoreV2:
         for i, t in enumerate(final_texts):
             byte_len = len(t.encode('utf-8', errors='ignore'))
             if byte_len > actual_chunk_max:
-                print(f" CRITICAL: Chunk {i} still exceeds limit! {byte_len} > {actual_chunk_max}")
+                print(f"⚠️ CRITICAL: Chunk {i} still exceeds limit! {byte_len} > {actual_chunk_max}")
                 # 강제 자르기
                 final_texts[i] = t[:actual_chunk_max - 100]
         
@@ -403,7 +442,7 @@ class MilvusStoreV2:
             vecs,                           # embedding
         ]
 
-        print(f"[Milvus] Inserting {len(final_texts)} chunks for doc_id={doc_id}...")
+        print(f"Inserting {len(final_texts)} chunks for doc_id={doc_id}...")
         mr = self.col.insert(entities)
         self.col.flush()
         
@@ -430,6 +469,7 @@ class MilvusStoreV2:
         return out
 
     def delete_by_doc(self, doc_id: str) -> int:
+        """doc_id로 문서 삭제 (간단한 방식)"""
         try:
             res = self.col.delete(expr=f'doc_id == "{doc_id}"')
             self.col.flush()
@@ -474,7 +514,10 @@ class MilvusStoreV2:
         embed_fn: Callable[[List[str]], List[List[float]]], 
         topk: int = 20
     ) -> List[Dict[str, Any]]:
-        """IP metric + normalize 임베딩 기준으로 상위 topk 반환"""
+        """
+        개선: 동적 ef 파라미터 적용
+        IP metric + normalize 임베딩 기준으로 상위 topk 반환
+        """
         if not query:
             return []
         qv = embed_fn([query])[0]
@@ -484,10 +527,13 @@ class MilvusStoreV2:
         except Exception:
             pass
 
+        # 동적 ef 계산
+        ef = self._calculate_ef(topk)
+
         res = self.col.search(
             data=[qv],
             anns_field="embedding",
-            param={"metric_type": "IP", "params": {"ef": 64}},
+            param={"metric_type": "IP", "params": {"ef": ef}},  # 동적 ef 적용
             limit=topk,
             output_fields=["doc_id", "seq", "page", "section", "chunk"],
             consistency_level="Strong",
@@ -504,6 +550,11 @@ class MilvusStoreV2:
                 "section": ent.get("section"),
                 "chunk": ent.get("chunk"),
             })
+
+        # 검색 로깅
+        if out:
+            print(f"🔍 Search: topk={topk}, ef={ef}, results={len(out)}, top_score={out[0]['score']:.3f}")
+        
         return out
     
     def search_in_docs(
@@ -514,6 +565,7 @@ class MilvusStoreV2:
         topk: int = 20,
     ) -> List[Dict[str, Any]]:
         """
+        개선: 동적 ef 파라미터 적용
         특정 doc_id 목록 안에서만 검색하는 버전
         - doc_ids: osk_data.data_id 목록 (문자열)
         """
@@ -531,12 +583,15 @@ class MilvusStoreV2:
         safe_ids = [str(d).replace('"', "").replace("\\", "") for d in doc_ids]
         expr = "doc_id in [" + ",".join(f'"{i}"' for i in safe_ids) + "]"
 
+        # 동적 ef 계산
+        ef = self._calculate_ef(topk)
+
         res = self.col.search(
             data=[qv],
             anns_field="embedding",
-            param={"metric_type": "IP", "params": {"ef": 64}},
+            param={"metric_type": "IP", "params": {"ef": ef}},  # 동적 ef 적용
             limit=topk,
-            expr=expr,  # 🔹 여기서 필터 적용
+            expr=expr,  # 여기서 필터 적용
             output_fields=["doc_id", "seq", "page", "section", "chunk"],
             consistency_level="Strong",
         )
@@ -544,17 +599,33 @@ class MilvusStoreV2:
         out: List[Dict[str, Any]] = []
         for hit in res[0]:
             ent = hit.entity
-            out.append(
-                {
-                    "score": float(hit.distance),
-                    "doc_id": ent.get("doc_id"),
-                    "seq": int(ent.get("seq")),
-                    "page": int(ent.get("page")),
-                    "section": ent.get("section"),
-                    "chunk": ent.get("chunk"),
-                }
-            )
+            out.append({
+                "score": float(hit.distance),
+                "doc_id": ent.get("doc_id"),
+                "seq": int(ent.get("seq")),
+                "page": int(ent.get("page")),
+                "section": ent.get("section"),
+                "chunk": ent.get("chunk"),
+            })
+
+        # 검색 로깅
+        if out:
+            print(f"🔍 Search (filtered): topk={topk}, ef={ef}, doc_filter={len(doc_ids)}, results={len(out)}")
+        
         return out
+
+    def debug_search(
+        self,
+        query: str,
+        embed_fn: Callable[[List[str]], List[List[float]]],
+        topk: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """디버그용 검색 (메타 정보 포함)"""
+        results = self.search(query, embed_fn, topk)
+        # 사용된 ef 값 로깅
+        ef = self._calculate_ef(topk)
+        print(f"[DEBUG] search with ef={ef} (topk={topk})")
+        return results
 
     def count_by_doc(self, doc_id: str) -> int:
         """특정 doc_id의 청크 개수 조회"""
@@ -570,7 +641,10 @@ class MilvusStoreV2:
         return len(res) if res else 0
 
     def stats(self) -> dict:
-        """컬렉션 상태 요약"""
+        """
+        개선: 검색 파라미터 정보 추가
+        컬렉션 상태 요약
+        """
         try:
             num = self.col.num_entities
         except Exception:
@@ -586,11 +660,23 @@ class MilvusStoreV2:
                 idx.append(params)
         except Exception:
             pass
+        
         return {
             "collection": self.col.name,
             "num_entities": num,
+            "dim": self.dim,
             "indexes": idx,
             "schema_fields": [f.name for f in self.col.schema.fields],
+            # 검색 파라미터 정보
+            "search_params": {
+                "metric_type": METRIC_TYPE,
+                "ef_search_base": EF_SEARCH,
+                "ef_per_k": EF_PER_K,
+                "ef_max": EF_MAX,
+                "index_type": INDEX_TYPE,
+                "hnsw_m": HNSW_M,
+                "hnsw_efcon": HNSW_EFCON,
+            },
         }
 
     def query_by_doc(self, doc_id: str, limit: int = 10) -> list[dict]:

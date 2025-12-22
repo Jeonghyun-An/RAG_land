@@ -64,38 +64,134 @@ def _score_pairs(pairs: List[Tuple[str, str]]) -> Tuple[str, List[float]]:
             continue
     raise RuntimeError(f"reranker backends failed: {last_err}")
 
-def rerank(query: str, cands: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, Any]]:
+def rerank(
+    query: str, cands: List[Dict[str, Any]], top_k: int = 5
+) -> List[Dict[str, Any]]:
+    """
+    후보 청크들을 리랭킹하여 상위 top_k개 반환
+    
+    Args:
+        query: 검색 쿼리
+        cands: 후보 청크 리스트 [{"chunk": str, ...}, ...]
+        top_k: 반환할 상위 개수
+    
+    Returns:
+        리랭킹된 상위 top_k개 청크 (re_score 필드 추가됨)
+    """
     if not cands:
         return []
 
+    # 쿼리-청크 페어 생성
     pairs = [(query, _strip_meta_line(c.get("chunk") or "")) for c in cands]
-    backend, scores = _score_pairs(pairs)
 
-    # 점수 부착
+    # 스코어링
+    try:
+        backend, scores = _score_pairs(pairs)
+    except Exception as e:
+        print(f"[RERANK] Scoring failed: {e}")
+        # 폴백: 원래 임베딩 스코어 사용
+        for c in cands:
+            c["re_score"] = c.get("score", 0.0)
+            c["re_backend"] = "fallback"
+        cands.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return cands[:max(1, top_k)]
+
+    # 스코어 부착
     for c, s in zip(cands, scores):
         c["re_score"] = float(s)
         c["re_backend"] = backend
 
     # 내림차순 정렬
     cands.sort(key=lambda x: x.get("re_score", -1e9), reverse=True)
-    return cands[:max(1, top_k)]
+
+    # 상위 top_k개 반환
+    result = cands[: max(1, top_k)]
+
+    # 로깅 강화
+    if result:
+        top3_scores = [c.get("re_score", 0) for c in result[:3]]
+        print(
+            f"[RERANK] Backend={backend}, top_k={top_k}, "
+            f"top3_re_scores={top3_scores}, total_cands={len(cands)}"
+        )
+
+    return result
 
 def preload_reranker():
     """
-    앱 시작 시 리랭커 모델을 미리 로드합니다.
-    첫 요청 시 발생하는 모델 로딩 지연을 제거합니다.
+    앱 시작 시 리랭커 모델을 미리 로드
+    첫 요청 시 발생하는 모델 로딩 지연 제거
     """
+    print("[RERANK] Preloading reranker models...")
+
     for backend in RERANKER_BACKENDS:
         try:
             if backend == "flag":
                 model = _load_flag_reranker()
                 if model:
                     print(f"[RERANK] FLAG reranker preloaded")
+                    # 테스트 스코어링으로 워밍업
+                    try:
+                        test_pairs = [("test query", "test document")]
+                        _ = model.compute_score(test_pairs, normalize=True)
+                        print(f"[RERANK] FLAG reranker warmed up")
+                    except Exception as e:
+                        print(f"[RERANK] FLAG warmup failed: {e}")
+
             elif backend == "ce":
                 model = _load_ce()
                 if model:
                     print(f"[RERANK] CE reranker preloaded")
+                    # 테스트 스코어링으로 워밍업
+                    try:
+                        test_pairs = [("test query", "test document")]
+                        _ = model.predict(test_pairs)
+                        print(f"[RERANK] CE reranker warmed up")
+                    except Exception as e:
+                        print(f"[RERANK] CE warmup failed: {e}")
+
         except Exception as e:
             print(f"[RERANK] Failed to preload {backend}: {e}")
-    
+
     print("[RERANK] Reranker preload complete")
+
+# 배치 처리 유틸리티
+def rerank_in_batches(
+    query: str,
+    cands: List[Dict[str, Any]],
+    top_k: int = 5,
+    batch_size: int = None,
+) -> List[Dict[str, Any]]:
+    """
+    대량의 후보를 배치로 나누어 리랭킹
+    
+    Args:
+        query: 검색 쿼리
+        cands: 후보 청크 리스트
+        top_k: 최종 반환할 상위 개수
+        batch_size: 배치 크기 (None이면 RERANKER_BATCH_SIZE 사용)
+    
+    Returns:
+        리랭킹된 상위 top_k개
+    """
+    if not cands:
+        return []
+
+    if batch_size is None:
+        batch_size = RERANKER_BATCH_SIZE
+
+    # 청크가 배치 크기보다 작으면 일반 리랭킹
+    if len(cands) <= batch_size * 2:
+        return rerank(query, cands, top_k)
+
+    # 배치로 나누어 처리
+    all_scored = []
+    for i in range(0, len(cands), batch_size):
+        batch = cands[i : i + batch_size]
+        scored_batch = rerank(query, batch, top_k=len(batch))
+        all_scored.extend(scored_batch)
+
+    # 전체 재정렬
+    all_scored.sort(key=lambda x: x.get("re_score", -1e9), reverse=True)
+
+    return all_scored[: max(1, top_k)]
