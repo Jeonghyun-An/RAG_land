@@ -22,6 +22,16 @@ from sse_starlette.sse import EventSourceResponse  # 요구사항: sse-starlette
 
 from datetime import datetime, timedelta, timezone
 import time as pytime
+try:
+    import tiktoken
+    _tokenizer = tiktoken.encoding_for_model("gpt-4")
+except:
+    try:
+        import tiktoken
+        _tokenizer = tiktoken.get_encoding("cl100k_base")
+    except ImportError:
+        _tokenizer = None
+        logging.warning("[LONG_CTX] tiktoken not installed, token counting disabled")
 
 from app.services.file_parser import (
     parse_pdf,                    # (local path) -> [(page_no, text)]
@@ -56,6 +66,10 @@ class AskReq(BaseModel):
     history: Optional[List[dict]] = []
     doc_ids: Optional[List[str]] = None
     response_type: Literal["short", "long"] = "short"  # short(단문형) | long(장문형)
+    long_context: bool = Field( 
+        default=False,
+        description="초장문 컨텍스트 모드: 임계치 넘는 모든 청크를 30K 토큰까지 포함"
+    )
 
 class UploadResp(BaseModel):
     filename: str
@@ -87,8 +101,8 @@ RESPONSE_MODE_CONFIG = {
 }
 # 모델별 최대 컨텍스트 길이 (토큰 단위)
 MODEL_MAX_CONTEXT = {
-    "qwen2.5-14b": 16384,
-    "qwen2.5-7b": 16384,
+    "qwen2.5-14b": 30000,
+    "qwen2.5-7b": 30000,
     "default": 8192,
 }
 # 리랭킹 설정
@@ -102,6 +116,13 @@ CONTEXT_BUDGET_TOKENS = int(os.getenv("RAG_CONTEXT_BUDGET_TOKENS", "1024"))
 USE_ADAPTIVE_THRESHOLD = os.getenv("RAG_USE_ADAPTIVE_THRESHOLD", "1") == "1"
 BASE_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.25"))
 EMB_BACKUP_THRESHOLD = float(os.getenv("RAG_EMB_BACKUP_THR", "0.55"))
+
+# ========== 초장문 모드 설정 (신규) ==========
+LONG_CONTEXT_ENABLED = os.getenv("RAG_LONG_CONTEXT_MODE", "1") == "1"
+LONG_CONTEXT_TOP_K = int(os.getenv("RAG_LONG_CONTEXT_TOP_K", "100"))
+LONG_SCORE_THRESHOLD = float(os.getenv("RAG_LONG_SCORE_THRESHOLD", "0.25"))
+LONG_CONTEXT_BUDGET_TOKENS = int(os.getenv("RAG_LONG_CONTEXT_BUDGET", "24000"))
+LONG_MAX_TOKENS = int(os.getenv("RAG_LONG_MAX_TOKENS", "5000"))
 
 # --- 폴백 전용: pages 정규화 도우미 ---------------------------------
 def _normalize_pages_for_chunkers(pages):
@@ -1174,6 +1195,56 @@ def _apply_context_budget(
     )
 
     return result
+
+# ========== 토큰 카운팅 ==========
+def count_tokens(text: str) -> int:
+    """텍스트의 토큰 수 추정"""
+    if not text:
+        return 0
+    if _tokenizer is None:
+        # tiktoken 없으면 근사치 (한글 기준: 1토큰 ≈ 0.7자)
+        return int(len(text) / 0.7)
+    return len(_tokenizer.encode(text))
+
+
+def pack_chunks_within_budget(
+    ranked_chunks: List[dict],  # rerank 결과 (re_score 내림차순)
+    budget_tokens: int,
+    system_prompt_tokens: int = 500,
+    max_output_tokens: int = 5000
+) -> List[dict]:
+    """
+    토큰 예산 내에서 청크를 최대한 포함
+    
+    Args:
+        ranked_chunks: 리랭킹된 청크 리스트
+        budget_tokens: 전체 컨텍스트 예산 (30000)
+        system_prompt_tokens: 시스템 프롬프트 예약
+        max_output_tokens: 답변 생성 예약
+    
+    Returns:
+        선택된 청크 리스트 (tokens 필드 추가됨)
+    """
+    available = budget_tokens - system_prompt_tokens - max_output_tokens
+    
+    selected = []
+    used_tokens = 0
+    
+    for chunk in ranked_chunks:
+        chunk_text = _strip_meta_line(chunk.get("chunk", ""))
+        chunk_tokens = count_tokens(chunk_text)
+        
+        if used_tokens + chunk_tokens > available:
+            logger.info(f"[PACK] Budget exhausted at chunk {len(selected)+1}, stopping")
+            break
+        
+        chunk["tokens"] = chunk_tokens  # 토큰 수 추가
+        selected.append(chunk)
+        used_tokens += chunk_tokens
+    
+    logger.info(f"[PACK] Selected {len(selected)} chunks / {used_tokens}/{available} tokens")
+    return selected
+
 # ---------- Routes ----------
 @router.get("/test")
 def test():
@@ -1319,14 +1390,27 @@ async def upload_document(
 @router.post("/ask", response_model=AskResp)
 def ask_question(req: AskReq):
     try:
-        # response_type에 따른 파라미터 설정
-        mode_config = RESPONSE_MODE_CONFIG.get(req.response_type, RESPONSE_MODE_CONFIG["short"])
-        configured_top_k = mode_config["top_k"] 
-        max_tokens = mode_config["max_tokens"]
-        temperature = mode_config["temperature"]
-        top_p = mode_config["top_p"]
+        # ========== 초장문 모드 분기 ==========
+        if req.long_context and LONG_CONTEXT_ENABLED:
+            # 초장문 모드 전용 설정
+            configured_top_k = LONG_CONTEXT_TOP_K  # 100
+            max_tokens = LONG_MAX_TOKENS  # 5000
+            temperature = 0.1
+            top_p = 0.92
+            use_token_packing = True  # 토큰 팩킹 활성화
+            
+            logger.info(f"[ask] LONG CONTEXT MODE | top_k={configured_top_k}, max_tokens={max_tokens}")
         
-        logger.info(f"[ask] response_type={req.response_type}, max_tokens={max_tokens}")
+        else:
+            # response_type에 따른 파라미터 설정
+            mode_config = RESPONSE_MODE_CONFIG.get(req.response_type, RESPONSE_MODE_CONFIG["short"])
+            configured_top_k = mode_config["top_k"] 
+            max_tokens = mode_config["max_tokens"]
+            temperature = mode_config["temperature"]
+            top_p = mode_config["top_p"]
+            use_token_packing = False
+
+            logger.info(f"[ask] response_type={req.response_type}, max_tokens={max_tokens}")
 
         # 0) 모델/스토어 준비
         model = get_embedding_model()
@@ -1340,8 +1424,13 @@ def ask_question(req: AskReq):
         logger.info("[ask] lang=%s | q_before=%s", lang, req.question[:120])
         logger.info("[ask] q_search=%s", query_for_search[:120])
 
-        # 초기 넉넉히 검색
-        raw_topk = max(40, configured_top_k * 8)
+# ========== 초기 검색 top_k 결정 (모드별 분기) ==========
+        if use_token_packing:
+            # 초장문 모드: 많이 검색
+            raw_topk = LONG_CONTEXT_TOP_K  # 100
+        else:
+            # 일반 모드: 기존 로직
+            raw_topk = max(40, configured_top_k * 8)
         
         # 선택 문서가 있을 경우 doc 필터를 걸어서 검색하는 헬퍼
         def _search_with_optional_filter(q: str, topk: int):
@@ -1423,8 +1512,14 @@ def ask_question(req: AskReq):
                         c["kw_boost"] = c.get("kw_boost", 0.0) + RAG_ARTICLE_BOOST
 
         cands.sort(key=lambda x: (x.get("kw_boost", 0), x.get("score", 0.0)), reverse=True)
-        rerank_pool_size = max(RERANKER_BATCH_SIZE, configured_top_k * 8)
-        rerank_pool = cands[:rerank_pool_size]
+        # ========== 리랭킹 풀 크기 결정 (모드별 분기) ==========
+        if use_token_packing:
+            # 초장문 모드: 전부 리랭킹
+            rerank_pool = cands[:LONG_CONTEXT_TOP_K]
+        else:
+            # 일반 모드: 기존 로직
+            rerank_pool_size = max(RERANKER_BATCH_SIZE, configured_top_k * 8)
+            rerank_pool = cands[:rerank_pool_size]
 
         # Rerank
         topk = rerank(query_for_search, rerank_pool, top_k=configured_top_k)
@@ -1437,14 +1532,20 @@ def ask_question(req: AskReq):
                 sources=[]
             )
 
-        # 적응형 임계값 계산
-        if USE_ADAPTIVE_THRESHOLD:
-            threshold = _calculate_adaptive_threshold(
-                topk, configured_top_k, BASE_SCORE_THRESHOLD
-            )
+        # ========== 임계값 결정 (모드별 분기) ==========
+        if use_token_packing:
+            # 초장문 모드: 고정 임계치 사용
+            threshold = LONG_SCORE_THRESHOLD  # 0.25
+            logger.info(f"[ASK] LONG MODE | Using threshold: {threshold}")
         else:
-            threshold = BASE_SCORE_THRESHOLD
-            logger.info(f"[ASK] Using fixed threshold: {threshold}")
+            # 일반 모드: 적응형 임계값
+            if USE_ADAPTIVE_THRESHOLD:
+                threshold = _calculate_adaptive_threshold(
+                    topk, configured_top_k, BASE_SCORE_THRESHOLD
+                )
+            else:
+                threshold = BASE_SCORE_THRESHOLD
+                logger.info(f"[ASK] Using fixed threshold: {threshold}")
 
         # 4) 임계값 필터링
         def _is_confident(hit: dict, thr: float) -> bool:
@@ -1490,10 +1591,20 @@ def ask_question(req: AskReq):
                 sources=[],
             )
 
-        # 컨텍스트 토큰 예산 적용
-        filtered_topk = _apply_context_budget(filtered_topk, CONTEXT_BUDGET_TOKENS)
+        # ========== 컨텍스트 구성 (모드별 분기) ==========
+        if use_token_packing:
+            # 초장문 모드: 토큰 예산으로 팩킹
+            filtered_topk = pack_chunks_within_budget(
+                ranked_chunks=filtered_topk,
+                budget_tokens=30000,
+                system_prompt_tokens=500,
+                max_output_tokens=LONG_MAX_TOKENS
+            )
+            logger.info(f"[ASK] LONG MODE | Packed {len(filtered_topk)} chunks")
+        else:
+            # 일반 모드: 기존 로직 (컨텍스트 토큰 예산)
+            filtered_topk = _apply_context_budget(filtered_topk, CONTEXT_BUDGET_TOKENS)
 
-            
         # 5) 컨텍스트/출처 구성
         context_lines = []
         sources = []
@@ -1511,14 +1622,12 @@ def ask_question(req: AskReq):
             })
         context = "\n\n".join(context_lines)
 
-        # ========== 기존 로직 끝 ==========
-
         # 6) 프롬프트 생성 (response_type 반영)
         prompt = _build_prompt(
             context=context,
             question=req.question,
             lang=lang,
-            response_type=req.response_type
+            response_type="long" if use_token_packing else req.response_type
         )
         
         # 동적 max_tokens 계산

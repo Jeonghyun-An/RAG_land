@@ -4,7 +4,7 @@
 set -e
 
 echo "========================================"
-echo "🎤 Starting STT Service"
+echo " Starting STT Service"
 echo "========================================"
 echo "Model: ${STT_MODEL_SIZE:-medium}"
 echo "Device: ${STT_DEVICE:-cuda}"
