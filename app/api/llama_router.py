@@ -1377,7 +1377,7 @@ def ask_question(req: AskReq):
                 logger.warning(f"[ask] debug print failed: {e}")
             return AskResp(
                 answer=_t(lang,
-                          "문서에서 해당 질문에 대한 확실한 답변을 찾기 어렵습니다.",
+                          "문서에서 해당 질문에 대한 확실한 근거를 찾기 어렵습니다.",
                           "It is hard to find a definitive answer to this question in the documents."),
                 used_chunks=0,
                 sources=[]
