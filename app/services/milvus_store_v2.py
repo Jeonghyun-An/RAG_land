@@ -610,7 +610,7 @@ class MilvusStoreV2:
 
         # 검색 로깅
         if out:
-            print(f"🔍 Search (filtered): topk={topk}, ef={ef}, doc_filter={len(doc_ids)}, results={len(out)}")
+            print(f"Search (filtered): topk={topk}, ef={ef}, doc_filter={len(doc_ids)}, results={len(out)}")
         
         return out
 

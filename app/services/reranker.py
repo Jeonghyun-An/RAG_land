@@ -1,13 +1,16 @@
 # app/services/reranker.py
 from __future__ import annotations
 import os, traceback
+import logging
 from functools import lru_cache
 from typing import List, Dict, Any, Tuple
 
+logger = logging.getLogger(__name__)
+
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANKER_BACKENDS = [x.strip() for x in os.getenv("RERANKER_BACKENDS", "flag,ce").split(",") if x.strip()]
-RERANKER_DEVICE = os.getenv("RERANKER_DEVICE", "cpu")
-RERANKER_BATCH_SIZE = int(os.getenv("RERANKER_BATCH_SIZE", "32"))
+RERANKER_DEVICE = os.getenv("RERANKER_DEVICE", "cuda")
+RERANKER_BATCH_SIZE = int(os.getenv("RERANKER_BATCH_SIZE", "64"))
 
 def _strip_meta_line(s: str) -> str:
     if not s: return ""
@@ -70,13 +73,7 @@ def rerank(
     """
     후보 청크들을 리랭킹하여 상위 top_k개 반환
     
-    Args:
-        query: 검색 쿼리
-        cands: 후보 청크 리스트 [{"chunk": str, ...}, ...]
-        top_k: 반환할 상위 개수
-    
-    Returns:
-        리랭킹된 상위 top_k개 청크 (re_score 필드 추가됨)
+    GPU 메모리 부족 시 배치 처리
     """
     if not cands:
         return []
@@ -84,22 +81,45 @@ def rerank(
     # 쿼리-청크 페어 생성
     pairs = [(query, _strip_meta_line(c.get("chunk") or "")) for c in cands]
 
-    # 스코어링
-    try:
-        backend, scores = _score_pairs(pairs)
-    except Exception as e:
-        print(f"[RERANK] Scoring failed: {e}")
-        # 폴백: 원래 임베딩 스코어 사용
-        for c in cands:
-            c["re_score"] = c.get("score", 0.0)
-            c["re_backend"] = "fallback"
-        cands.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        return cands[:max(1, top_k)]
+    # ========== 배치 처리 추가 ==========
+    MAX_BATCH_SIZE = 100  # GPU 메모리 고려
+    
+    if len(pairs) > MAX_BATCH_SIZE:
+        # 배치로 나눠서 처리
+        logger.info(f"[RERANK] Processing {len(pairs)} pairs in batches of {MAX_BATCH_SIZE}")
+        
+        all_scores = []
+        backend = None
+        
+        for i in range(0, len(pairs), MAX_BATCH_SIZE):
+            batch_pairs = pairs[i:i+MAX_BATCH_SIZE]
+            try:
+                backend, batch_scores = _score_pairs(batch_pairs)
+                all_scores.extend(batch_scores)
+            except Exception as e:
+                logger.error(f"[RERANK] Batch {i//MAX_BATCH_SIZE} failed: {e}")
+                # 폴백: 임베딩 스코어 사용
+                for c in cands[i:i+MAX_BATCH_SIZE]:
+                    all_scores.append(c.get("score", 0.0))
+        
+        scores = all_scores
+    else:
+        # 기존 로직
+        try:
+            backend, scores = _score_pairs(pairs)
+        except Exception as e:
+            logger.error(f"[RERANK] Scoring failed: {e}")
+            # 폴백: 원래 임베딩 스코어 사용
+            for c in cands:
+                c["re_score"] = c.get("score", 0.0)
+                c["re_backend"] = "fallback"
+            cands.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            return cands[:max(1, top_k)]
 
     # 스코어 부착
     for c, s in zip(cands, scores):
         c["re_score"] = float(s)
-        c["re_backend"] = backend
+        c["re_backend"] = backend if backend else "fallback"
 
     # 내림차순 정렬
     cands.sort(key=lambda x: x.get("re_score", -1e9), reverse=True)
@@ -107,10 +127,10 @@ def rerank(
     # 상위 top_k개 반환
     result = cands[: max(1, top_k)]
 
-    # 로깅 강화
+    # 로깅
     if result:
         top3_scores = [c.get("re_score", 0) for c in result[:3]]
-        print(
+        logger.info(
             f"[RERANK] Backend={backend}, top_k={top_k}, "
             f"top3_re_scores={top3_scores}, total_cands={len(cands)}"
         )

@@ -365,7 +365,7 @@ def main():
         if status == "success":
             print(f"  성공: {result['chunks']}개 청크")
         elif status == "skipped":
-            print(f"  ⏭ 스킵: {result['message']}")
+            print(f"  스킵: {result['message']}")
         else:
             print(f"  실패: {result['message']}")
             if args.verbose and result.get("details"):
@@ -384,7 +384,7 @@ def main():
     print(f"총 처리 시간: {elapsed:.1f}초")
     print(f"총 문서 수: {len(objects)}개")
     print(f"  성공: {len(results['success'])}개")
-    print(f"  ⏭ 스킵: {len(results['skipped'])}개")
+    print(f"  스킵: {len(results['skipped'])}개")
     print(f"  실패: {len(results['error'])}개")
     
     if results['success']:
@@ -395,7 +395,7 @@ def main():
         print(f"  평균 청크/문서: {avg_chunks:.1f}개")
     
     if results['error']:
-        print(f"\n❌ 실패한 문서 목록:")
+        print(f"\n실패한 문서 목록:")
         for r in results['error']:
             print(f"  - {r['doc_id'] or r['object_name']}: {r['message']}")
     
