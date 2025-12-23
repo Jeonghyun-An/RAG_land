@@ -9,14 +9,14 @@ import uuid
 from urllib.parse import unquote, quote
 from typing import Dict, List, Optional,Literal,Any
 from starlette.responses import StreamingResponse
-
+from app.services.db_connector import DBConnector
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
 from pydantic import BaseModel, Field
 import asyncio, json
 import numpy as np
 import logging
 
-logger = logging.getLogger("uvicorn.error")  # uvicorn 출력에 섞기
+logger = logging.getLogger(__name__)  # uvicorn 출력에 섞기
 
 from sse_starlette.sse import EventSourceResponse  # 요구사항: sse-starlette
 
@@ -119,10 +119,11 @@ EMB_BACKUP_THRESHOLD = float(os.getenv("RAG_EMB_BACKUP_THR", "0.55"))
 
 # ========== 초장문 모드 설정 (신규) ==========
 LONG_CONTEXT_ENABLED = os.getenv("RAG_LONG_CONTEXT_MODE", "1") == "1"
-LONG_CONTEXT_TOP_K = int(os.getenv("RAG_LONG_CONTEXT_TOP_K", "100"))
+LONG_CONTEXT_TOP_K = int(os.getenv("RAG_LONG_CONTEXT_TOP_K", "150"))
 LONG_SCORE_THRESHOLD = float(os.getenv("RAG_LONG_SCORE_THRESHOLD", "0.25"))
-LONG_CONTEXT_BUDGET_TOKENS = int(os.getenv("RAG_LONG_CONTEXT_BUDGET", "24000"))
+LONG_CONTEXT_BUDGET_TOKENS = int(os.getenv("RAG_LONG_CONTEXT_BUDGET", "20000"))
 LONG_MAX_TOKENS = int(os.getenv("RAG_LONG_MAX_TOKENS", "5000"))
+RERANKER_MAX_BATCH_SIZE = int(os.getenv("RERANKER_MAX_BATCH_SIZE", "100"))  # 리랭커 최대 배치 크기
 
 # --- 폴백 전용: pages 정규화 도우미 ---------------------------------
 def _normalize_pages_for_chunkers(pages):
@@ -831,19 +832,19 @@ def _build_prompt(
 # 4단 구성 (전문 질의 답변 형식)
 
 ### 1) 개요(Overview)
-- 질문 대상의 제도, 개념, 요구사항, 문서 범위를 3~4문장으로 요약합니다.
+- 질문 대상의 제도, 개념, 요구사항, 문서 범위를 5~6문장으로 요약합니다.
 - 문서의 목적과 적용 범위를 명확히 언급합니다.
 
 ### 2) 주요 내용(Detailed Explanation)
-- 제공된 컨텍스트에 근거하여 **최소 10문장 이상** 상세히 설명합니다.
+- 제공된 컨텍스트에 근거하여 **최소 15문장 이상** 상세히 설명합니다.
 - 컨텍스트에 새로운 정보가 없더라도, 이미 등장한 개념, 용어, 절차, 보고 흐름, 상호 관계를 풀어서 설명해야 합니다.
 - 단순 요약이나 문장 수 축소는 허용되지 않습니다.
 정책·규정·절차는 다음과 같이 구조화합니다:
 
   **순차적 흐름/단계가 있는 경우 (번호 목록):**
-  1. 첫 번째 단계: 구체적인 설명 (2~3문장)
-  2. 두 번째 단계: 상세한 요건 및 조건 (2~3문장)
-  3. 세 번째 단계: 후속 조치 및 예외사항 (2~3문장)
+  1. 첫 번째 단계: 구체적인 설명 (3~4문장)
+  2. 두 번째 단계: 상세한 요건 및 조건 (3~4문장)
+  3. 세 번째 단계: 후속 조치 및 예외사항 (3~4문장)
 
   **조건·요건·구성요소 나열 (불릿 목록):**
   - 적용 대상과 범위
@@ -855,12 +856,12 @@ def _build_prompt(
 - 매 문장은 새로운 정보를 제공하도록 구성합니다.
 
 ### 3) 배경 또는 관련 규정(Background / Relevant Provisions)
-- 규제적·국제적 배경을 **최소 4문장 이상** 설명합니다.
+- 규제적·국제적 배경을 **최소 8문장 이상** 설명합니다.
 - 국제 Safeguards 체제, 조약 이행, 보고 일관성 등의 맥락을 제시합니다.
 - 컨텍스트에 등장하는 내용만 언급하고 추측하지 않습니다.
 
 ### 4) 결론(Conclusion)
-- 핵심 요점을 **최소 3문장 이상**으로 정리합니다.
+- 핵심 요점을 **최소 6문장 이상**으로 정리합니다.
 - 실무적 시사점이나 주의사항을 포함합니다.
 - 정보가 제한적인 경우 다음 문장을 포함합니다:
   "제공된 KINAC 문서의 범위 내에서 확인된 내용을 기반으로 설명했습니다."
@@ -1208,22 +1209,16 @@ def count_tokens(text: str) -> int:
 
 
 def pack_chunks_within_budget(
-    ranked_chunks: List[dict],  # rerank 결과 (re_score 내림차순)
+    ranked_chunks: List[Dict[str, Any]],
     budget_tokens: int,
-    system_prompt_tokens: int = 500,
-    max_output_tokens: int = 5000
-) -> List[dict]:
+    system_prompt_tokens: int = 0,
+    max_output_tokens: int = 0
+) -> List[Dict[str, Any]]:
     """
     토큰 예산 내에서 청크를 최대한 포함
     
-    Args:
-        ranked_chunks: 리랭킹된 청크 리스트
-        budget_tokens: 전체 컨텍스트 예산 (30000)
-        system_prompt_tokens: 시스템 프롬프트 예약
-        max_output_tokens: 답변 생성 예약
-    
-    Returns:
-        선택된 청크 리스트 (tokens 필드 추가됨)
+    - 각 청크는 "[N] (doc:... p....)\n{text}" 형태로 포함됨
+    - 실제 토큰 수는 메타라인 포함이므로 여유를 둬야 함
     """
     available = budget_tokens - system_prompt_tokens - max_output_tokens
     
@@ -1232,13 +1227,17 @@ def pack_chunks_within_budget(
     
     for chunk in ranked_chunks:
         chunk_text = _strip_meta_line(chunk.get("chunk", ""))
-        chunk_tokens = count_tokens(chunk_text)
+        
+        # 메타라인 오버헤드 추가 (예: "[1] (doc:abc123 p.5)\n")
+        meta_overhead = 50  # 대략적인 메타라인 토큰 수
+        
+        chunk_tokens = count_tokens(chunk_text) + meta_overhead
         
         if used_tokens + chunk_tokens > available:
             logger.info(f"[PACK] Budget exhausted at chunk {len(selected)+1}, stopping")
             break
         
-        chunk["tokens"] = chunk_tokens  # 토큰 수 추가
+        chunk["tokens"] = chunk_tokens
         selected.append(chunk)
         used_tokens += chunk_tokens
     
@@ -1593,14 +1592,32 @@ def ask_question(req: AskReq):
 
         # ========== 컨텍스트 구성 (모드별 분기) ==========
         if use_token_packing:
-            # 초장문 모드: 토큰 예산으로 팩킹
+            # 초장문 모드: 토큰 예산으로 팩킹 일단 좀 하드코딩
+            MODEL_MAX = 28000
+            SYSTEM_RESERVE = 2000   # 시스템 프롬프트 + 오버헤드 (넉넉하게)
+            OUTPUT_RESERVE = LONG_MAX_TOKENS  # 5000
+            SAFETY_MARGIN = 5000  # 예비 여유분
+            
+            chunk_budget = MODEL_MAX - SYSTEM_RESERVE - OUTPUT_RESERVE - SAFETY_MARGIN  # 18,000
+            
+            logger.info(
+                f"[ASK] LONG MODE | Token budget: total={MODEL_MAX}, "
+                f"system={SYSTEM_RESERVE}, output={OUTPUT_RESERVE}, "
+                f"safety={SAFETY_MARGIN}, chunks={chunk_budget}"
+            )
+            
             filtered_topk = pack_chunks_within_budget(
                 ranked_chunks=filtered_topk,
-                budget_tokens=30000,
-                system_prompt_tokens=500,
-                max_output_tokens=LONG_MAX_TOKENS
+                budget_tokens=chunk_budget,
+                system_prompt_tokens=0,
+                max_output_tokens=0
             )
-            logger.info(f"[ASK] LONG MODE | Packed {len(filtered_topk)} chunks")
+            
+            actual_tokens = sum(c.get('tokens', 0) for c in filtered_topk)
+            logger.info(
+                f"[ASK] LONG MODE | Packed {len(filtered_topk)} chunks, "
+                f"actual_tokens={actual_tokens}, budget={chunk_budget}"
+            )
         else:
             # 일반 모드: 기존 로직 (컨텍스트 토큰 예산)
             filtered_topk = _apply_context_budget(filtered_topk, CONTEXT_BUDGET_TOKENS)
@@ -1835,6 +1852,7 @@ def get_file_presigned(
 @router.get("/rag/docs")
 def list_docs():
     m = MinIOStore()
+    db = DBConnector()
     try:
         all_keys = m.list_files("uploaded/")
     except Exception as e:
@@ -1849,7 +1867,23 @@ def list_docs():
         )
 
     pdf_keys = [k for k in all_keys if not is_internal(k) and k.lower().endswith(".pdf")]
-
+    db_docs_map = {}
+    try:
+        # parse_yn='S'인 전체 문서 조회
+        db_rows = db.fetch_docs_by_code()  # 파라미터 없으면 전체 조회
+        
+        for row in db_rows:
+            data_id = str(row['data_id'])
+            db_docs_map[data_id] = {
+                'data_title': row.get('data_title'),
+                'data_code': row.get('data_code'),
+                'data_code_detail': row.get('data_code_detail'),
+                'data_code_detail_sub': row.get('data_code_detail_sub'),
+            }
+        
+        logger.info(f"[/rag/docs] Loaded {len(db_docs_map)} documents from DB")
+    except Exception as e:
+        logger.error(f"[/rag/docs] DB query failed: {e}")
     items = []
     for k in pdf_keys:
         base = os.path.basename(k)
@@ -1893,8 +1927,8 @@ def list_docs():
             original_key = resolved_orig
             if not original_name:
                 original_name = os.path.basename(resolved_orig)
-
-        title = (isinstance(meta, dict) and meta.get("title")) or original_name or base
+        db_info = db_docs_map.get(doc_id, {})
+        title = db_info.get('data_title') or base
         is_pdf_original = bool(original_key and original_key.lower().endswith(".pdf"))
 
         items.append({
@@ -1905,6 +1939,9 @@ def list_docs():
             "original_name": original_name,
             "is_pdf_original": is_pdf_original,
             "uploaded_at": uploaded_at,
+            "data_code": db_info.get('data_code'),
+            "data_detail_code": db_info.get('data_code_detail'),
+            "data_sub_code": db_info.get('data_code_detail_sub'), 
         })
 
     return {"docs": items}
