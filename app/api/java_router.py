@@ -193,24 +193,37 @@ def _normalize_pages_for_chunkers(pages) -> List[Tuple[int, str]]:
     return out
 
 def _split_for_milvus(text: str, meta: dict) -> list[tuple[str, dict]]:
-    """
-    Milvus VARCHAR 한도를 초과하지 않도록 텍스트를 강제로 쪼갠다.
-    - 문자 기준 단순 슬라이스 (문장 경계는 신경 안 쓰고 '내용 보존'에 집중)
-    """
-    max_len = MILVUS_VARCHAR_MAX
+    max_bytes = MILVUS_VARCHAR_MAX
 
-    if len(text) <= max_len:
+    b = (text or "").encode("utf-8")
+    if len(b) <= max_bytes:
         return [(text, meta)]
 
     pieces = []
-    # 약간의 여유를 두고 잘라서 후처리 문자열을 붙일 여지도 남김
-    step = max_len - 8
+    step = max_bytes - 32  # 메타/후처리 여유
 
-    for idx, start in enumerate(range(0, len(text), step)):
-        sub = text[start:start + step]
+    start = 0
+    idx = 0
+    while start < len(b):
+        chunk_b = b[start:start + step]
+
+        # UTF-8 경계 깨짐 방지: 디코딩이 안되면 뒤에서 조금씩 줄임
+        while True:
+            try:
+                sub = chunk_b.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                chunk_b = chunk_b[:-1]
+                if not chunk_b:
+                    sub = ""
+                    break
+
         m = dict(meta)
-        m["split_index_for_milvus"] = idx  # 디버깅용
+        m["split_index_for_milvus"] = idx
         pieces.append((sub, m))
+
+        start += len(chunk_b) if chunk_b else step
+        idx += 1
 
     return pieces
 
@@ -287,60 +300,62 @@ def perform_advanced_chunking(
 
 
 def _render_text_pdf(text: str, out_path: str) -> str:
-    """
-    주어진 text를 간단한 PDF로 렌더링해 out_path에 저장하고 경로를 반환.
-    reportlab이 없으면 ImportError 발생 -> 상위에서 처리.
-    """
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
+    from pathlib import Path
+    import textwrap
 
-    # 폰트 등록 (없어도 기본 폰트로 동작은 함)
-    try:
-        # 시스템에 NotoSansCJK 같은 폰트가 있으면 등록 (선택)
-        # pdfmetrics.registerFont(TTFont("NotoSans", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"))
-        pass
-    except Exception:
-        pass
+    font_candidates = [
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothicCoding.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumSquareR.ttf",
+    ]
+
+    font_path = next((p for p in font_candidates if Path(p).exists()), None)
+
+    # 폰트 등록
+    font_name = "Helvetica"
+    if font_path:
+        try:
+            font_name = "KoreanFont"
+            pdfmetrics.registerFont(TTFont(font_name, font_path))
+        except Exception as e:
+            print(f"[SC-PDF] Font register failed ({font_path}): {e}")
+            font_name = "Helvetica"
+    else:
+        print("[SC-PDF] No Korean font found in system. Install Noto/Nanum fonts.")
 
     c = canvas.Canvas(out_path, pagesize=A4)
     width, height = A4
 
     margin_x = 20 * mm
     margin_y = 20 * mm
-    max_width = width - 2 * margin_x
     y = height - margin_y
 
-    # 폰트 설정
-    try:
-        c.setFont("Helvetica", 10)
-    except Exception:
-        pass
+    # 3) 한글 폰트 적용
+    c.setFont(font_name, 10)
 
-    # 아주 단순한 워드랩
-    import textwrap
+    # 4) 간단 워드랩 (너무 길면 줄바꿈)
     lines = []
     for para in (text or "").splitlines():
-        # 대략적인 폭 기준(영문 80~100자, 한글 섞이면 줄 조밀)
-        # 필요하면 reportlab의 stringWidth로 정확도 향상 가능
-        wrap = textwrap.wrap(para, width=95) or [""]
+        wrap = textwrap.wrap(para, width=80) or [""]
         lines.extend(wrap)
 
-    line_height = 12  # pt
+    line_height = 14  # 한글은 조금 여유 있게
     for line in lines:
         if y <= margin_y:
             c.showPage()
-            try:
-                c.setFont("Helvetica", 10)
-            except Exception:
-                pass
+            c.setFont(font_name, 10)
             y = height - margin_y
         c.drawString(margin_x, y, line)
         y -= line_height
 
-    c.showPage()
     c.save()
     return out_path
 
@@ -1460,7 +1475,12 @@ async def process_delete_document(
             if m.exists(pdf_key):
                 m.delete(pdf_key)
                 deleted_files.append(pdf_key)
-            
+            # SC PDF 삭제
+            sc_pdf_key = f"uploaded/sc/{doc_id}.pdf"
+            if m.exists(sc_pdf_key):
+                m.delete(sc_pdf_key)
+                deleted_files.append(sc_pdf_key)
+
             # meta.json 삭제
             meta_key = META_KEY(doc_id)
             if m.exists(meta_key):
@@ -1509,7 +1529,7 @@ async def process_update_metadata(
     """
     db = DBConnector()
     start_time = datetime.utcnow()
-    
+    row = None
     job_state.start(job_id, data_id=data_id)
     
     try:
