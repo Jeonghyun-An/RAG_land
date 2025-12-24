@@ -1845,106 +1845,152 @@ def get_file_presigned(
     except Exception as e:
         raise HTTPException(500, f"presign failed: {e}")
 
-# 기존
-# @router.get("/docs")
-# def list_docs():
-
 @router.get("/rag/docs")
 def list_docs():
     m = MinIOStore()
     db = DBConnector()
-    try:
-        all_keys = m.list_files("uploaded/")
-    except Exception as e:
-        raise HTTPException(500, f"minio list failed: {e}")
 
-    def is_internal(k: str) -> bool:
-        return (
-            k.endswith(".flag")
-            or "/__hash__/" in k
-            or "/__meta__/" in k
-            or k.startswith("uploaded/originals/")
-        )
-
-    pdf_keys = [k for k in all_keys if not is_internal(k) and k.lower().endswith(".pdf")]
     db_docs_map = {}
     try:
-        # parse_yn='S'인 전체 문서 조회
-        db_rows = db.fetch_docs_by_code()  # 파라미터 없으면 전체 조회
-        
+        db_rows = db.fetch_docs_by_code()  # 전체
         for row in db_rows:
-            data_id = str(row['data_id'])
+            data_id = str(row["data_id"])
             db_docs_map[data_id] = {
-                'data_title': row.get('data_title'),
-                'data_code': row.get('data_code'),
-                'data_code_detail': row.get('data_code_detail'),
-                'data_code_detail_sub': row.get('data_code_detail_sub'),
+                "data_title": row.get("data_title"),
+                "data_code": row.get("data_code"),
+                "data_code_detail": row.get("data_code_detail"),
+                "data_code_detail_sub": row.get("data_code_detail_sub"),
             }
-        
         logger.info(f"[/rag/docs] Loaded {len(db_docs_map)} documents from DB")
     except Exception as e:
         logger.error(f"[/rag/docs] DB query failed: {e}")
-    items = []
-    for k in pdf_keys:
-        base = os.path.basename(k)
-        doc_id = os.path.splitext(base)[0]
 
+    # 2) meta.json 전부 스캔
+    try:
+        meta_keys = m.list_files("uploaded/__meta__/")
+    except Exception as e:
+        raise HTTPException(500, f"minio list meta failed: {e}")
+
+    meta_json_keys = [k for k in meta_keys if k.endswith("/meta.json") or k.endswith(".json")]
+
+    items = []
+    seen = set()
+
+    def _safe_str(x):
+        return "" if x is None else str(x)
+
+    # meta 기반 구성
+    for mk in meta_json_keys:
         meta = None
         try:
-            if m.exists(meta_key(doc_id)):
-                meta = m.get_json(meta_key(doc_id))
-            elif m.exists(legacy_meta_key(doc_id)):
-                meta = m.get_json(legacy_meta_key(doc_id))
+            meta = m.get_json(mk)
         except Exception:
             meta = None
+        if not isinstance(meta, dict):
+            continue
 
-        # 메타에서 원본 정보 꺼낼 때 키 호환
-        original_key = None
-        original_name = None
-        uploaded_at = None
-        if isinstance(meta, dict):
-            original_key = meta.get("original_key") or meta.get("original")
-            original_name = meta.get("original_name")
-            uploaded_at = meta.get("uploaded_at")
+        doc_id = _safe_str(meta.get("doc_id"))
+        if not doc_id:
+            # legacy 형태: uploaded/__meta__/{doc_id}.json
+            # mk에서 doc_id 추출 시도
+            # uploaded/__meta__/ABC.json -> ABC
+            base = os.path.basename(mk)
+            if base.endswith(".json"):
+                doc_id = base[:-5]
+        if not doc_id:
+            continue
 
-        def _resolve_original() -> Optional[str]:
-            if original_key and m.exists(original_key):
-                return original_key
-            if original_name:
-                cand1 = f"uploaded/originals/{doc_id}/{original_name}"
-                if m.exists(cand1):
-                    return cand1
-                cand2 = f"uploaded/originals/{original_name}"
-                if m.exists(cand2):
-                    return cand2
-            cands = m.list_files(f"uploaded/originals/{doc_id}/")
-            if cands:
-                return cands[0]
-            return None
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
 
-        resolved_orig = _resolve_original()
-        if resolved_orig:
-            original_key = resolved_orig
-            if not original_name:
-                original_name = os.path.basename(resolved_orig)
+        # 키 호환 (pdf_key/object_key)
+        pdf_key = meta.get("pdf_key") or meta.get("object_key") or meta.get("pdf")
+        original_key = meta.get("original_key") or meta.get("original")
+        original_name = meta.get("original_name")
+        uploaded_at = meta.get("uploaded_at")
+
+        # SC 같은 경우 pdf_key가 없을 수도 있으니 존재하면만 is_pdf_original 판단
+        is_pdf_original = bool(original_key and str(original_key).lower().endswith(".pdf"))
+
+        # 표시 title: DB 우선(있으면), 없으면 meta.title, 없으면 doc_id
         db_info = db_docs_map.get(doc_id, {})
-        title = db_info.get('data_title') or base
-        is_pdf_original = bool(original_key and original_key.lower().endswith(".pdf"))
+        title = (db_info.get("data_title") or meta.get("title") or doc_id).strip()
 
         items.append({
             "doc_id": doc_id,
             "title": title,
-            "object_key": k,                  # 변환 PDF
-            "original_key": original_key,     # 원본 (있으면)
+            "pdf_key": pdf_key,
+            "object_key": pdf_key,  # legacy 호환
+            "original_key": original_key,
             "original_name": original_name,
             "is_pdf_original": is_pdf_original,
             "uploaded_at": uploaded_at,
-            "data_code": db_info.get('data_code'),
-            "data_detail_code": db_info.get('data_code_detail'),
-            "data_sub_code": db_info.get('data_code_detail_sub'), 
+            "data_code": db_info.get("data_code"),
+            "data_detail_code": db_info.get("data_code_detail"),
+            "data_sub_code": db_info.get("data_code_detail_sub"),
+            # SC 메타도 그대로 내려주면 프론트에서 뱃지/필터 가능
+            "type": meta.get("type"),
+            "source_type": meta.get("source_type"),
+            "chunk_count": meta.get("chunk_count"),
+            "page_count": meta.get("page_count"),
+            "file_size": meta.get("file_size"),
         })
 
-    return {"docs": items}
+    # 3) meta가 하나도 없으면 기존 PDF 스캔 폴백
+    if not items:
+        logger.warning("[/rag/docs] meta.json not found; fallback to pdf scan under uploaded/")
+        try:
+            all_keys = m.list_files("uploaded/")
+        except Exception as e:
+            raise HTTPException(500, f"minio list failed: {e}")
+
+        def is_internal(k: str) -> bool:
+            return (
+                k.endswith(".flag")
+                or "/__hash__/" in k
+                or "/__meta__/" in k
+                or k.startswith("uploaded/originals/")
+            )
+
+        pdf_keys = [k for k in all_keys if not is_internal(k) and k.lower().endswith(".pdf")]
+
+        for k in pdf_keys:
+            base = os.path.basename(k)
+            doc_id = os.path.splitext(base)[0]
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+
+            db_info = db_docs_map.get(doc_id, {})
+            title = db_info.get("data_title") or base
+
+            items.append({
+                "doc_id": doc_id,
+                "title": title,
+                "pdf_key": k,
+                "object_key": k,
+                "original_key": None,
+                "original_name": None,
+                "is_pdf_original": False,
+                "uploaded_at": None,
+                "file_exists": True,
+                "data_code": db_info.get("data_code"),
+                "data_detail_code": db_info.get("data_code_detail"),
+                "data_sub_code": db_info.get("data_code_detail_sub"),
+            })
+
+    # 4) 정렬(업로드 최신 우선 → 없으면 title)
+    def _sort_key(x):
+        return (x.get("uploaded_at") or "", x.get("title") or "", x.get("doc_id") or "")
+
+    items.sort(key=_sort_key, reverse=True)
+
+    return {
+        "docs": items,
+        "total": len(items),
+        "has_meta": len(meta_json_keys) > 0,  # meta.json 존재 여부
+    }
 
 @router.get("/rag/meta/{doc_id}")
 def get_meta(doc_id: str):
