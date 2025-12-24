@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
       ca-certificates curl wget \
       libglib2.0-0 libgl1 libsm6 libxext6 \
       poppler-utils \
-      fonts-nanum fonts-nanum-coding fonts-nanum-extra; \
+      fonts-noto-cjk fonts-nanum fonts-nanum-coding fonts-nanum-extra; \
     if [ "$INSTALL_OCR_STACK" = "1" ]; then \
       apt-get install -y --no-install-recommends \
         tesseract-ocr tesseract-ocr-kor \
