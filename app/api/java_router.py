@@ -300,63 +300,102 @@ def perform_advanced_chunking(
 
 
 def _render_text_pdf(text: str, out_path: str) -> str:
+    """
+    주어진 text를 간단한 PDF로 렌더링해 out_path에 저장하고 경로를 반환.
+    reportlab이 없으면 ImportError 발생 -> 상위에서 처리.
+    """
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    from pathlib import Path
-    import textwrap
+    import os
 
-    font_candidates = [
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.otf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-        "/usr/share/fonts/truetype/nanum/NanumGothicCoding.ttf",
-        "/usr/share/fonts/truetype/nanum/NanumSquareR.ttf",
-    ]
+    # ========== 한글 폰트 등록 ==========
+    font_registered = False
+    try:
+        # 나눔고딕 폰트 경로
+        font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
+        
+        if os.path.exists(font_path):
+            pdfmetrics.registerFont(TTFont("NanumGothic", font_path))
+            font_registered = True
+            print(f"[SC-PDF] Font registered: {font_path}")
+        else:
+            print(f"[SC-PDF] WARNING: Font not found at {font_path}")
+            
+    except Exception as e:
+        print(f"[SC-PDF] Font registration error: {e}")
 
-    font_path = next((p for p in font_candidates if Path(p).exists()), None)
-
-    # 폰트 등록
-    font_name = "Helvetica"
-    if font_path:
-        try:
-            font_name = "KoreanFont"
-            pdfmetrics.registerFont(TTFont(font_name, font_path))
-        except Exception as e:
-            print(f"[SC-PDF] Font register failed ({font_path}): {e}")
-            font_name = "Helvetica"
-    else:
-        print("[SC-PDF] No Korean font found in system. Install Noto/Nanum fonts.")
-
+    # PDF 캔버스 생성
     c = canvas.Canvas(out_path, pagesize=A4)
     width, height = A4
 
     margin_x = 20 * mm
     margin_y = 20 * mm
+    max_width = width - 2 * margin_x
     y = height - margin_y
 
-    # 3) 한글 폰트 적용
-    c.setFont(font_name, 10)
+    # ========== 폰트 설정 ==========
+    if font_registered:
+        c.setFont("NanumGothic", 10)
+    else:
+        c.setFont("Helvetica", 10)
+        print("[SC-PDF] WARNING: Using Helvetica (Korean may not display)")
 
-    # 4) 간단 워드랩 (너무 길면 줄바꿈)
+    # ========== 텍스트 줄바꿈 처리 ==========
+    import textwrap
     lines = []
+    
     for para in (text or "").splitlines():
-        wrap = textwrap.wrap(para, width=80) or [""]
-        lines.extend(wrap)
+        if not para.strip():
+            lines.append("")  # 빈 줄 유지
+            continue
+        
+        # 한글 문자 비율 계산
+        korean_chars = sum(1 for c in para if ord(c) > 127)
+        total_chars = len(para)
+        korean_ratio = korean_chars / total_chars if total_chars > 0 else 0
+        
+        # 한글이 많으면 줄바꿈 폭 줄이기
+        if korean_ratio > 0.3:  # 30% 이상 한글
+            wrap_width = 50  # 한글 기준
+        else:
+            wrap_width = 95  # 영문 기준
+        
+        wrapped = textwrap.wrap(para, width=wrap_width) or [""]
+        lines.extend(wrapped)
 
-    line_height = 14  # 한글은 조금 여유 있게
+    line_height = 14  # pt (한글 가독성 고려)
+    
     for line in lines:
-        if y <= margin_y:
+        # 페이지 넘김 체크
+        if y <= margin_y + line_height:
             c.showPage()
-            c.setFont(font_name, 10)
+            if font_registered:
+                c.setFont("NanumGothic", 10)
+            else:
+                c.setFont("Helvetica", 10)
             y = height - margin_y
-        c.drawString(margin_x, y, line)
+        
+        try:
+            c.drawString(margin_x, y, line)
+        except Exception as e:
+            # 특수 문자 에러 방지
+            print(f"[SC-PDF] WARNING: Error drawing line, using fallback: {e}")
+            safe_line = line.encode('utf-8', errors='ignore').decode('utf-8')
+            try:
+                c.drawString(margin_x, y, safe_line)
+            except:
+                # 그래도 안 되면 스킵
+                print(f"[SC-PDF] ERROR: Cannot draw line: {safe_line[:50]}...")
+        
         y -= line_height
 
+    c.showPage()
     c.save()
+    
+    print(f"[SC-PDF] PDF created successfully: {out_path}")
     return out_path
 
 
@@ -632,7 +671,6 @@ async def process_convert_and_index_prod(
     """
     운영용 백그라운드 처리 - convert-and-index
     
-    🔥 수정사항:
     1. PDF 외 확장자 → PDF 변환 (bytes 기반)
     2. 변환된 PDF를 MinIO에 업로드
     3. DB에는 경로를 쓰지 않고 상태만 업데이트
@@ -1107,7 +1145,18 @@ async def process_sc_index(
     
     job_state.start(job_id, data_id=data_id, file_id="sc_document")
     
+    # ========== 환경변수 백업 및 오버라이드 ==========
+    old_dedup = os.environ.get("RAG_DEDUP_MANIFEST")
+    old_skip = os.environ.get("RAG_SKIP_IF_EXISTS")
+    old_replace = os.environ.get("RAG_REPLACE_DOC")
+    
     try:
+        # SC 인덱싱은 항상 강제 재삽입 (환경변수 임시 오버라이드)
+        os.environ["RAG_DEDUP_MANIFEST"] = "0"
+        os.environ["RAG_SKIP_IF_EXISTS"] = "0"
+        os.environ["RAG_REPLACE_DOC"] = "0"
+        print(f"[SC-INDEX] Environment override: DEDUP=0, SKIP=0, REPLACE=0")
+        
         # ========== Step 1: OCR 시작 마킹 ==========
         db.mark_ocr_start(data_id)
         print(f"[SC-INDEX] 신규 SC 문서 작업: data_id={data_id}, parse_yn='L'")
@@ -1143,7 +1192,6 @@ async def process_sc_index(
         
         # 토큰 수 계산
         from app.services.embedding_model import get_embedding_model
-        import os
         
         embedding_model = get_embedding_model()
         tokenizer = getattr(embedding_model, "tokenizer", None)
@@ -1154,8 +1202,14 @@ async def process_sc_index(
         # 둘 중 작은 값 사용 (안전 마진 20% 확보)
         safe_max_tokens = int(min(max_seq_length, embed_max_tokens) * 0.8)
         
+        # Milvus VARCHAR 제한 (바이트 기준)
+        MILVUS_VARCHAR_MAX = int(os.getenv("MILVUS_VARCHAR_MAX", "8192"))
+        # UTF-8 한글은 3바이트, 안전 마진 포함
+        SAFE_CHAR_LIMIT = (MILVUS_VARCHAR_MAX // 3) - 200  # 약 2500자
+        
         print(f"[SC-INDEX] Max seq length: {max_seq_length}, EMBED_MAX_TOKENS: {embed_max_tokens}")
         print(f"[SC-INDEX] Safe max tokens per chunk: {safe_max_tokens}")
+        print(f"[SC-INDEX] Safe char limit: {SAFE_CHAR_LIMIT} (for Milvus VARCHAR)")
         
         # 전체 토큰 수 계산
         if tokenizer:
@@ -1185,6 +1239,10 @@ async def process_sc_index(
         if total_token_count <= safe_max_tokens:
             print(f"[SC-INDEX] Creating single chunk (within token limit)")
             
+            chunk_text = full_text
+            if len(chunk_text) > SAFE_CHAR_LIMIT:
+                print(f"[SC-INDEX] WARNING: Chunk text too long ({len(chunk_text)} chars), truncating to {SAFE_CHAR_LIMIT}")
+                chunk_text = chunk_text[:SAFE_CHAR_LIMIT]
             chunk_metadata = {
                 "page": 1,
                 "pages": [1],
@@ -1195,7 +1253,7 @@ async def process_sc_index(
                 **sc_metadata  # SC 메타데이터 추가
             }
             
-            chunk = (full_text, chunk_metadata)
+            chunk = (chunk_text, chunk_metadata)
             chunks = [chunk]
             
         else:
@@ -1218,6 +1276,9 @@ async def process_sc_index(
                     if i > 0:
                         # 나머지 청크에는 간략한 헤더 추가
                         chunk_text = f"[계속]\n{header}\n\n{chunk_text}"
+                    if len(chunk_text) > SAFE_CHAR_LIMIT:
+                        print(f"[SC-INDEX] WARNING: Chunk {i+1} too long ({len(chunk_text)} chars), truncating to {SAFE_CHAR_LIMIT}")
+                        chunk_text = chunk_text[:SAFE_CHAR_LIMIT]
                     
                     chunk_metadata = {
                         "page": i + 1,
@@ -1231,12 +1292,12 @@ async def process_sc_index(
                     
                     chunk = (chunk_text, chunk_metadata)
                     chunks.append(chunk)
-                    print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: {len(chunk_tokens)} tokens")
+                    print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: {len(chunk_tokens)} tokens, {len(chunk_text)} chars")
             else:
                 # tokenizer 없으면 문자 기반 분할 (대략적)
-                chars_per_chunk = safe_max_tokens * 4  # 1 토큰 ≈ 4자
+                chars_per_chunk = min(safe_max_tokens * 4, SAFE_CHAR_LIMIT)  # 둘 중 작은 값
                 num_chunks = (len(full_text) + chars_per_chunk - 1) // chars_per_chunk
-                print(f"[SC-INDEX] Splitting into {num_chunks} chunks (character-based)")
+                print(f"[SC-INDEX] Splitting into {num_chunks} chunks (character-based, {chars_per_chunk} chars each)")
                 
                 for i in range(num_chunks):
                     start_idx = i * chars_per_chunk
@@ -1246,6 +1307,9 @@ async def process_sc_index(
                     # 각 청크에 헤더 정보 추가
                     if i > 0:
                         chunk_text = f"[계속]\n{header}\n\n{chunk_text}"
+                    
+                    if len(chunk_text) > SAFE_CHAR_LIMIT:
+                        chunk_text = chunk_text[:SAFE_CHAR_LIMIT]
                     
                     chunk_metadata = {
                         "page": i + 1,
@@ -1259,7 +1323,7 @@ async def process_sc_index(
                     
                     chunk = (chunk_text, chunk_metadata)
                     chunks.append(chunk)
-                    print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: ~{len(chunk_text)} chars")
+                    print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: {len(chunk_text)} chars")
         
         print(f"[SC-INDEX] Total chunks created: {len(chunks)}")
         
@@ -1267,6 +1331,17 @@ async def process_sc_index(
         chunks = _coerce_chunks_for_milvus(chunks)
         print(f"[SC-INDEX] Normalized {len(chunks)} chunk(s) for Milvus")
         
+        for i, (text, meta) in enumerate(chunks):
+            byte_len = len(text.encode('utf-8', errors='ignore'))
+            if byte_len > MILVUS_VARCHAR_MAX:
+                print(f"[SC-INDEX] ERROR: Chunk {i} exceeds byte limit: {byte_len} > {MILVUS_VARCHAR_MAX}")
+                # 강제 자르기
+                while byte_len > MILVUS_VARCHAR_MAX and text:
+                    text = text[:int(len(text) * 0.9)]
+                    byte_len = len(text.encode('utf-8', errors='ignore'))
+                chunks[i] = (text, meta)
+                print(f"[SC-INDEX] Truncated chunk {i} to {byte_len} bytes")
+
         # ========== Step 5: 임베딩 및 Milvus 저장 ==========
         job_state.update(job_id, status="embedding", step=f"Embedding {len(chunks)} chunk(s)")
         
@@ -1292,9 +1367,16 @@ async def process_sc_index(
             embed_fn=embed
         )
         
-        print(f"[SC-INDEX] Successfully indexed: {result.get('inserted', 0)} chunk(s)")
+        inserted_count = result.get('inserted', 0)
+        print(f"[SC-INDEX] Milvus insert result: {result}")
+        print(f"[SC-INDEX] Successfully indexed: {inserted_count} chunk(s)")
+        
+        if inserted_count == 0 and len(chunks) > 0:
+            error_msg = f"Milvus 삽입 실패: {result.get('reason', 'unknown')}"
+            print(f"[SC-INDEX] ERROR: {error_msg}")
+            raise RuntimeError(error_msg)
 
- # ========== Step 6: MinIO sync (SC) ==========
+        # ========== Step 6: MinIO sync (SC) ==========
         try:
             SYNC_TO_MINIO = os.getenv("JAVA_SYNC_TO_MINIO", "1") == "1"
             if SYNC_TO_MINIO:
@@ -1331,6 +1413,7 @@ async def process_sc_index(
                     local_pdf = None
 
                 # MinIO 업로드 (PDF가 생성된 경우만)
+                object_pdf = None 
                 if local_pdf and local_pdf.exists():
                     object_pdf = f"uploaded/sc/{doc_id}.pdf"
                     
@@ -1358,6 +1441,8 @@ async def process_sc_index(
                     "receiver_agency": metadata['receiver_agency'],
                     "sc_title": metadata['sc_title'],
                     "send_date": metadata['send_date'],
+                    "type": "sc",
+                    "source_type": "sc_document",
                 }
                 
                 # get_json도 예외 처리
@@ -1366,29 +1451,31 @@ async def process_sc_index(
                     if m.exists(META_KEY(doc_id)):
                         meta = m.get_json(META_KEY(doc_id)) or {}
                 except Exception as e:
-                    print(f"[SC-MINIO]  Failed to load existing meta.json: {e}")
+                    print(f"[SC-MINIO] Failed to load existing meta.json: {e}")
                     meta = {}
                 
                 meta.update({
                     "doc_id": doc_id,
                     "title": display_title,
+                    "pdf_key": object_pdf,
+                    "object_key": object_pdf,  # backward compat
                     "indexed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "indexed": True,
-                    "chunk_count": int(result.get('inserted', 0)),
+                    "chunk_count": int(inserted_count),
                     "last_indexed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "type": "sc_document",
                     **extra_meta,
                 })
                 m.put_json(META_KEY(doc_id), meta)
 
-                print(f"[SC-MINIO] synced meta.json: title='{display_title}', chunks={result.get('inserted', 0)}")
+                print(f"[SC-MINIO] synced meta.json: title='{display_title}', pdf_key='{object_pdf}', chunks={inserted_count}")
                 
             else:
                 print("[SC-MINIO] skip: JAVA_SYNC_TO_MINIO=0")
         except Exception as e:
             import traceback
             print(f"[SC-MINIO] sync failed: {e}")
-            print(traceback.format_exc())
+            traceback.print_exc()
 
         # ========== Step 7: OCR 성공 마킹 ==========
         # SC 문서는 페이지 개념이 없으므로 osk_ocr_data에 저장하지 않음
@@ -1397,7 +1484,7 @@ async def process_sc_index(
         print(f"[SC-INDEX] Marked OCR success for SC document: data_id={data_id}")
         
         # ========== Step 8: RAG 완료 처리 ==========
-        chunk_count = result.get('inserted', len(chunks))
+        chunk_count = inserted_count
         
         print(f"[SC-INDEX] Indexing completed: 1 SC document, {chunk_count} chunk(s)")
         # RAG 완료 마킹 (parse_yn='S' 유지, 히스토리 로깅)
@@ -1436,6 +1523,8 @@ async def process_sc_index(
         job_state.fail(job_id, str(e))
         db.update_rag_error(data_id, str(e))
         print(f"[SC-INDEX] Error: {e}")
+        import traceback
+        traceback.print_exc()
         
         if callback_url:
             payload = WebhookPayload(
@@ -1447,6 +1536,24 @@ async def process_sc_index(
             await send_webhook(callback_url, payload, SHARED_SECRET)
         
         raise
+    
+    finally:
+        if old_dedup is not None:
+            os.environ["RAG_DEDUP_MANIFEST"] = old_dedup
+        else:
+            os.environ.pop("RAG_DEDUP_MANIFEST", None)
+        
+        if old_skip is not None:
+            os.environ["RAG_SKIP_IF_EXISTS"] = old_skip
+        else:
+            os.environ.pop("RAG_SKIP_IF_EXISTS", None)
+            
+        if old_replace is not None:
+            os.environ["RAG_REPLACE_DOC"] = old_replace
+        else:
+            os.environ.pop("RAG_REPLACE_DOC", None)
+        
+        print(f"[SC-INDEX] Environment variables restored")
 
 
 async def process_delete_document(

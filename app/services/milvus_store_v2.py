@@ -553,7 +553,7 @@ class MilvusStoreV2:
 
         # 검색 로깅
         if out:
-            print(f"🔍 Search: topk={topk}, ef={ef}, results={len(out)}, top_score={out[0]['score']:.3f}")
+            print(f"Search: topk={topk}, ef={ef}, results={len(out)}, top_score={out[0]['score']:.3f}")
         
         return out
     
