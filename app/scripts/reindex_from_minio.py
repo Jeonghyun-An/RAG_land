@@ -23,7 +23,7 @@ import argparse
 import traceback
 import tempfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional
 import json
 
@@ -226,7 +226,34 @@ def process_single_document(
                 os.environ.pop("RAG_REPLACE_DOC", None)
         
         inserted_count = insert_result.get("inserted", 0)
-        
+        if inserted_count > 0:
+            try:
+                from app.services.minio_store import MinIOStore
+                m = MinIOStore()
+                
+                # 기존 meta 읽기
+                meta_key_path = f"uploaded/__meta__/{doc_id}/meta.json"
+                meta = {}
+                try:
+                    if m.exists(meta_key_path):
+                        meta = m.get_json(meta_key_path) or {}
+                except:
+                    pass
+                
+                # 업데이트
+                meta.update({
+                    "doc_id": doc_id,
+                    "chunk_count": inserted_count,
+                    "indexed": True,
+                    "last_indexed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                })
+                
+                # 저장
+                m.put_json(meta_key_path, meta)
+                print(f"[meta.json] Updated: {inserted_count} chunks")
+                
+            except Exception as e:
+                print(f"[WARN] Failed to update meta.json: {e}")
         if inserted_count == 0:
             result["message"] = f"Milvus 삽입 실패 - {insert_result.get('reason', 'unknown')}"
             result["details"]["step"] = "insertion"
