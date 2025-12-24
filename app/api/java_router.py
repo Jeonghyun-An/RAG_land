@@ -398,6 +398,43 @@ def _render_text_pdf(text: str, out_path: str) -> str:
     print(f"[SC-PDF] PDF created successfully: {out_path}")
     return out_path
 
+def _clean_html_and_split_paragraphs(html_text: str) -> List[str]:
+    """
+    HTML 텍스트를 정리하고 <p><br></p> 단위로 단락 분리
+    
+    사용자가 엔터로 구분한 단락을 유지하기 위함.
+    """
+    from html import unescape
+    import re
+    
+    # HTML 엔티티 디코딩
+    text = unescape(html_text)
+    
+    # 빈 <p> 태그를 단락 구분자로 변경
+    # <p><br></p>, <p><br/></p>, <p> </p>, <p></p> 등
+    # 연속된 빈 태그도 하나의 구분자로 처리
+    empty_p_pattern = r'(<p[^>]*>\s*(?:<br\s*/?>)?\s*</p>\s*)+'
+    text = re.sub(empty_p_pattern, '\n\n__PARAGRAPH_BREAK__\n\n', text, flags=re.IGNORECASE)
+    
+    # 나머지 <p> 태그 제거 (내용은 유지)
+    text = re.sub(r'</?p[^>]*>', '', text, flags=re.IGNORECASE)
+    
+    # 모든 HTML 태그 제거
+    text = re.sub(r'<[^>]+>', '', text)
+    
+    # 단락 분리
+    paragraphs = text.split('__PARAGRAPH_BREAK__')
+    
+    cleaned_paragraphs = []
+    for para in paragraphs:
+        # 연속된 공백을 하나로
+        para = re.sub(r'\s+', ' ', para)
+        para = para.strip()
+        
+        if para:
+            cleaned_paragraphs.append(para)
+    
+    return cleaned_paragraphs
 
 # ==================== Endpoints ====================
 
@@ -1138,6 +1175,7 @@ async def process_sc_index(
     5. 토큰 수에 따라 청크 분할 (필요시)
     6. 임베딩 및 Milvus 저장
     7. osk_data.parse_yn = 'S', osk_ocr_hist 로깅
+    개선: HTML 태그 제거 + <br> 단위 단락 청킹
     """
     db = DBConnector()
     m = MinIOStore()
@@ -1173,30 +1211,39 @@ async def process_sc_index(
         
         metadata = sc_data['metadata']
         header = sc_data['header']
-        contents = sc_data['contents']
+        contents_raw = sc_data['contents']
         conclusion = sc_data['conclusion']
-        full_text = sc_data['full_text']
         
         print(f"[SC-INDEX] Loaded SC document:")
         print(f"     문서번호: {metadata['sc_code']}")
         print(f"     수신처: {metadata['receiver_agency']}")
         print(f"     제목: {metadata['sc_title']}")
         print(f"     발신일: {metadata['send_date']}")
-        print(f"     Full text: {len(full_text)} characters")
         print(f"     Header: {len(header)} characters")
-        print(f"     Contents: {len(contents)} characters")
+        print(f"     Contents (raw): {len(contents_raw)} characters")
         print(f"     Conclusion: {len(conclusion)} characters")
         
-        # ========== Step 3: 청크 생성 (토큰 길이에 따라 분할) ==========
+        print(f"[SC-INDEX] Cleaning HTML and splitting paragraphs...")
+        paragraphs = _clean_html_and_split_paragraphs(contents_raw)
+        print(f"[SC-INDEX] Extracted {len(paragraphs)} paragraphs from contents")
+        if len(paragraphs) > 0:
+            print(f"[SC-INDEX] First paragraph preview: {paragraphs[0][:100]}...")
+        full_text_clean = header  # 헤더는 그대로 사용
+        if paragraphs:
+            full_text_clean += "\n\n" + "\n\n".join(paragraphs)
+        if conclusion:
+            full_text_clean += "\n\n" + conclusion
+        
+        print(f"[SC-INDEX] Full text (cleaned): {len(full_text_clean)} characters")
+
+        # ========== Step 3: 단락 기반 청크 생성 ==========
         job_state.update(job_id, status="chunking", step="Creating chunks for SC document")
         
-        # 토큰 수 계산
         from app.services.embedding_model import get_embedding_model
         
         embedding_model = get_embedding_model()
         tokenizer = getattr(embedding_model, "tokenizer", None)
         
-        # 임베딩 모델의 최대 토큰 길이 가져오기
         max_seq_length = int(getattr(embedding_model, "max_seq_length", 1024))
         embed_max_tokens = int(os.getenv("EMBED_MAX_TOKENS", "1024"))
         # 둘 중 작은 값 사용 (안전 마진 20% 확보)
@@ -1210,18 +1257,7 @@ async def process_sc_index(
         print(f"[SC-INDEX] Max seq length: {max_seq_length}, EMBED_MAX_TOKENS: {embed_max_tokens}")
         print(f"[SC-INDEX] Safe max tokens per chunk: {safe_max_tokens}")
         print(f"[SC-INDEX] Safe char limit: {SAFE_CHAR_LIMIT} (for Milvus VARCHAR)")
-        
-        # 전체 토큰 수 계산
-        if tokenizer:
-            tokens = tokenizer.encode(full_text, add_special_tokens=False)
-            total_token_count = len(tokens)
-        else:
-            # tokenizer 없으면 대략적 추정
-            total_token_count = len(full_text) // 4
-            tokens = None
-        
-        print(f"[SC-INDEX] SC document total token count: {total_token_count}")
-        
+
         # ========== Step 3.1: SC 메타데이터 준비 ==========
         # 모든 청크에 공통으로 들어갈 SC 메타데이터
         sc_metadata = {
@@ -1234,99 +1270,83 @@ async def process_sc_index(
         
         chunks = []
         
-        # ========== Step 3.2: 청크 생성 로직 ==========
-        # 토큰 수가 안전 범위 내면 단일 청크
-        if total_token_count <= safe_max_tokens:
-            print(f"[SC-INDEX] Creating single chunk (within token limit)")
+        # ========== Step 3.2: 단락 기반 청크 생성 로직 ==========
+        current_chunk_text = header  # 헤더로 시작
+        current_token_count = 0
+        
+        if tokenizer:
+            current_token_count = len(tokenizer.encode(current_chunk_text, add_special_tokens=False))
+        else:
+            current_token_count = len(current_chunk_text) // 4
+        
+        chunk_index = 0
+        
+        for i, paragraph in enumerate(paragraphs):
+            # 단락의 토큰 수 계산
+            if tokenizer:
+                para_tokens = len(tokenizer.encode(paragraph, add_special_tokens=False))
+            else:
+                para_tokens = len(paragraph) // 4
             
-            chunk_text = full_text
-            if len(chunk_text) > SAFE_CHAR_LIMIT:
-                print(f"[SC-INDEX] WARNING: Chunk text too long ({len(chunk_text)} chars), truncating to {SAFE_CHAR_LIMIT}")
-                chunk_text = chunk_text[:SAFE_CHAR_LIMIT]
+            # 현재 청크에 단락을 추가했을 때 제한을 넘는지 확인
+            would_exceed_tokens = (current_token_count + para_tokens) > safe_max_tokens
+            would_exceed_chars = (len(current_chunk_text) + len(paragraph) + 2) > SAFE_CHAR_LIMIT
+            
+            if would_exceed_tokens or would_exceed_chars:
+                # 현재 청크 저장
+                if current_chunk_text.strip():
+                    chunk_metadata = {
+                        "page": chunk_index + 1,
+                        "pages": [chunk_index + 1],
+                        "section": f"SC Document (Part {chunk_index + 1})" if chunk_index > 0 else "SC Document",
+                        "token_count": current_token_count,
+                        "bboxes": {},
+                        "type": "sc_document_part" if chunk_index > 0 else "sc_document",
+                        **sc_metadata
+                    }
+                    
+                    chunks.append((current_chunk_text, chunk_metadata))
+                    print(f"[SC-INDEX] Created chunk {chunk_index + 1}: {current_token_count} tokens, {len(current_chunk_text)} chars")
+                    chunk_index += 1
+                
+                # 새 청크 시작 (헤더 포함)
+                current_chunk_text = f"[계속]\n{header}\n\n{paragraph}"
+                if tokenizer:
+                    header_tokens = len(tokenizer.encode(header, add_special_tokens=False))
+                    current_token_count = para_tokens + header_tokens + 10  # [계속]\n 부분
+                else:
+                    current_token_count = (len(header) + len(paragraph)) // 4
+            else:
+                # 현재 청크에 단락 추가
+                current_chunk_text += f"\n\n{paragraph}"
+                current_token_count += para_tokens
+        
+        # 마지막 청크 저장
+        if current_chunk_text.strip():
+            # 결론 추가
+            if conclusion:
+                current_chunk_text += f"\n\n{conclusion}"
+            
+            if tokenizer:
+                current_token_count = len(tokenizer.encode(current_chunk_text, add_special_tokens=False))
+            else:
+                current_token_count = len(current_chunk_text) // 4
+            
             chunk_metadata = {
-                "page": 1,
-                "pages": [1],
-                "section": "SC Document",
-                "token_count": total_token_count,
+                "page": chunk_index + 1,
+                "pages": [chunk_index + 1],
+                "section": f"SC Document (Part {chunk_index + 1})" if chunk_index > 0 else "SC Document",
+                "token_count": current_token_count,
                 "bboxes": {},
-                "type": "sc_document",
-                **sc_metadata  # SC 메타데이터 추가
+                "type": "sc_document_part" if chunk_index > 0 else "sc_document",
+                **sc_metadata
             }
             
-            chunk = (chunk_text, chunk_metadata)
-            chunks = [chunk]
-            
-        else:
-            # 토큰 수 초과 시 분할
-            print(f"[SC-INDEX] Token count ({total_token_count}) exceeds limit ({safe_max_tokens}), splitting into multiple chunks")
-            
-            if tokenizer and tokens:
-                # tokenizer가 있으면 정확하게 토큰 기반 분할
-                num_chunks = (total_token_count + safe_max_tokens - 1) // safe_max_tokens
-                print(f"[SC-INDEX] Splitting into {num_chunks} chunks")
-                
-                for i in range(num_chunks):
-                    start_idx = i * safe_max_tokens
-                    end_idx = min((i + 1) * safe_max_tokens, total_token_count)
-                    chunk_tokens = tokens[start_idx:end_idx]
-                    chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-                    
-                    # 각 청크에 헤더 정보 추가 (첫 청크 제외)
-                    # 전략: 모든 청크에 헤더 포함하여 컨텍스트 유지
-                    if i > 0:
-                        # 나머지 청크에는 간략한 헤더 추가
-                        chunk_text = f"[계속]\n{header}\n\n{chunk_text}"
-                    if len(chunk_text) > SAFE_CHAR_LIMIT:
-                        print(f"[SC-INDEX] WARNING: Chunk {i+1} too long ({len(chunk_text)} chars), truncating to {SAFE_CHAR_LIMIT}")
-                        chunk_text = chunk_text[:SAFE_CHAR_LIMIT]
-                    
-                    chunk_metadata = {
-                        "page": i + 1,
-                        "pages": [i + 1],
-                        "section": f"SC Document (Part {i + 1}/{num_chunks})",
-                        "token_count": len(chunk_tokens),
-                        "bboxes": {},
-                        "type": "sc_document_part",
-                        **sc_metadata  # SC 메타데이터 추가
-                    }
-                    
-                    chunk = (chunk_text, chunk_metadata)
-                    chunks.append(chunk)
-                    print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: {len(chunk_tokens)} tokens, {len(chunk_text)} chars")
-            else:
-                # tokenizer 없으면 문자 기반 분할 (대략적)
-                chars_per_chunk = min(safe_max_tokens * 4, SAFE_CHAR_LIMIT)  # 둘 중 작은 값
-                num_chunks = (len(full_text) + chars_per_chunk - 1) // chars_per_chunk
-                print(f"[SC-INDEX] Splitting into {num_chunks} chunks (character-based, {chars_per_chunk} chars each)")
-                
-                for i in range(num_chunks):
-                    start_idx = i * chars_per_chunk
-                    end_idx = min((i + 1) * chars_per_chunk, len(full_text))
-                    chunk_text = full_text[start_idx:end_idx]
-                    
-                    # 각 청크에 헤더 정보 추가
-                    if i > 0:
-                        chunk_text = f"[계속]\n{header}\n\n{chunk_text}"
-                    
-                    if len(chunk_text) > SAFE_CHAR_LIMIT:
-                        chunk_text = chunk_text[:SAFE_CHAR_LIMIT]
-                    
-                    chunk_metadata = {
-                        "page": i + 1,
-                        "pages": [i + 1],
-                        "section": f"SC Document (Part {i + 1}/{num_chunks})",
-                        "token_count": len(chunk_text) // 4,
-                        "bboxes": {},
-                        "type": "sc_document_part",
-                        **sc_metadata  # SC 메타데이터 추가
-                    }
-                    
-                    chunk = (chunk_text, chunk_metadata)
-                    chunks.append(chunk)
-                    print(f"[SC-INDEX] Created chunk {i + 1}/{num_chunks}: {len(chunk_text)} chars")
+            chunks.append((current_chunk_text, chunk_metadata))
+            print(f"[SC-INDEX] Created final chunk {chunk_index + 1}: {current_token_count} tokens, {len(current_chunk_text)} chars")
         
-        print(f"[SC-INDEX] Total chunks created: {len(chunks)}")
-        
+        print(f"[SC-INDEX] Total chunks created: {len(chunks)} (paragraph-based)")
+            
         # ========== Step 4: 청크 정규화 ==========
         chunks = _coerce_chunks_for_milvus(chunks)
         print(f"[SC-INDEX] Normalized {len(chunks)} chunk(s) for Milvus")
@@ -1403,7 +1423,7 @@ async def process_sc_index(
                 local_pdf = _Path(tmpdir) / f"sc_{doc_id}.pdf"
 
                 try:
-                    _render_text_pdf(full_text, str(local_pdf))
+                    _render_text_pdf(full_text_clean, str(local_pdf))
                 except ImportError as e:
                     # reportlab 미설치 시 안내 로그
                     print(f"[SC-MINIO] reportlab not installed, skipping PDF generation")
@@ -1443,6 +1463,7 @@ async def process_sc_index(
                     "send_date": metadata['send_date'],
                     "type": "sc",
                     "source_type": "sc_document",
+                    "paragraph_count": len(paragraphs),
                 }
                 
                 # get_json도 예외 처리
