@@ -27,22 +27,22 @@ LORA_PATH = os.getenv("OUTPUT_DIR", "/workspace/output/qwen2.5-7b-nuclear-lora")
 MERGED_OUTPUT_DIR = os.getenv("MERGED_OUTPUT_DIR", "/workspace/output/qwen2.5-7b-nuclear-merged")
 
 print("="*80)
-print("🔧 LoRA 어댑터 병합")
+print(" LoRA 어댑터 병합")
 print("="*80)
-print(f"📦 Base Model: {MODEL_NAME}")
-print(f"🎯 LoRA Adapter: {LORA_PATH}")
-print(f"💾 Output Directory: {MERGED_OUTPUT_DIR}")
+print(f" Base Model: {MODEL_NAME}")
+print(f" LoRA Adapter: {LORA_PATH}")
+print(f" Output Directory: {MERGED_OUTPUT_DIR}")
 print("="*80)
 
 # ==================== 검증 ====================
 lora_config_path = Path(LORA_PATH) / "adapter_config.json"
 if not lora_config_path.exists():
-    print(f"❌ LoRA adapter not found at {LORA_PATH}")
+    print(f" LoRA adapter not found at {LORA_PATH}")
     print("   Please run train_qlora.py first!")
     sys.exit(1)
 
 # ==================== 모델 로드 ====================
-print("\n📥 Loading models...")
+print("\n Loading models...")
 
 try:
     # Tokenizer
@@ -74,7 +74,7 @@ except Exception as e:
     sys.exit(1)
 
 # ==================== 병합 ====================
-print("\n🔄 Merging LoRA weights into base model...")
+print("\n Merging LoRA weights into base model...")
 print("   This may take several minutes...")
 
 try:
@@ -90,7 +90,7 @@ except Exception as e:
     sys.exit(1)
 
 # ==================== 저장 ====================
-print(f"\n💾 Saving merged model to {MERGED_OUTPUT_DIR}...")
+print(f"\n Saving merged model to {MERGED_OUTPUT_DIR}...")
 
 try:
     # 출력 디렉토리 생성
@@ -182,7 +182,7 @@ try:
     print(f"   A: {response[:200]}...")
 
 except Exception as e:
-    print(f"⚠️  Verification failed: {e}")
+    print(f"  Verification failed: {e}")
     import traceback
     traceback.print_exc()
 

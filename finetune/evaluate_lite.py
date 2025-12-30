@@ -21,10 +21,10 @@ MAX_NEW_TOKENS = 200
 GENERATION_TIMEOUT = 30
 
 print("="*80)
-print("🧪 개선된 경량 파인튜닝 모델 평가 (v2)")
+print(" 개선된 경량 파인튜닝 모델 평가 (v2)")
 print("="*80)
-print(f"📦 Base Model: {MODEL_NAME}")
-print(f"🎯 LoRA Path: {LORA_PATH}")
+print(f" Base Model: {MODEL_NAME}")
+print(f" LoRA Path: {LORA_PATH}")
 print("="*80)
 
 # ==================== 모델 로드 ====================
@@ -45,14 +45,14 @@ try:
     model.eval()
     
     load_time = time.time() - start_time
-    print(f"✅ Model loaded ({load_time:.1f}s)")
+    print(f" Model loaded ({load_time:.1f}s)")
     
     if torch.cuda.is_available():
         gpu_allocated = torch.cuda.memory_allocated(0) / 1e9
-        print(f"🔧 GPU Memory: {gpu_allocated:.2f} GB")
+        print(f" GPU Memory: {gpu_allocated:.2f} GB")
 
 except Exception as e:
-    print(f"❌ Failed: {e}")
+    print(f" Failed: {e}")
     sys.exit(1)
 
 # ==================== 테스트 질문 ====================
@@ -139,7 +139,7 @@ def generate_response(question: str) -> tuple:
         return f"[ERROR: {str(e)}]", 0, False
 
 # ==================== 평가 실행 ====================
-print("\n🔍 Evaluating...\n" + "="*80)
+print("\n Evaluating...\n" + "="*80)
 
 results = []
 total_time = 0
@@ -167,7 +167,7 @@ for i, test_case in enumerate(test_questions, 1):
         # 응답 출력 (처음 200자)
         display_text = response[:200] + "..." if len(response) > 200 else response
         print(f"A: {display_text}")
-        print(f"⏱️  {inference_time:.2f}s | 키워드: {matched}/{len(expected_keywords)} ({match_rate*100:.0f}%)")
+        print(f"⏱  {inference_time:.2f}s | 키워드: {matched}/{len(expected_keywords)} ({match_rate*100:.0f}%)")
         
         result = {
             "index": i,
@@ -181,7 +181,7 @@ for i, test_case in enumerate(test_questions, 1):
             "success": True
         }
     else:
-        print(f"❌ Failed: {response}")
+        print(f" Failed: {response}")
         result = {
             "index": i,
             "category": category,
@@ -195,7 +195,7 @@ for i, test_case in enumerate(test_questions, 1):
 
 # ==================== 결과 분석 ====================
 print("\n" + "="*80)
-print("📊 평가 결과")
+print(" 평가 결과")
 print("="*80)
 
 successful_results = [r for r in results if r["success"]]
@@ -204,9 +204,9 @@ if successful_results:
     avg_time = total_time / len(successful_results)
     avg_match_rate = sum(r["match_rate"] for r in successful_results) / len(successful_results)
     
-    print(f"\n✅ 성공: {success_count}/{len(test_questions)}")
-    print(f"⏱️  평균 추론 시간: {avg_time:.2f}s")
-    print(f"🎯 평균 키워드 매칭률: {avg_match_rate*100:.1f}%")
+    print(f"\n 성공: {success_count}/{len(test_questions)}")
+    print(f"⏱  평균 추론 시간: {avg_time:.2f}s")
+    print(f" 평균 키워드 매칭률: {avg_match_rate*100:.1f}%")
     
     # 카테고리별
     categories = {}
@@ -216,21 +216,21 @@ if successful_results:
             categories[cat] = []
         categories[cat].append(r["match_rate"])
     
-    print(f"\n📈 카테고리별 매칭률:")
+    print(f"\n 카테고리별 매칭률:")
     for cat, rates in categories.items():
         avg_rate = sum(rates) / len(rates)
         print(f"   [{cat}]: {avg_rate*100:.1f}%")
     
     # 판정
-    print(f"\n🎓 종합 평가:")
+    print(f"\n 종합 평가:")
     if avg_match_rate >= 0.7:
-        print("   ✅ 우수 - 파인튜닝 성공!")
+        print("    우수 - 파인튜닝 성공!")
     elif avg_match_rate >= 0.5:
-        print("   ⚠️  보통 - 추가 학습 권장")
+        print("     보통 - 추가 학습 권장")
     else:
-        print("   ❌ 미흡 - 재학습 필요")
+        print("    미흡 - 재학습 필요")
 else:
-    print("\n❌ 모든 테스트 실패")
+    print("\n 모든 테스트 실패")
 
 # ==================== 결과 저장 ====================
 output_dir = Path(LORA_PATH)
@@ -254,10 +254,10 @@ with open(output_file, 'w', encoding='utf-8') as f:
             f.write(f"A: {r['response']}\n")
             f.write(f"시간: {r['inference_time']:.2f}s | 매칭: {r['matched_keywords']}/{r['total_keywords']}\n")
         else:
-            f.write(f"❌ 실패: {r['response']}\n")
+            f.write(f" 실패: {r['response']}\n")
         f.write("\n" + "-"*80 + "\n\n")
 
-print(f"\n💾 결과 저장: {output_file}")
+print(f"\n 결과 저장: {output_file}")
 print("\n" + "="*80)
-print("✅ 평가 완료!")
+print(" 평가 완료!")
 print("="*80)

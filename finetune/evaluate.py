@@ -28,22 +28,22 @@ TEST_DATA = os.getenv("TEST_DATASET_PATH", "/workspace/data/test_qa.jsonl")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 print("="*80)
-print("🧪 파인튜닝 모델 평가")
+print(" 파인튜닝 모델 평가")
 print("="*80)
-print(f"📦 Base Model: {MODEL_NAME}")
-print(f"🎯 LoRA Adapter: {LORA_PATH}")
-print(f"📊 Test Data: {TEST_DATA}")
-print(f"🔧 Device: {DEVICE}")
+print(f" Base Model: {MODEL_NAME}")
+print(f" LoRA Adapter: {LORA_PATH}")
+print(f" Test Data: {TEST_DATA}")
+print(f" Device: {DEVICE}")
 print("="*80)
 
 # ==================== 모델 로드 ====================
-print("\n📥 Loading model...")
+print("\n Loading model...")
 
 try:
     # LoRA 어댑터가 있는지 확인
     lora_config_path = Path(LORA_PATH) / "adapter_config.json"
     if not lora_config_path.exists():
-        print(f"❌ LoRA adapter not found at {LORA_PATH}")
+        print(f" LoRA adapter not found at {LORA_PATH}")
         print("   Please run train_qlora.py first!")
         sys.exit(1)
     
@@ -67,37 +67,37 @@ try:
     model = PeftModel.from_pretrained(model, LORA_PATH)
     model.eval()
     
-    print("✅ Model loaded successfully")
+    print(" Model loaded successfully")
     
     # 모델 정보 출력
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n📊 Model Info:")
+    print(f"\n Model Info:")
     print(f"   Total params: {total_params:,}")
     print(f"   Trainable params: {trainable_params:,}")
     print(f"   Trainable ratio: {100 * trainable_params / total_params:.2f}%")
 
 except Exception as e:
-    print(f"❌ Failed to load model: {e}")
+    print(f" Failed to load model: {e}")
     traceback.print_exc()
     sys.exit(1)
 
 # ==================== 테스트 데이터 로드 ====================
-print(f"\n📂 Loading test data: {TEST_DATA}")
+print(f"\n Loading test data: {TEST_DATA}")
 
 try:
     if not Path(TEST_DATA).exists():
-        print(f"❌ Test data not found: {TEST_DATA}")
+        print(f" Test data not found: {TEST_DATA}")
         print("   Please run prepare_from_milvus.py first!")
         sys.exit(1)
     
     dataset = load_dataset('json', data_files=TEST_DATA)
     test_data = dataset['train']
     
-    print(f"✅ Loaded {len(test_data)} test examples")
+    print(f" Loaded {len(test_data)} test examples")
 
 except Exception as e:
-    print(f"❌ Failed to load test data: {e}")
+    print(f" Failed to load test data: {e}")
     traceback.print_exc()
     sys.exit(1)
 
@@ -150,7 +150,7 @@ def generate_response(instruction: str, input_text: str = "") -> str:
     return response
 
 # ==================== 평가 실행 ====================
-print("\n🔍 Evaluating model...")
+print("\n Evaluating model...")
 print("="*80)
 
 results = []
@@ -196,14 +196,14 @@ for i, example in enumerate(tqdm(test_data, desc="Evaluating")):
 
 # ==================== 결과 분석 ====================
 print("\n" + "="*80)
-print("📊 평가 결과")
+print(" 평가 결과")
 print("="*80)
 
 successful_count = sum(1 for r in results if r['success'])
 failed_count = len(results) - successful_count
 avg_time = total_time / len(results) if results else 0
 
-print(f"\n📈 통계:")
+print(f"\n 통계:")
 print(f"   총 테스트: {len(results)}")
 print(f"   성공: {successful_count}")
 print(f"   실패: {failed_count}")
@@ -232,7 +232,7 @@ with open(results_file, 'w', encoding='utf-8') as f:
         "results": results
     }, f, ensure_ascii=False, indent=2)
 
-print(f"\n💾 결과 저장:")
+print(f"\n 결과 저장:")
 print(f"   {results_file}")
 
 # 샘플 결과 저장 (텍스트 파일)
@@ -256,7 +256,7 @@ with open(samples_file, 'w', encoding='utf-8') as f:
 print(f"   {samples_file}")
 
 # ==================== 샘플 출력 ====================
-print("\n📝 샘플 결과 (처음 3개):\n")
+print("\n 샘플 결과 (처음 3개):\n")
 print("="*80)
 
 for i, result in enumerate(results[:3]):
@@ -270,5 +270,5 @@ for i, result in enumerate(results[:3]):
     print(f"\n추론 시간: {result['inference_time']:.2f}초")
     print("="*80)
 
-print("\n✅ 평가 완료!")
-print(f"📂 상세 결과: {output_dir}")
+print("\n 평가 완료!")
+print(f" 상세 결과: {output_dir}")

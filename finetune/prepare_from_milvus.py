@@ -11,7 +11,7 @@ MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "rag_chunks_v2")
 
 async def extract_from_milvus(target_count: int = 3000):
-    print(f"🔗 Connecting to Milvus: {MILVUS_HOST}:{MILVUS_PORT}")
+    print(f" Connecting to Milvus: {MILVUS_HOST}:{MILVUS_PORT}")
     
     try:
         from pymilvus import connections, Collection
@@ -22,33 +22,33 @@ async def extract_from_milvus(target_count: int = 3000):
             port=MILVUS_PORT
         )
         
-        print(f"✅ Connected to Milvus")
+        print(f" Connected to Milvus")
         
         collection = Collection(MILVUS_COLLECTION)
         collection.load()
         
-        print(f"📊 Collection: {MILVUS_COLLECTION}")
-        print(f"📈 Total entities: {collection.num_entities}")
+        print(f" Collection: {MILVUS_COLLECTION}")
+        print(f" Total entities: {collection.num_entities}")
         
-        # ✅ 스키마 확인
-        print(f"\n📋 Schema fields:")
+        #  스키마 확인
+        print(f"\n Schema fields:")
         for field in collection.schema.fields:
             print(f"  - {field.name}: {field.dtype}")
         
-        # ✅ 쿼리 수정 (chunk_index 대신 id 또는 빈 expr 사용)
+        #  쿼리 수정 (chunk_index 대신 id 또는 빈 expr 사용)
         total_entities = collection.num_entities
         limit = min(target_count, total_entities)
         
-        print(f"\n📥 Extracting {limit} chunks...")
+        print(f"\n Extracting {limit} chunks...")
         
         # 방법 1: id 필드 사용
         results = collection.query(
-            expr=f"id >= 0",  # ✅ chunk_index → id
+            expr=f"id >= 0",  #  chunk_index → id
             output_fields=["doc_id", "section", "chunk", "page"],
             limit=limit
         )
         
-        print(f"✅ Extracted {len(results)} chunks from Milvus")
+        print(f" Extracted {len(results)} chunks from Milvus")
         
         qa_pairs = []
         for i, chunk in enumerate(results):
@@ -57,13 +57,13 @@ async def extract_from_milvus(target_count: int = 3000):
             
             qa_pairs.extend(generate_qa_from_chunk(chunk))
         
-        print(f"✅ Generated {len(qa_pairs)} QA pairs")
+        print(f" Generated {len(qa_pairs)} QA pairs")
         
         connections.disconnect("default")
         return qa_pairs
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f" Error: {e}")
         import traceback
         traceback.print_exc()
         return []
@@ -163,17 +163,17 @@ def save_dataset(data: List[Dict], output_path: str):
         for item in data:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
     
-    print(f"✅ Saved {len(data)} examples to {output_path}")
+    print(f" Saved {len(data)} examples to {output_path}")
 
 async def main():
     print("="*60)
-    print("📊 Extracting QA Data from Milvus")
+    print(" Extracting QA Data from Milvus")
     print("="*60)
     
     qa_pairs = await extract_from_milvus(target_count=3000)
     
     if not qa_pairs:
-        print("❌ No data extracted")
+        print(" No data extracted")
         return
     
     # 중복 제거
@@ -184,7 +184,7 @@ async def main():
             unique_qa[key] = qa
     
     qa_pairs = list(unique_qa.values())
-    print(f"✅ After deduplication: {len(qa_pairs)} unique QA pairs")
+    print(f" After deduplication: {len(qa_pairs)} unique QA pairs")
     
     # Train/Test 분할
     random.shuffle(qa_pairs)
@@ -198,14 +198,14 @@ async def main():
     save_dataset(test_data, "/workspace/data/test_qa.jsonl")
     
     print("="*60)
-    print(f"📊 Final Statistics:")
+    print(f" Final Statistics:")
     print(f"   Train: {len(train_data)} examples")
     print(f"   Test:  {len(test_data)} examples")
     print(f"   Total: {len(qa_pairs)} unique QA pairs")
     print("="*60)
     
     # 샘플 출력
-    print("\n📝 Sample QA Pairs:\n")
+    print("\n Sample QA Pairs:\n")
     for i, qa in enumerate(train_data[:3], 1):
         print(f"[{i}] Q: {qa['instruction']}")
         print(f"    A: {qa['output'][:100]}...")

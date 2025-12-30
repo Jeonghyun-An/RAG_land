@@ -148,11 +148,11 @@ def compare_models(base_url: str, finetuned_url: str, output_dir: str = "./compa
     """두 모델 성능 비교"""
     
     print("="*80)
-    print("🔬 모델 성능 비교 테스트")
+    print(" 모델 성능 비교 테스트")
     print("="*80)
-    print(f"📌 Base Model URL: {base_url}")
-    print(f"📌 Finetuned Model URL: {finetuned_url}")
-    print(f"📊 Test Questions: {len(NUCLEAR_TEST_QUESTIONS)}")
+    print(f" Base Model URL: {base_url}")
+    print(f" Finetuned Model URL: {finetuned_url}")
+    print(f" Test Questions: {len(NUCLEAR_TEST_QUESTIONS)}")
     print("="*80)
     
     results = []
@@ -226,7 +226,7 @@ def compare_models(base_url: str, finetuned_url: str, output_dir: str = "./compa
     
     # ==================== 결과 출력 ====================
     print("\n" + "="*80)
-    print("📊 비교 결과")
+    print(" 비교 결과")
     print("="*80)
     print(f"\n전체 통계:")
     print(f"  총 테스트: {total_tests}")
@@ -273,7 +273,7 @@ def compare_models(base_url: str, finetuned_url: str, output_dir: str = "./compa
             "results": results
         }, f, ensure_ascii=False, indent=2)
     
-    print(f"\n💾 결과 저장: {results_file}")
+    print(f"\n 결과 저장: {results_file}")
     
     # 텍스트 리포트 저장
     report_file = output_path / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
@@ -302,7 +302,7 @@ def compare_models(base_url: str, finetuned_url: str, output_dir: str = "./compa
                 f.write(f"Finetuned 점수: {r['finetuned_model']['evaluation']['total_score']:.3f}\n")
                 f.write("-"*80 + "\n\n")
     
-    print(f"💾 리포트 저장: {report_file}")
+    print(f" 리포트 저장: {report_file}")
     print("="*80)
 
 # ==================== 메인 ====================

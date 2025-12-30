@@ -34,14 +34,14 @@ LEARNING_RATE = float(os.getenv("LEARNING_RATE", "2e-4"))
 MAX_SEQ_LENGTH = int(os.getenv("MAX_SEQ_LENGTH", "2048"))
 
 logger.info("="*60)
-logger.info("🚀 Nuclear Safety Fine-tuning (QLoRA)")
+logger.info(" Nuclear Safety Fine-tuning (QLoRA)")
 logger.info("="*60)
-logger.info(f"📦 Model: {MODEL_NAME}")
-logger.info(f"📊 Dataset: {DATASET_PATH}")
-logger.info(f"💾 Output: {OUTPUT_DIR}")
-logger.info(f"🎛️  LoRA Config: r={LORA_R}, alpha={LORA_ALPHA}, dropout={LORA_DROPOUT}")
-logger.info(f"🔧 Batch: {BATCH_SIZE}, Grad Accum: {GRADIENT_ACCUMULATION}")
-logger.info(f"📈 Epochs: {NUM_EPOCHS}, LR: {LEARNING_RATE}")
+logger.info(f" Model: {MODEL_NAME}")
+logger.info(f" Dataset: {DATASET_PATH}")
+logger.info(f" Output: {OUTPUT_DIR}")
+logger.info(f" LoRA Config: r={LORA_R}, alpha={LORA_ALPHA}, dropout={LORA_DROPOUT}")
+logger.info(f" Batch: {BATCH_SIZE}, Grad Accum: {GRADIENT_ACCUMULATION}")
+logger.info(f" Epochs: {NUM_EPOCHS}, LR: {LEARNING_RATE}")
 logger.info("="*60)
 
 # ==================== 4bit 양자화 설정 ====================
@@ -53,7 +53,7 @@ bnb_config = BitsAndBytesConfig(
 )
 
 # ==================== 모델 & 토크나이저 로드 ====================
-logger.info("📥 Loading model and tokenizer...")
+logger.info(" Loading model and tokenizer...")
 
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_NAME,
@@ -74,7 +74,7 @@ model = AutoModelForCausalLM.from_pretrained(
 model.gradient_checkpointing_enable()
 model = prepare_model_for_kbit_training(model)
 
-logger.info("✅ Model loaded successfully")
+logger.info(" Model loaded successfully")
 
 # ==================== LoRA 설정 ====================
 lora_config = LoraConfig(
@@ -95,13 +95,13 @@ model.print_trainable_parameters()
 logger.info("="*60)
 
 # ==================== 데이터셋 로드 ====================
-logger.info(f"📂 Loading dataset from {DATASET_PATH}...")
+logger.info(f" Loading dataset from {DATASET_PATH}...")
 
 try:
     dataset = load_dataset('json', data_files=DATASET_PATH)
-    logger.info(f"✅ Dataset loaded: {len(dataset['train'])} examples")
+    logger.info(f" Dataset loaded: {len(dataset['train'])} examples")
 except Exception as e:
-    logger.error(f"❌ Failed to load dataset: {e}")
+    logger.error(f" Failed to load dataset: {e}")
     raise
 
 def format_instruction(example):
@@ -154,7 +154,7 @@ tokenized_dataset = tokenized_dataset.map(
     remove_columns=["text"]
 )
 
-logger.info(f"✅ Tokenization completed")
+logger.info(f" Tokenization completed")
 
 # ==================== Trainer 설정 ====================
 training_args = TrainingArguments(
@@ -201,27 +201,27 @@ trainer = Trainer(
 
 # ==================== 학습 시작 ====================
 logger.info("="*60)
-logger.info("🔥 Starting training...")
+logger.info(" Starting training...")
 logger.info("="*60)
 
 try:
     trainer.train()
     logger.info("="*60)
-    logger.info("✅ Training completed successfully!")
+    logger.info(" Training completed successfully!")
     logger.info("="*60)
     
     # LoRA 어댑터 저장
-    logger.info(f"💾 Saving LoRA adapter to {OUTPUT_DIR}...")
+    logger.info(f" Saving LoRA adapter to {OUTPUT_DIR}...")
     model.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
     
     logger.info("="*60)
-    logger.info("🎉 Fine-tuning completed!")
-    logger.info(f"📂 Output saved to: {OUTPUT_DIR}")
+    logger.info(" Fine-tuning completed!")
+    logger.info(f" Output saved to: {OUTPUT_DIR}")
     logger.info("="*60)
     
 except Exception as e:
     logger.error("="*60)
-    logger.error(f"❌ Training failed: {e}")
+    logger.error(f" Training failed: {e}")
     logger.error("="*60)
     raise

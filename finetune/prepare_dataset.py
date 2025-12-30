@@ -95,7 +95,7 @@ def save_dataset(data: List[Dict], output_path: str):
         for item in data:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
     
-    print(f"✅ Saved {len(data)} examples to {output_path}")
+    print(f" Saved {len(data)} examples to {output_path}")
 
 def main():
     # Docker 컨테이너 내부에서는 /workspace/data로 마운트됨
@@ -115,8 +115,8 @@ def main():
     save_dataset(train_data, f"{base_path}/nuclear_qa.jsonl")
     save_dataset(test_data, f"{base_path}/test_qa.jsonl")
     
-    print(f"📊 Train: {len(train_data)} | Test: {len(test_data)}")
-    print(f"💾 Files saved to: {base_path}")
+    print(f" Train: {len(train_data)} | Test: {len(test_data)}")
+    print(f" Files saved to: {base_path}")
 
 if __name__ == "__main__":
     main()
