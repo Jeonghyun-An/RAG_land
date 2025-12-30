@@ -23,6 +23,7 @@ from pydantic import BaseModel
 import httpx
 
 from app.services.db_connector import DBConnector
+from app.services.iaea_smart_processor import process_if_needed
 from app.services.pdf_converter import convert_to_pdf, convert_bytes_to_pdf_bytes, ConvertError
 from app.services import job_state
 from app.services.minio_store import MinIOStore
@@ -835,6 +836,7 @@ async def process_convert_and_index_prod(
         
         print(f"[PROD-PARSE] Extracting text from: {converted_pdf_path}")
         pages = parse_pdf(converted_pdf_path, by_page=True)
+        pages = process_if_needed(pages)
         
         if not pages:
             raise RuntimeError("텍스트 추출 실패")
