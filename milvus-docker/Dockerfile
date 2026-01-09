@@ -51,6 +51,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # 앱 코드는 마지막에 복사 → 코드 변경만 있을 때 의존성 레이어 재사용
 COPY app/ ./app
+COPY finetune/ ./finetune
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host","0.0.0.0","--port","8000"]
