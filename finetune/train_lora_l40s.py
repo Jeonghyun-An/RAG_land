@@ -32,7 +32,7 @@ DATASET_PATH = os.getenv("DATASET_PATH", "/workspace/data/nuclear_qa.jsonl")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/output/qwen2.5-7b-qlora")
 
 # IMPORTANT: safe defaults (pipeline가 4096/2/0으로 던져서 터짐)
-MAX_SEQ_LENGTH = int(os.getenv("MAX_SEQ_LENGTH", "1024"))
+FT_MAX_SEQ_LENGTH = int(os.getenv("FT_MAX_SEQ_LENGTH", "1024"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 GRADIENT_ACCUMULATION = int(os.getenv("GRADIENT_ACCUMULATION", "16"))
 NUM_EPOCHS = int(os.getenv("NUM_EPOCHS", "3"))
@@ -62,7 +62,7 @@ logger.info("QLoRA Fine-tuning (L40S friendly)")
 logger.info(f"Model: {MODEL_NAME}")
 logger.info(f"Dataset: {DATASET_PATH}")
 logger.info(f"Output: {OUTPUT_DIR}")
-logger.info(f"Seq: {MAX_SEQ_LENGTH} | Batch: {BATCH_SIZE} | GradAcc: {GRADIENT_ACCUMULATION}")
+logger.info(f"Seq: {FT_MAX_SEQ_LENGTH} | Batch: {BATCH_SIZE} | GradAcc: {GRADIENT_ACCUMULATION}")
 logger.info(f"Epochs: {NUM_EPOCHS} | LR: {LEARNING_RATE}")
 logger.info(f"LoRA: r={LORA_R}, alpha={LORA_ALPHA}, dropout={LORA_DROPOUT}")
 logger.info(f"Grad checkpoint: {USE_GRAD_CHECKPOINT} | Optim: {OPTIM}")
@@ -166,7 +166,7 @@ def tokenize_batch(batch: Dict[str, List[str]]) -> Dict[str, Any]:
     enc = tokenizer(
         batch["text"],
         truncation=True,
-        max_length=MAX_SEQ_LENGTH,
+        max_length=FT_MAX_SEQ_LENGTH,
         padding=False,
     )
     # labels = input_ids (causal LM)

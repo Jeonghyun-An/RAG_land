@@ -424,7 +424,7 @@ async def _run_training_in_container(
             "NUM_EPOCHS": str(num_epochs),
             "LEARNING_RATE": str(learning_rate),
 
-            "MAX_SEQ_LENGTH": _env_get("MAX_SEQ_LENGTH", "1024"),
+            "FT_MAX_SEQ_LENGTH": _env_get("FT_MAX_SEQ_LENGTH", "1024"),
             "USE_GRAD_CHECKPOINT": _env_get("USE_GRAD_CHECKPOINT", "1"),
 
             # 옵션: QLoRA/LoRA 스크립트에서 쓸 수도 있는 최적화 env
@@ -545,7 +545,7 @@ async def _run_training_local(
         "NUM_EPOCHS": str(num_epochs),
         "LEARNING_RATE": str(learning_rate),
 
-        "MAX_SEQ_LENGTH": _env_get("MAX_SEQ_LENGTH", "1024"),
+        "FT_MAX_SEQ_LENGTH": _env_get("FT_MAX_SEQ_LENGTH", "1024"),
         "USE_GRAD_CHECKPOINT": _env_get("USE_GRAD_CHECKPOINT", "1"),
 
         "OPTIM": _env_get("OPTIM", "paged_adamw_8bit"),
