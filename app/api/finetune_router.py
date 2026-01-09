@@ -1,10 +1,11 @@
 # app/api/finetune_router.py
 """
-파인튜닝 API 엔드포인트 (완전 구현 v2)
-- 기존 추출 스크립트 활용 (extract_english_first.py, extract_structured_compliance.py)
+파인튜닝 API 엔드포인트 (완전 구현 v3 - 모듈화 강화)
+- finetune_service.py 의존성 주입
 - 추출 전략 선택 가능
 - L40S 최적화 LoRA 파인튜닝
 - 실시간 진행률 업데이트
+- 상태 관리 강화
 """
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -14,16 +15,30 @@ import os
 import json
 from pathlib import Path
 
+# 파인튜닝 서비스 임포트
+from app.services.finetune_service import (
+    extract_training_data,
+    run_lora_training
+)
+
 router = APIRouter(prefix="/finetune", tags=["finetune"])
 
-# 파인튜닝 작업 상태 저장소
+# ==================== 설정 ====================
+
+# 파인튜닝 작업 상태 저장소 (인메모리)
 finetune_jobs: Dict[str, Dict[str, Any]] = {}
 
 # 학습 결과 저장 경로
 FINETUNE_OUTPUT_DIR = Path(os.getenv("FINETUNE_OUTPUT_DIR", "/workspace/output"))
 FINETUNE_DATA_DIR = Path(os.getenv("FINETUNE_DATA_DIR", "/workspace/data"))
 
+# 디렉토리 생성
+FINETUNE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+FINETUNE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
 # ==================== Request/Response Models ====================
+
 class FinetuneStartRequest(BaseModel):
     """파인튜닝 시작 요청"""
     doc_ids: List[str]
@@ -33,13 +48,14 @@ class FinetuneStartRequest(BaseModel):
     total_samples: Optional[int] = 5000
     
     # 모델 설정
-    model_name: Optional[str] = "Qwen/Qwen2.5-14B-Instruct"
-    lora_r: Optional[int] = 32  # L40S: 32
-    lora_alpha: Optional[int] = 64  # L40S: 64
-    num_epochs: Optional[int] = 3
-    batch_size: Optional[int] = 4  # L40S: 4
-    learning_rate: Optional[float] = 2e-4
+    model_name: Optional[str] = None  # None이면 환경변수에서 읽음
+    lora_r: Optional[int] = None  # None이면 환경변수에서 읽음
+    lora_alpha: Optional[int] = None
+    num_epochs: Optional[int] = None
+    batch_size: Optional[int] = None
+    learning_rate: Optional[float] = None
     output_name: Optional[str] = None
+
 
 class FinetuneStatusResponse(BaseModel):
     """파인튜닝 상태 응답"""
@@ -55,6 +71,7 @@ class FinetuneStatusResponse(BaseModel):
     error: Optional[str] = None
     output_path: Optional[str] = None
 
+
 class FinetuneModel(BaseModel):
     """파인튜닝된 모델 정보"""
     name: str
@@ -65,6 +82,7 @@ class FinetuneModel(BaseModel):
     doc_ids: Optional[List[str]] = None
     extraction_strategy: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
+
 
 # ==================== Endpoints ====================
 
@@ -92,26 +110,30 @@ async def start_finetuning(
     # 전략 검증
     valid_strategies = ["english_first", "structured", "balanced"]
     if request.extraction_strategy not in valid_strategies:
-        raise HTTPException(400, f"유효하지 않은 전략: {request.extraction_strategy}. 가능한 값: {valid_strategies}")
+        raise HTTPException(
+            400, 
+            f"유효하지 않은 전략: {request.extraction_strategy}. "
+            f"사용 가능: {', '.join(valid_strategies)}"
+        )
     
     # Job ID 생성
-    job_id = f"ft_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    job_id = f"finetune_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    # Output 이름 자동 생성
+    # 출력 이름 결정
     if not request.output_name:
-        strategy_abbr = {
-            "english_first": "en",
-            "structured": "st",
-            "balanced": "bal"
-        }[request.extraction_strategy]
-        request.output_name = f"nuclear-ft-{strategy_abbr}-{datetime.now().strftime('%Y%m%d_%H%M')}"
+        # model_name이 None일 수 있으므로 환경변수 기본값 사용
+        default_model = os.getenv("MODEL_NAME", "Qwen2.5-7B-Instruct")
+        model_short = (request.model_name or default_model).split('/')[-1]
+        output_name = f"{model_short}_{request.extraction_strategy}_{job_id}"
+    else:
+        output_name = request.output_name
     
-    # 작업 상태 초기화
+    # Job 상태 초기화
     finetune_jobs[job_id] = {
         "job_id": job_id,
         "status": "pending",
         "progress": 0.0,
-        "current_step": "작업 준비 중...",
+        "current_step": "초기화 중...",
         "doc_ids": request.doc_ids,
         "extraction_strategy": request.extraction_strategy,
         "dataset_size": None,
@@ -122,23 +144,19 @@ async def start_finetuning(
         "config": request.dict()
     }
     
-    # 백그라운드에서 파인튜닝 실행
+    # 백그라운드 작업 시작
     background_tasks.add_task(
         run_finetuning_pipeline,
-        job_id,
-        request
+        job_id=job_id,
+        config=request
     )
-    
-    strategy_desc = {
-        "english_first": "언어 우선순위 (70:20:10)",
-        "structured": "구조화 추출 (60:40)",
-        "balanced": "균형 전략 (60:40)"
-    }[request.extraction_strategy]
     
     return {
         "job_id": job_id,
-        "message": f"파인튜닝 작업이 시작되었습니다 (전략: {strategy_desc}, 문서 {len(request.doc_ids)}개)"
+        "message": "파인튜닝 작업이 시작되었습니다.",
+        "output_name": output_name
     }
+
 
 @router.get("/status/{job_id}", response_model=FinetuneStatusResponse)
 async def get_finetuning_status(job_id: str):
@@ -149,10 +167,12 @@ async def get_finetuning_status(job_id: str):
     job = finetune_jobs[job_id]
     return FinetuneStatusResponse(**job)
 
+
 @router.get("/jobs", response_model=List[FinetuneStatusResponse])
 async def list_finetuning_jobs():
     """모든 파인튜닝 작업 목록"""
     return [FinetuneStatusResponse(**job) for job in finetune_jobs.values()]
+
 
 @router.get("/models", response_model=List[FinetuneModel])
 async def list_finetuned_models():
@@ -196,6 +216,7 @@ async def list_finetuned_models():
     models.sort(key=lambda x: x.created_at, reverse=True)
     return models
 
+
 @router.delete("/job/{job_id}")
 async def delete_finetuning_job(job_id: str):
     """파인튜닝 작업 삭제"""
@@ -210,6 +231,7 @@ async def delete_finetuning_job(job_id: str):
     del finetune_jobs[job_id]
     return {"message": f"작업이 삭제되었습니다: {job_id}"}
 
+
 # ==================== Background Task ====================
 
 async def run_finetuning_pipeline(job_id: str, config: FinetuneStartRequest):
@@ -219,31 +241,39 @@ async def run_finetuning_pipeline(job_id: str, config: FinetuneStartRequest):
     단계:
     1. 선택된 전략으로 데이터 추출 (10-30%)
     2. L40S 최적화 LoRA 파인튜닝 (30-95%)
-    3. 결과 저장 및 메타데이터 (95-100%)
+    3. 메타데이터 저장 및 완료 (95-100%)
     """
-    job = finetune_jobs[job_id]
+    
+    # ========== 환경변수 기본값 적용 ==========
+    model_name = config.model_name or os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+    lora_r = config.lora_r or int(os.getenv("LORA_R", "8"))
+    lora_alpha = config.lora_alpha or int(os.getenv("LORA_ALPHA", "32"))
+    num_epochs = config.num_epochs or int(os.getenv("NUM_EPOCHS", "3"))
+    batch_size = config.batch_size or int(os.getenv("BATCH_SIZE", "1"))
+    learning_rate = config.learning_rate or float(os.getenv("LEARNING_RATE", "2e-4"))
+    
+    print(f"[FINETUNE-PIPELINE] Config:")
+    print(f"  Model: {model_name}")
+    print(f"  LoRA: r={lora_r}, alpha={lora_alpha}")
+    print(f"  Training: epochs={num_epochs}, batch={batch_size}, lr={learning_rate}")
+    
+    def update_progress(progress: float, step: str):
+        """진행률 업데이트 헬퍼"""
+        finetune_jobs[job_id].update({
+            "progress": progress,
+            "current_step": step
+        })
     
     try:
-        # ========== Step 1: 데이터 추출 ==========
-        job["status"] = "extracting"
-        job["progress"] = 10.0
+        # ========== 1단계: 데이터 추출 ==========
+        update_progress(5.0, "데이터 추출 준비 중...")
+        finetune_jobs[job_id]["status"] = "extracting"
         
-        strategy_desc = {
-            "english_first": "언어 우선순위 추출",
-            "structured": "구조화 추출",
-            "balanced": "균형 전략 추출"
-        }[config.extraction_strategy]
+        # 데이터셋 경로
+        dataset_path = FINETUNE_DATA_DIR / f"{job_id}_training.jsonl"
         
-        job["current_step"] = f"{strategy_desc} 중... ({len(config.doc_ids)}개 문서)"
-        
-        print(f"[FINETUNE] Job {job_id}: Extracting data with strategy '{config.extraction_strategy}'...")
-        
-        from app.services.finetune_service import extract_training_data
-        
-        dataset_path = FINETUNE_DATA_DIR / f"{job_id}_dataset.jsonl"
-        FINETUNE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        
-        # 기존 추출 스크립트 실행
+        # 추출 실행
+        update_progress(10.0, f"데이터 추출 중 (전략: {config.extraction_strategy})...")
         dataset_size = await extract_training_data(
             doc_ids=config.doc_ids,
             output_path=dataset_path,
@@ -251,75 +281,82 @@ async def run_finetuning_pipeline(job_id: str, config: FinetuneStartRequest):
             total_samples=config.total_samples
         )
         
-        job["dataset_size"] = dataset_size
-        job["progress"] = 30.0
-        job["current_step"] = f"학습 데이터 생성 완료 ({dataset_size}개 샘플, 전략: {config.extraction_strategy})"
+        finetune_jobs[job_id]["dataset_size"] = dataset_size
+        update_progress(30.0, f"데이터 추출 완료 ({dataset_size} 샘플)")
         
-        print(f"[FINETUNE] Job {job_id}: Dataset created with {dataset_size} samples")
+        # ========== 2단계: 파인튜닝 ==========
+        finetune_jobs[job_id]["status"] = "training"
+        update_progress(35.0, "파인튜닝 준비 중...")
         
-        # ========== Step 2: 파인튜닝 실행 ==========
-        job["status"] = "training"
-        job["progress"] = 35.0
-        job["current_step"] = "L40S 최적화 LoRA 파인튜닝 시작..."
+        # 출력 디렉토리
+        output_name = config.output_name or f"{model_name.split('/')[-1]}_{config.extraction_strategy}_{job_id}"
+        output_dir = FINETUNE_OUTPUT_DIR / output_name
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        print(f"[FINETUNE] Job {job_id}: Starting L40S optimized LoRA training...")
+        # 진행률 콜백 (35% ~ 95%)
+        def training_progress_callback(train_progress: float, step_msg: str):
+            # 학습 진행률을 전체 진행률로 변환 (35% ~ 95%)
+            overall_progress = 35.0 + (train_progress / 100.0) * 60.0
+            update_progress(overall_progress, f"학습 중: {step_msg}")
         
-        from app.services.finetune_service import run_lora_training
-        
-        output_dir = FINETUNE_OUTPUT_DIR / config.output_name
-        FINETUNE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        
-        # 진행률 콜백
-        def update_progress(progress_pct: float, log_line: str):
-            mapped_progress = 35.0 + (progress_pct * 0.60)  # 35-95%
-            job["progress"] = min(mapped_progress, 95.0)
-            job["current_step"] = log_line[:200]
-        
-        # 학습 실행
+        # 파인튜닝 실행
         await run_lora_training(
-            model_name=config.model_name,
+            model_name=model_name,
             dataset_path=dataset_path,
             output_dir=output_dir,
-            lora_r=config.lora_r,
-            lora_alpha=config.lora_alpha,
-            num_epochs=config.num_epochs,
-            batch_size=config.batch_size,
-            learning_rate=config.learning_rate,
-            progress_callback=update_progress
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            progress_callback=training_progress_callback
         )
         
-        # ========== Step 3: 완료 처리 ==========
-        job["status"] = "completed"
-        job["progress"] = 100.0
-        job["current_step"] = "파인튜닝 완료!"
-        job["output_path"] = str(output_dir)
-        job["completed_at"] = datetime.now().isoformat()
+        # ========== 3단계: 메타데이터 저장 ==========
+        update_progress(96.0, "메타데이터 저장 중...")
         
-        print(f"[FINETUNE] Job {job_id}: Training completed successfully")
-        
-        # 메타데이터 저장
         metadata = {
-            "base_model": config.model_name,
-            "created_at": job["completed_at"],
+            "job_id": job_id,
+            "base_model": model_name,
+            "extraction_strategy": config.extraction_strategy,
             "dataset_size": dataset_size,
             "doc_ids": config.doc_ids,
-            "extraction_strategy": config.extraction_strategy,
-            "config": config.dict()
+            "config": {
+                "lora_r": lora_r,
+                "lora_alpha": lora_alpha,
+                "num_epochs": num_epochs,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+            },
+            "created_at": finetune_jobs[job_id]["started_at"],
+            "completed_at": datetime.now().isoformat()
         }
         
-        metadata_file = output_dir / "finetune_metadata.json"
-        with open(metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
+        metadata_path = output_dir / "finetune_metadata.json"
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
         
-        print(f"[FINETUNE] Job {job_id}: Metadata saved")
+        # ========== 완료 ==========
+        update_progress(100.0, "파인튜닝 완료!")
+        
+        finetune_jobs[job_id].update({
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+            "output_path": str(output_dir)
+        })
+        
+        print(f"[FINETUNE-PIPELINE] Job {job_id} completed successfully!")
+        print(f"[FINETUNE-PIPELINE] Output: {output_dir}")
         
     except Exception as e:
-        job["status"] = "failed"
-        job["error"] = str(e)
-        job["completed_at"] = datetime.now().isoformat()
-        job["progress"] = 0.0
-        job["current_step"] = f"오류 발생: {str(e)}"
+        # 오류 처리
+        error_msg = f"파인튜닝 실패: {str(e)}"
+        print(f"[FINETUNE-PIPELINE] {error_msg}")
         
-        print(f"[FINETUNE] Job {job_id} failed: {e}")
-        import traceback
-        traceback.print_exc()
+        finetune_jobs[job_id].update({
+            "status": "failed",
+            "error": error_msg,
+            "completed_at": datetime.now().isoformat()
+        })
+        
+        raise
