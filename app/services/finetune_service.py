@@ -1,9 +1,10 @@
 # app/services/finetune_service.py
 """
-파인튜닝 서비스 (완전 구현)
-- 기존 extract_english_first.py / extract_structured_compliance.py 활용
+파인튜닝 서비스 (완전 구현 - 모듈화 강화 버전)
+- 동적 경로 탐색으로 extract_english_first.py / extract_structured_compliance.py 활용
 - L40S 최적화 LoRA 학습 실행
 - 실시간 진행률 업데이트
+- 프로젝트 구조 독립적 설계
 """
 import os
 import json
@@ -12,6 +13,101 @@ import re
 from typing import List, Dict, Any, Callable, Optional
 from pathlib import Path
 from datetime import datetime
+
+def _env_get(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if (v is not None and str(v).strip() != "") else default
+
+# ==================== 경로 탐색 유틸리티 ====================
+
+def find_project_root() -> Path:
+    """
+    프로젝트 루트 디렉토리 찾기
+    현재 파일 위치: app/services/finetune_service.py
+    프로젝트 루트: 2단계 상위
+    """
+    return Path(__file__).parent.parent.parent
+
+
+def find_extraction_script(script_name: str) -> Path:
+    """
+    추출 스크립트 경로 동적 탐색 (Docker 환경 대응)
+    
+    탐색 순서:
+    1. 환경변수 FINETUNE_SCRIPTS_DIR (최우선)
+    2. /workspace/finetune/{script_name} (Docker 컨테이너)
+    3. {project_root}/finetune/{script_name} (로컬)
+    4. {project_root}/scripts/{script_name}
+    5. {project_root}/{script_name}
+    
+    Args:
+        script_name: 스크립트 파일명 (예: "extract_english_first.py")
+    
+    Returns:
+        스크립트 경로 (Path 객체)
+    
+    Raises:
+        FileNotFoundError: 스크립트를 찾을 수 없을 때
+    """
+    project_root = find_project_root()
+    
+    # 탐색 경로 목록
+    search_paths = []
+    
+    # 1. 환경변수로 커스텀 경로 (최우선)
+    custom_finetune_dir = os.getenv("FINETUNE_SCRIPTS_DIR")
+    if custom_finetune_dir:
+        search_paths.append(Path(custom_finetune_dir) / script_name)
+    
+    # 2. Docker 컨테이너 표준 경로 (/workspace/finetune)
+    workspace_finetune = Path("/workspace/finetune") / script_name
+    search_paths.append(workspace_finetune)
+    
+    # 3. 프로젝트 루트 기준 경로들
+    search_paths.extend([
+        project_root / "finetune" / script_name,
+        project_root / "scripts" / script_name,
+        project_root / script_name,
+    ])
+    
+    # 4. /app/finetune 도 체크 (컨테이너에 마운트된 경우)
+    app_finetune = Path("/app/finetune") / script_name
+    if app_finetune.parent.exists():  # /app/finetune 디렉토리가 존재하면
+        search_paths.insert(2, app_finetune)  # Docker 경로 다음에 추가
+    
+    for path in search_paths:
+        if path.exists():
+            print(f"[FINETUNE-SERVICE] Found script: {path}")
+            return path
+    
+    # 찾지 못한 경우
+    search_paths_str = "\n  - ".join(str(p) for p in search_paths)
+    raise FileNotFoundError(
+        f"Script '{script_name}' not found in any of these locations:\n  - {search_paths_str}\n\n"
+        f"Solutions:\n"
+        f"  1. Mount finetune folder in docker-compose.yml:\n"
+        f"     volumes:\n"
+        f"       - ./finetune:/app/finetune:ro\n"
+        f"  2. Set environment variable:\n"
+        f"     FINETUNE_SCRIPTS_DIR=/workspace/finetune\n"
+        f"  3. Copy scripts to container:\n"
+        f"     COPY ./finetune /workspace/finetune\n"
+    )
+
+
+def find_training_script(script_name: str = "train_lora_l40s.py") -> Path:
+    """
+    학습 스크립트 경로 동적 탐색
+    
+    Fallback: train_lora_l40s.py -> train_qlora.py
+    """
+    try:
+        return find_extraction_script(script_name)
+    except FileNotFoundError:
+        if script_name == "train_lora_l40s.py":
+            print(f"[FINETUNE-SERVICE] {script_name} not found, trying fallback: train_qlora.py")
+            return find_extraction_script("train_qlora.py")
+        raise
 
 
 # ==================== 데이터 추출 (기존 스크립트 활용) ====================
@@ -68,10 +164,8 @@ async def _run_english_first_extraction(
     """
     print(f"[FINETUNE-EXTRACT] Running extract_english_first.py...")
     
-    script_path = Path("/workspace/finetune/extract_english_first.py")
-    
-    if not script_path.exists():
-        raise FileNotFoundError(f"Script not found: {script_path}")
+    # 동적 스크립트 경로 탐색
+    script_path = find_extraction_script("extract_english_first.py")
     
     # 명령어 구성
     cmd = [
@@ -104,7 +198,7 @@ async def _run_english_first_extraction(
             
             # 샘플 수 계산
             sample_count = 0
-            with open(output_path, 'r') as f:
+            with open(output_path, 'r', encoding='utf-8') as f:
                 for _ in f:
                     sample_count += 1
             
@@ -129,10 +223,8 @@ async def _run_structured_extraction(
     """
     print(f"[FINETUNE-EXTRACT] Running extract_structured_compliance.py...")
     
-    script_path = Path("/workspace/finetune/extract_structured_compliance.py")
-    
-    if not script_path.exists():
-        raise FileNotFoundError(f"Script not found: {script_path}")
+    # 동적 스크립트 경로 탐색
+    script_path = find_extraction_script("extract_structured_compliance.py")
     
     # 명령어 구성
     cmd = [
@@ -156,7 +248,7 @@ async def _run_structured_extraction(
         
         # 샘플 수 계산
         sample_count = 0
-        with open(output_path, 'r') as f:
+        with open(output_path, 'r', encoding='utf-8') as f:
             for _ in f:
                 sample_count += 1
         
@@ -257,37 +349,213 @@ async def run_lora_training(
     print(f"[FINETUNE-TRAIN] Dataset: {dataset_path}")
     print(f"[FINETUNE-TRAIN] Output: {output_dir}")
     
-    # L40S 최적화 학습 스크립트
-    train_script = Path("/workspace/finetune/train_lora_l40s.py")
+    # ========== Finetune 컨테이너 사용 여부 확인 ==========
+    use_finetune_container = os.getenv("USE_FINETUNE_CONTAINER", "1") == "1"
+    finetune_container_name = os.getenv("FINETUNE_CONTAINER_NAME", "nuclear-finetune")
     
-    if not train_script.exists():
-        # Fallback: QLoRA 스크립트
-        train_script = Path("/workspace/finetune/train_qlora.py")
-        print(f"[FINETUNE-TRAIN] Warning: Using QLoRA script (train_lora_l40s.py not found)")
+    if use_finetune_container:
+        print(f"[FINETUNE-TRAIN] Using external finetune container: {finetune_container_name}")
+        return await _run_training_in_container(
+            container_name=finetune_container_name,
+            model_name=model_name,
+            dataset_path=dataset_path,
+            output_dir=output_dir,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            progress_callback=progress_callback
+        )
+    else:
+        print(f"[FINETUNE-TRAIN] Using local training (not recommended)")
+        return await _run_training_local(
+            model_name=model_name,
+            dataset_path=dataset_path,
+            output_dir=output_dir,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            progress_callback=progress_callback
+        )
+
+
+async def _run_training_in_container(
+    container_name: str,
+    model_name: str,
+    dataset_path: Path,
+    output_dir: Path,
+    lora_r: int,
+    lora_alpha: int,
+    num_epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    progress_callback: Optional[Callable] = None
+):
+    """
+    외부 Finetune 컨테이너에서 학습 실행 (Docker Python SDK 사용)
+    """
+    import docker
+    
+    print(f"[FINETUNE-TRAIN] Executing in container: {container_name}")
+    
+    try:
+        # Docker 클라이언트 연결
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+        # 환경변수 우선순위:
+        # 1) 호출 인자(model_name, dataset_path, output_dir, lora_r, lora_alpha, num_epochs, batch_size, learning_rate)
+        # 2) Portainer/Stack에 설정된 OS env
+        # 3) 최종 fallback
+        env_vars = {
+            "MODEL_NAME": model_name,
+            "DATASET_PATH": str(dataset_path),
+            "OUTPUT_DIR": str(output_dir),
+
+            "LORA_R": str(lora_r),
+            "LORA_ALPHA": str(lora_alpha),
+            "LORA_DROPOUT": _env_get("LORA_DROPOUT", "0.05"),
+
+            # 하드코딩 제거하고, 스택 env를 존중
+            "BATCH_SIZE": str(batch_size),
+            "GRADIENT_ACCUMULATION": _env_get("GRADIENT_ACCUMULATION", "16"),
+            "NUM_EPOCHS": str(num_epochs),
+            "LEARNING_RATE": str(learning_rate),
+
+            "MAX_SEQ_LENGTH": _env_get("MAX_SEQ_LENGTH", "1024"),
+            "USE_GRAD_CHECKPOINT": _env_get("USE_GRAD_CHECKPOINT", "1"),
+
+            # 옵션: QLoRA/LoRA 스크립트에서 쓸 수도 있는 최적화 env
+            "OPTIM": _env_get("OPTIM", "paged_adamw_8bit"),
+            "PYTORCH_CUDA_ALLOC_CONF": _env_get(
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "max_split_size_mb:128,"
+            ),
+        }
+
+
+        def _sh(v: str) -> str:
+            return "'" + v.replace("'", "'\"'\"'") + "'"
+
+        env_string = " ".join([f"{k}={_sh(str(v))}" for k, v in env_vars.items()])
+        train_path = _env_get("FINETUNE_TRAIN_SCRIPT", "/app/finetune/train_lora_l40s.py")
+        print(f"[FINETUNE-TRAIN] Command: python {train_path}")
+        command = f"bash -lc \"{env_string} python {_sh(train_path)}\""
+
+        
+        print(f"[FINETUNE-TRAIN] Full command: {command}")
+        
+        res = container.exec_run(command, stream=False, demux=False)
+        if isinstance(res, tuple):
+            exit_code, output = res
+        else:
+            exit_code, output = res.exit_code, res.output
+        
+        # 출력 디코딩 및 출력
+        if output:
+            output_text = output.decode('utf-8', errors='ignore')
+            print(output_text)
+            
+            # 진행률 파싱 (전체 출력에서)
+            if progress_callback:
+                for line in output_text.split('\n'):
+                    try:
+                        if "Epoch" in line and "/" in line:
+                            epoch_match = re.search(r'Epoch\s+(\d+)/(\d+)', line)
+                            step_match = re.search(r'Step\s+(\d+)/(\d+)', line)
+                            
+                            if epoch_match and step_match:
+                                current_epoch = int(epoch_match.group(1))
+                                total_epochs = int(epoch_match.group(2))
+                                current_step = int(step_match.group(1))
+                                total_steps = int(step_match.group(2))
+                                
+                                epoch_progress = (current_epoch - 1) / total_epochs
+                                step_progress = current_step / total_steps / total_epochs
+                                overall_progress = (epoch_progress + step_progress) * 100
+                                
+                                progress_callback(overall_progress, line)
+                            
+                            elif epoch_match:
+                                current_epoch = int(epoch_match.group(1))
+                                total_epochs = int(epoch_match.group(2))
+                                overall_progress = (current_epoch / total_epochs) * 100
+                                
+                                progress_callback(overall_progress, line)
+                    
+                    except Exception as e:
+                        print(f"[FINETUNE-TRAIN] Progress parsing error: {e}")
+        
+        # Exit code 확인
+        if exit_code != 0:
+            raise Exception(f"Training failed with exit code {exit_code}")
+        
+        print(f"[FINETUNE-TRAIN] Training completed successfully!")
+        print(f"[FINETUNE-TRAIN] Output saved to: {output_dir}")
+        
+    except docker.errors.NotFound:
+        error_msg = f"Container '{container_name}' not found. Please start nuclear-finetune stack first."
+        print(f"[FINETUNE-TRAIN] Error: {error_msg}")
+        raise Exception(error_msg)
+    
+    except docker.errors.APIError as e:
+        error_msg = f"Docker API error: {e}"
+        print(f"[FINETUNE-TRAIN] Error: {error_msg}")
+        raise Exception(error_msg)
+    
+    except Exception as e:
+        print(f"[FINETUNE-TRAIN] Training failed: {e}")
+        raise
+
+
+async def _run_training_local(
+    model_name: str,
+    dataset_path: Path,
+    output_dir: Path,
+    lora_r: int,
+    lora_alpha: int,
+    num_epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    progress_callback: Optional[Callable] = None
+):
+    """
+    로컬에서 학습 실행 (비권장 - 라이브러리 없을 수 있음)
+    """
+    print(f"[FINETUNE-TRAIN] Warning: Running training locally (may fail if peft not installed)")
+    
+    # L40S 최적화 학습 스크립트 (Fallback 포함)
+    train_script = find_training_script("train_lora_l40s.py")
     
     # 환경변수 설정
     env = os.environ.copy()
     env.update({
-        # 모델 & 데이터
         "MODEL_NAME": model_name,
         "DATASET_PATH": str(dataset_path),
         "OUTPUT_DIR": str(output_dir),
-        
-        # L40S 최적 LoRA 설정
+
         "LORA_R": str(lora_r),
         "LORA_ALPHA": str(lora_alpha),
-        "LORA_DROPOUT": "0.05",
-        
-        # L40S 최적 학습 설정
+        "LORA_DROPOUT": _env_get("LORA_DROPOUT", "0.05"),
+
         "BATCH_SIZE": str(batch_size),
-        "GRADIENT_ACCUMULATION": "4",
+        "GRADIENT_ACCUMULATION": _env_get("GRADIENT_ACCUMULATION", "16"),
         "NUM_EPOCHS": str(num_epochs),
         "LEARNING_RATE": str(learning_rate),
-        "MAX_SEQ_LENGTH": "4096",  # L40S: 4096
-        "USE_GRAD_CHECKPOINT": "0",  # L40S: 메모리 충분
+
+        "MAX_SEQ_LENGTH": _env_get("MAX_SEQ_LENGTH", "1024"),
+        "USE_GRAD_CHECKPOINT": _env_get("USE_GRAD_CHECKPOINT", "1"),
+
+        "OPTIM": _env_get("OPTIM", "paged_adamw_8bit"),
+        "PYTORCH_CUDA_ALLOC_CONF": _env_get(
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "max_split_size_mb:128"
+        ),
     })
+
     
-    # 서브프로세스로 학습 실행
     try:
         print(f"[FINETUNE-TRAIN] Executing: python {train_script}")
         
@@ -304,11 +572,8 @@ async def run_lora_training(
         for line in process.stdout:
             print(line.strip())
             
-            # 진행률 콜백
             if progress_callback:
                 try:
-                    # 진행률 파싱
-                    # 예: "Epoch 1/3, Step 100/500 (20%), Loss: 1.234"
                     if "Epoch" in line and "/" in line:
                         epoch_match = re.search(r'Epoch\s+(\d+)/(\d+)', line)
                         step_match = re.search(r'Step\s+(\d+)/(\d+)', line)
@@ -319,7 +584,6 @@ async def run_lora_training(
                             current_step = int(step_match.group(1))
                             total_steps = int(step_match.group(2))
                             
-                            # 전체 진행률 계산
                             epoch_progress = (current_epoch - 1) / total_epochs
                             step_progress = current_step / total_steps / total_epochs
                             overall_progress = (epoch_progress + step_progress) * 100
@@ -327,7 +591,6 @@ async def run_lora_training(
                             progress_callback(overall_progress, line.strip())
                         
                         elif epoch_match:
-                            # Step 없이 Epoch만 있는 경우
                             current_epoch = int(epoch_match.group(1))
                             total_epochs = int(epoch_match.group(2))
                             overall_progress = (current_epoch / total_epochs) * 100
@@ -337,7 +600,6 @@ async def run_lora_training(
                 except Exception as e:
                     print(f"[FINETUNE-TRAIN] Progress parsing error: {e}")
         
-        # 프로세스 완료 대기
         return_code = process.wait()
         
         if return_code != 0:
