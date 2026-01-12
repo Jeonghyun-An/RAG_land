@@ -177,7 +177,7 @@ train_tok = train_text.map(tokenize_batch, batched=True, remove_columns=["text"]
 eval_tok = eval_text.map(tokenize_batch, batched=True, remove_columns=["text"])
 logger.info("Tokenization completed")
 
-# -------------------- ✅ Custom collator (fix label mismatch 100%) --------------------
+# --------------------  Custom collator (fix label mismatch 100%) --------------------
 class CausalLMCollator:
     """
     - Pads input_ids/attention_mask using tokenizer.pad
@@ -256,7 +256,7 @@ training_args = TrainingArguments(
     eval_steps=EVAL_STEPS,
     load_best_model_at_end=False,
 
-    # ✅ worker에서 pad/labels 변환 에러 줄이려면 0이 제일 안정적
+    #  worker에서 pad/labels 변환 에러 줄이려면 0이 제일 안정적
     dataloader_num_workers=0,
     dataloader_pin_memory=True,
     group_by_length=True,

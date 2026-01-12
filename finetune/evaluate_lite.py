@@ -28,7 +28,7 @@ print(f" LoRA Path: {LORA_PATH}")
 print("="*80)
 
 # ==================== 모델 로드 ====================
-print("\n📥 Loading model...")
+print("\n Loading model...")
 start_time = time.time()
 
 try:
@@ -84,7 +84,7 @@ test_questions = [
     },
 ]
 
-print(f"\n📝 Test questions: {len(test_questions)}")
+print(f"\n Test questions: {len(test_questions)}")
 
 # ==================== 평가 함수 ====================
 def generate_response(question: str) -> tuple:
