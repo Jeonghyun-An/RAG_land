@@ -199,7 +199,7 @@ async def process_dev_convert_and_index(
         print(f"[DEV-CHUNK] Extracted {len(pages_std)} pages")
         
         # 3-2) 단순 청킹
-        from app.services.simple_proofreading_chunker import simple_chunk_by_paragraph
+        from app.services.chunkers.simple_proofreading_chunker import simple_chunk_by_paragraph
         from app.services.embedding_model import get_embedding_model
         
         embed_model = get_embedding_model()

@@ -345,7 +345,7 @@ def index_pdf_to_milvus(
         
         if ENABLE_EN_TECH_CHUNKER:
             try:
-                from app.services.english_technical_chunker import english_technical_chunk_pages
+                from app.services.chunkers.english_technical_chunker import english_technical_chunk_pages
                 print("[CHUNK] Trying English technical chunker (IAEA/standards optimized)...")
                 
                 # 영어 문서는 더 큰 타겟 토큰 사용
@@ -370,7 +370,7 @@ def index_pdf_to_milvus(
             
             if ENABLE_LAW_CHUNKER:
                 try:
-                    from app.services.law_chunker import law_chunk_pages
+                    from app.services.chunkers.law_chunker import law_chunk_pages
                     print("[CHUNK] Trying law chunker (nuclear/legal optimized)...")
                     
                     chunks = law_chunk_pages(
@@ -393,7 +393,7 @@ def index_pdf_to_milvus(
             
             if ENABLE_LAYOUT_CHUNKER and layout_map:
                 try:
-                    from app.services.chunker import smart_chunk_pages_plus
+                    from app.services.chunkers.chunker import smart_chunk_pages_plus
                     print("[CHUNK] Using layout-aware chunker (SmartChunkerPlus)...")
                     
                     chunks = smart_chunk_pages_plus(
@@ -412,7 +412,7 @@ def index_pdf_to_milvus(
         # 2-4) 기본 Smart chunker
         if chunks is None:
             try:
-                from app.services.chunker import smart_chunk_pages
+                from app.services.chunkers.chunker import smart_chunk_pages
                 print("[CHUNK] Using basic smart chunker...")
                 
                 chunks = smart_chunk_pages(

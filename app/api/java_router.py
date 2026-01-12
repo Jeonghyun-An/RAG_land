@@ -295,7 +295,7 @@ def perform_advanced_chunking(
     """
     공용 청킹 파이프라인 호출 (llama_router와 동일)
     """
-    from app.services.chunking_unified import build_chunks
+    from app.services.chunkers.chunking_unified import build_chunks
     job_state.update(job_id, step="chunking:unified")
     return build_chunks(pages_std, layout_map, job_id=job_id)
 
