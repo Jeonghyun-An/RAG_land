@@ -27,13 +27,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("train_qlora")
 
 # -------------------- Config (Env) --------------------
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+MODEL_NAME = os.getenv("FT_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 DATASET_PATH = os.getenv("DATASET_PATH", "/workspace/data/nuclear_qa.jsonl")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/output/qwen2.5-7b-qlora")
 
 # IMPORTANT: safe defaults (pipeline가 4096/2/0으로 던져서 터짐)
 FT_MAX_SEQ_LENGTH = int(os.getenv("FT_MAX_SEQ_LENGTH", "1024"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
+BATCH_SIZE = int(os.getenv("FT_BATCH_SIZE", "1"))
 GRADIENT_ACCUMULATION = int(os.getenv("GRADIENT_ACCUMULATION", "16"))
 NUM_EPOCHS = int(os.getenv("NUM_EPOCHS", "3"))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "2e-4"))

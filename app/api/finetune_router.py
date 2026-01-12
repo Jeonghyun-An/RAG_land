@@ -245,11 +245,11 @@ async def run_finetuning_pipeline(job_id: str, config: FinetuneStartRequest):
     """
     
     # ========== 환경변수 기본값 적용 ==========
-    model_name = config.model_name or os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+    model_name = config.model_name or os.getenv("FT_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
     lora_r = config.lora_r or int(os.getenv("LORA_R", "8"))
     lora_alpha = config.lora_alpha or int(os.getenv("LORA_ALPHA", "32"))
     num_epochs = config.num_epochs or int(os.getenv("NUM_EPOCHS", "3"))
-    batch_size = config.batch_size or int(os.getenv("BATCH_SIZE", "1"))
+    batch_size = config.batch_size or int(os.getenv("FT_BATCH_SIZE", "1"))
     learning_rate = config.learning_rate or float(os.getenv("LEARNING_RATE", "2e-4"))
     
     print(f"[FINETUNE-PIPELINE] Config:")

@@ -323,11 +323,11 @@ async def run_lora_training(
     model_name: str,
     dataset_path: Path,
     output_dir: Path,
-    lora_r: int = 32,
-    lora_alpha: int = 64,
-    num_epochs: int = 3,
-    batch_size: int = 4,
-    learning_rate: float = 2e-4,
+    lora_r: int,
+    lora_alpha: int,
+    num_epochs: int,
+    batch_size: int,
+    learning_rate: float,
     progress_callback: Optional[Callable] = None
 ):
     """
