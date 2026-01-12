@@ -1,4 +1,4 @@
-# app/services/english_technical_chunker.py
+# app/services/chunkers/english_technical_chunker.py
 """
 English technical papers chunker (v2)
 - 빠른 휴리스틱(정규식) 기반: 토크나이저 호출 없이 초고속

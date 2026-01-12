@@ -1,4 +1,4 @@
-# app/services/layout_chunker.py
+# app/services/chunkers/layout_chunker.py
 """
 레이아웃 인지 청킹 - 개선 버전
 - bbox 정보를 보조로만 사용

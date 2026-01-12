@@ -1,4 +1,4 @@
-# app/services/simple_proofreading_chunker.py
+# app/services/chunkers/simple_proofreading_chunker.py
 """
 교정·교열 전용 단순 청킹 모듈
 - 복잡한 레이아웃 분석 없이 텍스트만 순서대로 추출

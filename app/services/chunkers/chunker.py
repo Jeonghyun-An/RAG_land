@@ -1,4 +1,4 @@
-# app/services/chunker.py
+# app/services/chunkers/chunker.py
 """
 스마트 청킹 - 통합 개선 버전
 - SmartChunker와 SmartChunkerPlus 통합

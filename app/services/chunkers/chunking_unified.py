@@ -1,4 +1,4 @@
-# app/services/chunking_unified.py
+# app/services/chunkers/chunking_unified.py
 from __future__ import annotations
 import os, re
 from typing import Dict, List, Tuple
@@ -51,7 +51,7 @@ def build_chunks(
     # 1) 영어 기술 청커 (우선 시도)
     if os.getenv("RAG_ENABLE_EN_TECH_CHUNKER", "1") == "1":
         try:
-            from app.services.english_technical_chunker import english_technical_chunk_pages
+            from app.services.chunkers.english_technical_chunker import english_technical_chunk_pages
             if job_id: print(f"[CHUNK-{job_id}] Trying English technical chunker...")
             en_target_tokens = int(os.getenv("RAG_EN_TARGET_TOKENS", "500"))
             ch = english_technical_chunk_pages(pages_std, enc, en_target_tokens, overlap_tokens, layout_map)
@@ -65,7 +65,7 @@ def build_chunks(
     # 2) 법령 청커
     if os.getenv("RAG_ENABLE_LAW_CHUNKER", "1") == "1":
         try:
-            from app.services.law_chunker import law_chunk_pages
+            from app.services.chunkers.law_chunker import law_chunk_pages
             if job_id: print(f"[CHUNK-{job_id}] Trying NuclearLegalChunker...")
             ch = law_chunk_pages(
                 pages_std, enc, target_tokens, overlap_tokens,
@@ -81,7 +81,7 @@ def build_chunks(
     # 3) SmartChunker Plus (레이아웃)
     if os.getenv("RAG_ENABLE_LAYOUT_CHUNKER", "1") == "1" and layout_map:
         try:
-            from app.services.chunker import smart_chunk_pages_plus
+            from app.services.chunkers.chunker import smart_chunk_pages_plus
             if job_id: print(f"[CHUNK-{job_id}] Using layout-aware chunker (SmartChunkerPlus)...")
             ch = smart_chunk_pages_plus(pages_std, enc, target_tokens, overlap_tokens, layout_map)
             if _nonempty(ch):
@@ -93,7 +93,7 @@ def build_chunks(
 
     # 4) 기본 SmartChunker
     try:
-        from app.services.chunker import smart_chunk_pages
+        from app.services.chunkers.chunker import smart_chunk_pages
         if job_id: print(f"[CHUNK-{job_id}] Using basic smart chunker...")
         ch = smart_chunk_pages(pages_std, enc, target_tokens, overlap_tokens, layout_map)
         if _nonempty(ch):
