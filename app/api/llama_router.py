@@ -1758,7 +1758,7 @@ def doc_status(doc_id: str):
         # 키 호환(pdf/pdf_key, original/original_key 등) 처리
         chunk_count = meta.get("chunk_count")
         if isinstance(chunk_count, int):
-            return {"doc_id": doc_id, "chunks": chunk_count, "indexed": chunk_count > 0}
+            return {"doc_id": doc_id, "chunks": chunk_count, "indexed": chunk_count > 0, "cached_in_meta": True, "name": meta.get("title")}
 
     # 2) 폴백: Milvus에서 세고 메타에 캐시
     try:
@@ -1775,7 +1775,7 @@ def doc_status(doc_id: str):
         except Exception:
             pass
 
-        return {"doc_id": doc_id, "chunks": total, "indexed": total > 0}
+        return {"doc_id": doc_id, "chunks": total, "indexed": total > 0, "cached_in_meta": True, "name": meta.get("title")}
     except Exception as e:
         raise HTTPException(500, f"doc status 실패: {e}")
 

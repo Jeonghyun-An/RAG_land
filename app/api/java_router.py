@@ -1437,7 +1437,7 @@ async def process_sc_index(
                 # MinIO 업로드 (PDF가 생성된 경우만)
                 object_pdf = None 
                 if local_pdf and local_pdf.exists():
-                    object_pdf = f"uploaded/sc/{doc_id}.pdf"
+                    object_pdf = f"uploaded/{doc_id}.pdf"
                     
                     # upload_bytes 메서드 사용
                     with open(local_pdf, "rb") as f:
