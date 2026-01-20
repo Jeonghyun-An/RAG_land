@@ -1,0 +1,14 @@
+FROM vllm/vllm-openai:latest
+
+# 중국어 억제 스크립트 복사
+COPY suppress_chinese.py /workspace/
+COPY start_vllm_with_suppression.py /workspace/
+
+# 실행 권한 부여
+RUN chmod +x /workspace/start_vllm_with_suppression.py
+
+# 작업 디렉토리
+WORKDIR /workspace
+
+# 기본 엔트리포인트 오버라이드
+ENTRYPOINT ["python3", "/workspace/start_vllm_with_suppression.py"]
