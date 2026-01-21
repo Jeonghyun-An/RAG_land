@@ -720,6 +720,83 @@ def _calculate_safe_max_tokens(
     
     return safe_max_tokens
 
+FACILITY_RE = re.compile(
+    r"\bKO(?:-[A-Z]|[A-Z]{1,2}|\d[A-Z]|[A-Z]\d)\b",
+    re.IGNORECASE
+)
+
+def extract_facility_codes(text: str) -> List[str]:
+    """질문에서 facility code(KOO/KOI/KOEI...) 추출"""
+    if not text:
+        return []
+    codes = FACILITY_RE.findall(text.upper())
+    seen, out = set(), []
+    for c in codes:
+        c = c.upper()
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+def _text_has_any_code(text: str, codes: List[str]) -> bool:
+    if not text or not codes:
+        return False
+    up = text.upper()
+    return any(code in up for code in codes)
+
+def _candidate_has_any_facility_code(cand: Dict[str, Any], codes: List[str]) -> bool:
+    """청크/섹션/메타에 시설코드가 포함되는지 검사"""
+    if not codes:
+        return True
+
+    chunk = cand.get("chunk") or ""
+    section = cand.get("section") or ""
+    try:
+        body = _strip_meta_line(chunk)
+    except Exception:
+        body = chunk
+
+    return (
+        _text_has_any_code(body, codes)
+        or _text_has_any_code(section, codes)
+        # doc_id에도 코드가 들어가는 경우가 있어서(파일명/그룹명) 보조적으로 검사
+        or _text_has_any_code(str(cand.get("doc_id") or ""), codes)
+    )
+
+def _apply_facility_code_filter(
+    cands: List[Dict[str, Any]],
+    question: str,
+    query_for_search: str,
+    logger=None
+) -> List[Dict[str, Any]]:
+    """
+    질문/검색질의에서 facility code를 뽑아서,
+    rerank 이전 후보(cands)를 hard-filter.
+    - coded 후보가 존재하면 coded로 교체
+    - 없으면 기존 cands 유지 (fallback)
+    """
+    codes = extract_facility_codes(question) or extract_facility_codes(query_for_search)
+    if not codes:
+        return cands
+
+    coded = [c for c in cands if _candidate_has_any_facility_code(c, codes)]
+
+    if logger:
+        logger.info(
+            "[ask] facility_codes=%s | coded=%d/%d",
+            ",".join(codes),
+            len(coded),
+            len(cands),
+        )
+
+    return coded if coded else cands
+def _wants_timeline(question: str) -> bool:
+    if not question:
+        return False
+    q = question.lower()
+    triggers = ["이력", "연혁", "타임라인", "레터", "letter history", "chronology", "history"]
+    return any(t in q for t in triggers)
+
 # def _build_prompt(context: str, question: str, lang: str) -> str:
 #     if lang == "ko":
 #         return f"""당신은 한국원자력통제기술원(KINAC)의 AI 어시스턴트 '키나기AI'입니다.
@@ -797,6 +874,67 @@ def _build_prompt(
         lang: 언어 (ko/en)
         response_type: short(단문형) | long(장문형)
     """
+    if _wants_timeline(question):
+        if lang == "ko":
+            return f"""
+당신은 KINAC 내부 문서(아래 [CONTEXT])만 근거로 답변하는 어시스턴트입니다.
+추측/외부지식/일반 설명 금지. 문서에 없는 레터는 "확인 불가"라고 쓰세요.
+페이지 번호, URL, 인용 형식은 사용하지 마세요.
+
+사용자 요청은 "레터 이력(타임라인) 정리"입니다.
+아래 규칙을 반드시 지켜서 출력하세요. 4단 구성(개요/주요내용/배경/결론) 금지.
+
+[출력 형식]
+## 1) 요약(2~5문장): 해당 Facility code 관련 레터가 "몇 건" 확인되는지, 확인된 "기간"이 언제인지
+## 2) 타임라인 표(필수): 아래 컬럼명을 정확히 사용
+
+- Date: 문서에 적힌 날짜(예: 2006-10-06)
+- Reference: 문서의 레퍼런스(예: KOO4/2006/002, MA-ROK-33.1 등)
+- Type: 문서 제목/성격(예: Statement of Results of Inspection / Conclusions / Amendment / Transfer 등)
+- Facility/MBA: 예: KOO4, MBA KOO4 등 문서에 있는 표기 그대로
+- Basis: Article 90(a) 같은 근거 조항이 있으면 그대로
+- Key Points: 해당 레터의 핵심 내용을 자세하게 설명
+- Source: (doc_id, page)
+
+## 3) 누락/추가 확인 필요(선택): "추가 레터가 더 있을 수 있음" 같은 점검 포인트를 1~3개(근거 기반)
+
+[CONTEXT]
+{context}
+
+[QUESTION]
+{question}
+
+이제 위 형식대로만 작성하세요.
+""".strip()
+
+        else:  # English timeline
+            return f"""
+You are "Kinagi AI" for KINAC. Use ONLY the provided [CONTEXT].
+No external knowledge, no speculation. If a letter is not in the context, write "Not found".
+
+The user asks for a "Letter history / timeline". Do NOT use the four-section essay format.
+
+[OUTPUT FORMAT]
+## 1) Summary (2-5 sentences): how many letters are found and the covered date range
+## 2) Timeline table (required) with EXACT columns:
+- Date
+- Reference
+- Type
+- Facility/MBA
+- Basis
+- Key Points (detailed explanation)
+- Source (doc_id, page)
+
+## 3) Missing / further check (optional): 1-3 checks based on evidence
+
+[CONTEXT]
+{context}
+
+[QUESTION]
+{question}
+
+Write strictly in the format above.
+""".strip()
     if lang == "ko":
         if response_type == "long":
             return f"""당신은 "키나기 AI"입니다. KINAC(한국원자력통제기술원)의 공식 문서를 기반으로
@@ -1489,7 +1627,12 @@ def ask_question(req: AskReq):
                 used_chunks=0,
                 sources=[]
             )
-
+        cands = _apply_facility_code_filter(
+            cands=cands,
+            question=req.question or "",
+            query_for_search=query_for_search or "",
+            logger=logger,
+        )
         # 2) 키워드 부스트 (질문 원문 기준으로 키워드 추출)
         kws = extract_keywords(req.question)
         def _kw_boost_score(c: dict) -> int:

@@ -26,7 +26,7 @@ class ChineseTokenSuppressor(LogitsProcessor):
     ]
 
     def __init__(self, vllm_config, device: torch.device, is_pin_memory: bool):
-        # ✅ 절대 super().__init__() 호출하지 말 것 (0.11.0에서는 바로 NotImplementedError)
+        # 절대 super().__init__() 호출하지 말 것 (0.11.0에서는 바로 NotImplementedError)
         self.vllm_config = vllm_config
         self.device = device
         self.is_pin_memory = is_pin_memory
