@@ -3,7 +3,8 @@ from __future__ import annotations
 import os, traceback
 import logging
 from functools import lru_cache
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Union, Iterable
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -40,19 +41,32 @@ def _load_ce():
         print(f"[RERANK] CE load failed: {e}\n{traceback.format_exc()}")
         return None
 
+def ensure_list(scores: Union[float, np.ndarray, List[float], Any]) -> List[float]:
+    """FlagReranker/CE의 scores를 항상 List[float]로 보장"""
+    if np.isscalar(scores) or isinstance(scores, (float, np.floating)):
+        return [float(scores)]
+    if isinstance(scores, np.ndarray):
+        if scores.ndim == 0:
+            return [float(scores)]
+        return scores.flatten().tolist()
+    if isinstance(scores, list):
+        return [float(s) for s in scores]
+    raise ValueError(f"Unexpected scores type from reranker: {type(scores)}")
+
 def _score_flag(pairs: List[Tuple[str, str]]) -> List[float]:
     model = _load_flag_reranker()
     if model is None:
         raise RuntimeError("Flag reranker not available")
-    # normalize=True → 0~1 근처 점수
-    return model.compute_score(pairs, normalize=True, batch_size=RERANKER_BATCH_SIZE)
+    raw_scores = model.compute_score(pairs, normalize=True, batch_size=RERANKER_BATCH_SIZE)
+    return ensure_list(raw_scores)
 
 def _score_ce(pairs: List[Tuple[str, str]]) -> List[float]:
     model = _load_ce()
     if model is None:
         raise RuntimeError("CE reranker not available")
-    # CE는 자유 스케일(음수/양수 혼재). 그대로 사용하고 컷오프에서 emb 백업 조건 병행.
-    return model.predict(pairs, batch_size=RERANKER_BATCH_SIZE).tolist()
+    raw_scores = model.predict(pairs, batch_size=RERANKER_BATCH_SIZE)
+    return ensure_list(raw_scores)
+
 
 def _score_pairs(pairs: List[Tuple[str, str]]) -> Tuple[str, List[float]]:
     last_err = None
@@ -64,76 +78,82 @@ def _score_pairs(pairs: List[Tuple[str, str]]) -> Tuple[str, List[float]]:
                 return "ce", _score_ce(pairs)
         except Exception as e:
             last_err = e
+            logger.warning(f"[RERANK] Backend {backend} failed: {e}")
             continue
-    raise RuntimeError(f"reranker backends failed: {last_err}")
+    raise RuntimeError(f"All reranker backends failed: {last_err}")
 
 def rerank(
-    query: str, cands: List[Dict[str, Any]], top_k: int = 5
+    query: str,
+    cands: List[Dict[str, Any]],
+    top_k: int = 5
 ) -> List[Dict[str, Any]]:
-    """
-    후보 청크들을 리랭킹하여 상위 top_k개 반환
-    
-    GPU 메모리 부족 시 배치 처리
-    """
     if not cands:
         return []
 
-    # 쿼리-청크 페어 생성
-    pairs = [(query, _strip_meta_line(c.get("chunk") or "")) for c in cands]
+    # Early return for trivial cases
+    if len(cands) == 0:
+        return []
+    if len(cands) == 1:
+        c = cands[0]
+        c["re_score"] = float(c.get("score", 0.5))
+        c["re_backend"] = "single_fallback"
+        return cands
 
-    # ========== 배치 처리 추가 ==========
-    MAX_BATCH_SIZE = 100  # GPU 메모리 고려
-    
+    pairs = [(query, _strip_meta_line(c.get("chunk") or "")) for c in cands]
+    pairs = [p for p in pairs if p[1]]  # 빈 청크 제거
+
+    if not pairs:
+        logger.warning("[RERANK] All pairs empty after stripping → fallback to original scores")
+        for c in cands:
+            c["re_score"] = float(c.get("score", 0.0))
+            c["re_backend"] = "fallback_empty"
+        cands.sort(key=lambda x: x.get("re_score", -1e9), reverse=True)
+        return cands[:max(1, top_k)]
+
+    MAX_BATCH_SIZE = 100
+
     if len(pairs) > MAX_BATCH_SIZE:
-        # 배치로 나눠서 처리
-        logger.info(f"[RERANK] Processing {len(pairs)} pairs in batches of {MAX_BATCH_SIZE}")
-        
+        logger.info(f"[RERANK] Large input ({len(pairs)}), splitting into batches of {MAX_BATCH_SIZE}")
         all_scores = []
         backend = None
-        
         for i in range(0, len(pairs), MAX_BATCH_SIZE):
-            batch_pairs = pairs[i:i+MAX_BATCH_SIZE]
+            batch_pairs = pairs[i:i + MAX_BATCH_SIZE]
+            batch_cands = cands[i:i + MAX_BATCH_SIZE]
             try:
-                backend, batch_scores = _score_pairs(batch_pairs)
+                b, batch_scores = _score_pairs(batch_pairs)
+                batch_scores = ensure_list(batch_scores)
+                if backend is None:
+                    backend = b
                 all_scores.extend(batch_scores)
             except Exception as e:
-                logger.error(f"[RERANK] Batch {i//MAX_BATCH_SIZE} failed: {e}")
-                # 폴백: 임베딩 스코어 사용
-                for c in cands[i:i+MAX_BATCH_SIZE]:
-                    all_scores.append(c.get("score", 0.0))
-        
+                logger.error(f"[RERANK] Batch {i//MAX_BATCH_SIZE + 1} failed: {e} → fallback")
+                all_scores.extend([c.get("score", 0.0) for c in batch_cands])
         scores = all_scores
     else:
-        # 기존 로직
         try:
             backend, scores = _score_pairs(pairs)
+            scores = ensure_list(scores)
         except Exception as e:
-            logger.error(f"[RERANK] Scoring failed: {e}")
-            # 폴백: 원래 임베딩 스코어 사용
+            logger.error(f"[RERANK] Full scoring failed: {e} → fallback to embedding scores")
             for c in cands:
-                c["re_score"] = c.get("score", 0.0)
-                c["re_backend"] = "fallback"
-            cands.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+                c["re_score"] = float(c.get("score", 0.0))
+                c["re_backend"] = "fallback_error"
+            cands.sort(key=lambda x: x.get("re_score", -1e9), reverse=True)
             return cands[:max(1, top_k)]
 
     # 스코어 부착
     for c, s in zip(cands, scores):
         c["re_score"] = float(s)
-        c["re_backend"] = backend if backend else "fallback"
+        c["re_backend"] = backend or "unknown"
 
     # 내림차순 정렬
     cands.sort(key=lambda x: x.get("re_score", -1e9), reverse=True)
 
-    # 상위 top_k개 반환
-    result = cands[: max(1, top_k)]
+    result = cands[:max(1, top_k)]
 
-    # 로깅
     if result:
-        top3_scores = [c.get("re_score", 0) for c in result[:3]]
-        logger.info(
-            f"[RERANK] Backend={backend}, top_k={top_k}, "
-            f"top3_re_scores={top3_scores}, total_cands={len(cands)}"
-        )
+        top3 = [round(c.get("re_score", 0), 4) for c in result[:3]]
+        logger.info(f"[RERANK] Success | backend={backend} | top_k={top_k} | top3_scores={top3} | total={len(cands)}")
 
     return result
 
