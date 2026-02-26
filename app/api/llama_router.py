@@ -111,7 +111,8 @@ RAG_ARTICLE_BOOST = float(os.getenv("RAG_ARTICLE_BOOST", "2.5"))
 
 # 컨텍스트 토큰 예산
 CONTEXT_BUDGET_TOKENS = int(os.getenv("RAG_CONTEXT_BUDGET_TOKENS", "1024"))
-
+LONG_CONTEXT_BUDGET_TOKENS_NORMAL = int(os.getenv("RAG_LONG_CONTEXT_BUDGET_NORMAL", "4096"))
+LONG_CONTEXT_BUDGET_TOKENS = int(os.getenv("RAG_LONG_CONTEXT_BUDGET", "20000"))
 # 적응형 임계값 설정
 USE_ADAPTIVE_THRESHOLD = os.getenv("RAG_USE_ADAPTIVE_THRESHOLD", "1") == "1"
 BASE_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.25"))
@@ -121,10 +122,9 @@ EMB_BACKUP_THRESHOLD = float(os.getenv("RAG_EMB_BACKUP_THR", "0.55"))
 LONG_CONTEXT_ENABLED = os.getenv("RAG_LONG_CONTEXT_MODE", "1") == "1"
 LONG_CONTEXT_TOP_K = int(os.getenv("RAG_LONG_CONTEXT_TOP_K", "150"))
 LONG_SCORE_THRESHOLD = float(os.getenv("RAG_LONG_SCORE_THRESHOLD", "0.25"))
-LONG_CONTEXT_BUDGET_TOKENS = int(os.getenv("RAG_LONG_CONTEXT_BUDGET", "20000"))
 LONG_MAX_TOKENS = int(os.getenv("RAG_LONG_MAX_TOKENS", "5000"))
 RERANKER_MAX_BATCH_SIZE = int(os.getenv("RERANKER_MAX_BATCH_SIZE", "100"))  # 리랭커 최대 배치 크기
-
+LONG_TEMPERATURE = float(os.getenv("RAG_LONG_TEMPERATURE", "0.1"))
 # --- 폴백 전용: pages 정규화 도우미 ---------------------------------
 def _normalize_pages_for_chunkers(pages):
     """
@@ -1077,18 +1077,18 @@ you must follow the four-section structure below.
 # Four-Section Structure
 
 ### 1) Overview
-- Summarize the topic in 3–4 sentences.
+- Summarize the topic in 3-4 sentences.
 
 ### 2) Detailed Explanation
-- Explain in sufficient detail (recommended 8–15 sentences) using only the context.
+- Explain in sufficient detail (recommended 8-15 sentences) using only the context.
 - Do not inflate length if the context is limited.
 
 ### 3) Background or Relevant Provisions
-- Explain regulatory or international background in 4–5 sentences.
+- Explain regulatory or international background in 4-5 sentences.
 - Use only information present in the context.
 
 ### 4) Conclusion
-- Summarize key points in 2–3 sentences.
+- Summarize key points in 2-3 sentences.
 - If information is limited, state:
   "This explanation is based solely on information provided in KINAC documents."
 
@@ -1295,18 +1295,10 @@ def _calculate_adaptive_threshold(
 # 컨텍스트 토큰 예산 적용
 def _apply_context_budget(
     chunks: List[Dict[str, Any]],
-    budget_tokens: int = CONTEXT_BUDGET_TOKENS,
+    budget_tokens: int | None = None,             # ← None이면 전역 변수 참조
 ) -> List[Dict[str, Any]]:
-    """
-    누적 토큰이 예산을 초과하지 않도록 청크 필터링
-    
-    Args:
-        chunks: 필터링된 청크 리스트
-        budget_tokens: 최대 토큰 예산
-    
-    Returns:
-        예산 내에 들어오는 청크 리스트
-    """
+    if budget_tokens is None:
+        budget_tokens = CONTEXT_BUDGET_TOKENS 
     if budget_tokens <= 0:
         return chunks
 
@@ -1532,7 +1524,7 @@ def ask_question(req: AskReq):
             # 초장문 모드 전용 설정
             configured_top_k = LONG_CONTEXT_TOP_K  # 100
             max_tokens = LONG_MAX_TOKENS  # 5000
-            temperature = 0.1
+            temperature = LONG_TEMPERATURE
             top_p = 0.92
             use_token_packing = True  # 토큰 팩킹 활성화
             
@@ -1761,10 +1753,12 @@ def ask_question(req: AskReq):
                 f"[ASK] LONG MODE | Packed {len(filtered_topk)} chunks, "
                 f"actual_tokens={actual_tokens}, budget={chunk_budget}"
             )
+        # 컨텍스트 구성 else 분기 수정
         else:
-            # 일반 모드: 기존 로직 (컨텍스트 토큰 예산)
-            filtered_topk = _apply_context_budget(filtered_topk, CONTEXT_BUDGET_TOKENS)
-
+            if req.response_type == "long":
+                filtered_topk = _apply_context_budget(filtered_topk, LONG_CONTEXT_BUDGET_TOKENS_NORMAL)
+            else:
+                filtered_topk = _apply_context_budget(filtered_topk, CONTEXT_BUDGET_TOKENS)
         # 5) 컨텍스트/출처 구성
         context_lines = []
         sources = []
