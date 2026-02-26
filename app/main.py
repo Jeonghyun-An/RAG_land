@@ -15,6 +15,7 @@ from app.api.java_router import router as java_router  # 운영용
 from app.api.dev_router import router as dev_router    # 개발용
 from app.api.stt_router import router as stt_router    # STT 라우터
 from app.api.finetune_router import router as finetune_router  # 파인튜닝 라우터
+from app.api.admin_router import router as admin_router  # RAG 파라미터 런타임 수정 라우터
 
 # ========== 모델 미리 로드 (앱 시작 시) ==========
 from app.services.embedding_model import get_embedding_model
@@ -50,6 +51,7 @@ app.include_router(java_router, prefix=API_BASE)  # /llama/java - 운영용
 app.include_router(dev_router, prefix=API_BASE)   # /llama/dev - 개발용
 app.include_router(stt_router, prefix=API_BASE)   # /llama/stt - STT
 app.include_router(finetune_router, prefix=API_BASE)  # /llama/finetune - 파인튜닝
+app.include_router(admin_router, prefix=API_BASE)  # /llama/admin - RAG 파라미터 런타임 수정
 
 @app.get(f"{API_BASE}/healthz")
 def healthz():
