@@ -63,6 +63,16 @@ class RagConfigUpdate(BaseModel):
         description="초장문형 temperature - LONG_TEMPERATURE (현재: 0.1)"
     )
 
+    # ===== 검색 임계값 =====
+    base_score_threshold: Optional[float] = Field(
+        None, ge=0.0, le=1.0,
+        description="단문/장문 리랭킹 최소 스코어 - BASE_SCORE_THRESHOLD (현재: 0.25)"
+    )
+    ultra_score_threshold: Optional[float] = Field(
+        None, ge=0.0, le=1.0,
+        description="초장문 리랭킹 최소 스코어 - LONG_SCORE_THRESHOLD (현재: 0.25)"
+    )
+
 
 @router.get("/rag-config", summary="현재 RAG 파라미터 조회")
 def get_rag_config():
@@ -84,6 +94,10 @@ def get_rag_config():
             "top_k": llama_module.LONG_CONTEXT_TOP_K,
             "max_tokens": llama_module.LONG_MAX_TOKENS,
             "temperature": llama_module.LONG_TEMPERATURE,
+        },
+        "search": {
+            "base_score_threshold": llama_module.BASE_SCORE_THRESHOLD,
+            "ultra_score_threshold": llama_module.LONG_SCORE_THRESHOLD,
         },
         "note": "서버 재시작 시 환경변수 기본값으로 복원됩니다."
     }
@@ -133,6 +147,14 @@ def update_rag_config(req: RagConfigUpdate):
         llama_module.LONG_TEMPERATURE = req.ultra_temperature
         changed["ultra_temperature"] = req.ultra_temperature
 
+    # 검색 임계값
+    if req.base_score_threshold is not None:
+        llama_module.BASE_SCORE_THRESHOLD = req.base_score_threshold
+        changed["base_score_threshold"] = req.base_score_threshold
+    if req.ultra_score_threshold is not None:
+        llama_module.LONG_SCORE_THRESHOLD = req.ultra_score_threshold
+        changed["ultra_score_threshold"] = req.ultra_score_threshold
+
     return {
         "message": "적용 완료 ✓",
         "changed": changed,
@@ -153,6 +175,10 @@ def update_rag_config(req: RagConfigUpdate):
                 "top_k": llama_module.LONG_CONTEXT_TOP_K,
                 "max_tokens": llama_module.LONG_MAX_TOKENS,
                 "temperature": llama_module.LONG_TEMPERATURE,
+            },
+            "search": {
+                "base_score_threshold": llama_module.BASE_SCORE_THRESHOLD,
+                "ultra_score_threshold": llama_module.LONG_SCORE_THRESHOLD,
             },
         }
     }
@@ -182,6 +208,8 @@ def reset_rag_config():
     llama_module.LONG_MAX_TOKENS = int(os.getenv("RAG_LONG_MAX_TOKENS", "5000"))
     llama_module.LONG_TEMPERATURE = float(os.getenv("RAG_LONG_TEMPERATURE", "0.1"))
     llama_module.LONG_CONTEXT_BUDGET_TOKENS_NORMAL = int(os.getenv("RAG_LONG_CONTEXT_BUDGET_NORMAL", "4096"))
+    llama_module.BASE_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.25"))
+    llama_module.LONG_SCORE_THRESHOLD = float(os.getenv("RAG_LONG_SCORE_THRESHOLD", "0.25"))
 
     return {
         "message": "기본값으로 초기화 완료 ✓",
@@ -192,6 +220,10 @@ def reset_rag_config():
                 "top_k": llama_module.LONG_CONTEXT_TOP_K,
                 "max_tokens": llama_module.LONG_MAX_TOKENS,
                 "temperature": llama_module.LONG_TEMPERATURE,
+            },
+            "search": {
+                "base_score_threshold": llama_module.BASE_SCORE_THRESHOLD,
+                "ultra_score_threshold": llama_module.LONG_SCORE_THRESHOLD,
             },
         }
     }
