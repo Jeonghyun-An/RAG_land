@@ -38,7 +38,7 @@ services:
     networks: [ragnet]
     ports: [] # 외부 노출 불필요 (fastapi가 내부에서 호출)
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
       interval: 5s
       timeout: 3s
       retries: 20

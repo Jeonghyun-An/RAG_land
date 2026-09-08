@@ -41,7 +41,7 @@ services:
     networks: [ragnet]
     ports: []
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
       interval: 5s
       timeout: 3s
       retries: 20
