@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Optional
 from openai import OpenAI
 
@@ -11,6 +12,14 @@ OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "180"))  # 초
 
 def _client(base_url: Optional[str] = None) -> OpenAI:
     return OpenAI(base_url=base_url or DEFAULT_BASE, api_key=API_KEY, timeout=OPENAI_TIMEOUT)
+
+# Qwen3 등 thinking 모드 모델이 <think>...</think>를 content에 그대로 섞어 보내는 경우 대비
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+def _strip_thinking(text: Optional[str]) -> str:
+    if not text:
+        return text or ""
+    return _THINK_BLOCK_RE.sub("", text).strip()
 
 GEN_TEMP = float(os.getenv("GEN_TEMP", "0.0"))
 GEN_TOP_P = float(os.getenv("GEN_TOP_P", "0.9"))
@@ -29,9 +38,10 @@ def chat_complete(model_name: str, prompt: str,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
-        stop=stop
+        stop=stop,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
-    return r.choices[0].message.content
+    return _strip_thinking(r.choices[0].message.content)
 
 def chat_complete_on(base_url: str, model_name: str, prompt: str,
                      temperature: float = GEN_TEMP,
@@ -45,9 +55,10 @@ def chat_complete_on(base_url: str, model_name: str, prompt: str,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
-        stop=stop
+        stop=stop,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
-    return r.choices[0].message.content
+    return _strip_thinking(r.choices[0].message.content)
 
 def list_vllm_models(base_url: Optional[str] = None) -> List[str]:
     """해당 base_url(vLLM 서버)의 served name 목록. 실패 시 빈 리스트."""

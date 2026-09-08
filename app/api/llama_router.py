@@ -46,7 +46,7 @@ from app.services.pdf_converter import convert_stream_to_pdf_bytes, convert_to_p
 from app.services.milvus_store_v2 import MilvusStoreV2
 from app.services.embedding_model import get_embedding_model, embed
 from app.services.reranker import rerank
-from app.services.llm_client import get_openai_client
+from app.services.llm_client import get_openai_client, _strip_thinking
 from app.services.db_connector import DBConnector
 
 router = APIRouter(tags=["llama"])
@@ -57,11 +57,11 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ---------- Schemas ----------
 class GenerateReq(BaseModel):
     prompt: str
-    model_name: str = "qwen2.5-14b"
+    model_name: Optional[str] = None
 
 class AskReq(BaseModel):
     question: str
-    model_name: str = "qwen2.5-14b"
+    model_name: Optional[str] = None
     top_k: int = 3  # 클라이언트에서 지정 가능하지만, response_type으로 오버라이드
     history: Optional[List[dict]] = []
     doc_ids: Optional[List[str]] = None
@@ -103,6 +103,7 @@ RESPONSE_MODE_CONFIG = {
 MODEL_MAX_CONTEXT = {
     "qwen2.5-14b": 30000,
     "qwen2.5-7b": 30000,
+    "qwen3-14b": 16384,
     "default": 8192,
 }
 # 리랭킹 설정
@@ -1188,23 +1189,24 @@ Examples:
             ],
             temperature=0.1,  # 약간의 창의성 허용 (0.0 → 0.1)
             max_tokens=256,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
-        
+
         if pytime.time() - st > TRANSLATE_TIMEOUT:
             raise TimeoutError("translate timeout")
-        
-        out = (resp.choices[0].message.content or "").strip()
-        
+
+        out = _strip_thinking(resp.choices[0].message.content)
+
         # 따옴표 제거
         out = out.strip('"\'`')
-        
+
         # 한글이 섞여 있으면 한 번 더 시도
         if _has_hangul(out):
-            sys2 = """Translate to English for document search. 
-Output ONLY pure ASCII English. 
+            sys2 = """Translate to English for document search.
+Output ONLY pure ASCII English.
 NO Korean letters. NO quotes. NO explanations.
 Preserve question format if input is a question."""
-            
+
             resp2 = client.chat.completions.create(
                 model=os.getenv("DEFAULT_MODEL_ALIAS", "qwen2.5-14b"),
                 messages=[
@@ -1213,8 +1215,9 @@ Preserve question format if input is a question."""
                 ],
                 temperature=0.0,
                 max_tokens=256,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-            out = (resp2.choices[0].message.content or "").strip().strip('"\'`')
+            out = _strip_thinking(resp2.choices[0].message.content).strip('"\'`')
         
         # 여전히 한글이 있거나 비어있으면 fallback
         if not out or _has_hangul(out):
@@ -1784,10 +1787,13 @@ def ask_question(req: AskReq):
             response_type="long" if use_token_packing else req.response_type
         )
         
+        # model_name 미지정 시 DEFAULT_MODEL_ALIAS 환경변수를 따름
+        resolved_model_name = (req.model_name or "").strip() or os.getenv("DEFAULT_MODEL_ALIAS", "qwen2.5-14b")
+
         # 동적 max_tokens 계산
         safe_max_tokens = _calculate_safe_max_tokens(
             prompt=prompt,
-            model_name=req.model_name,
+            model_name=resolved_model_name,
             requested_max_tokens=max_tokens,
             safety_margin=800
         )
@@ -1795,7 +1801,7 @@ def ask_question(req: AskReq):
         # 7) 모델 호출 (파라미터 전달)
         answer = generate_answer_unified(
             prompt=prompt,
-            name_or_id=req.model_name,
+            name_or_id=resolved_model_name,
             max_tokens=safe_max_tokens,
             temperature=temperature,
             top_p=top_p          
