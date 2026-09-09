@@ -30,7 +30,8 @@ def chat_complete(model_name: str, prompt: str,
                   temperature: float = GEN_TEMP,
                   max_tokens: int = GEN_MAX_TOKENS,
                   top_p: float = GEN_TOP_P,
-                  stop: list[str] | None = None) -> str:
+                  stop: list[str] | None = None,
+                  repetition_penalty: float = GEN_REP_PEN) -> str:
     c = _client()
     r = c.chat.completions.create(
         model=model_name,
@@ -39,7 +40,10 @@ def chat_complete(model_name: str, prompt: str,
         max_tokens=max_tokens,
         top_p=top_p,
         stop=stop,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        extra_body={
+            "repetition_penalty": repetition_penalty,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
     )
     return _strip_thinking(r.choices[0].message.content)
 
@@ -47,7 +51,8 @@ def chat_complete_on(base_url: str, model_name: str, prompt: str,
                      temperature: float = GEN_TEMP,
                      max_tokens: int = GEN_MAX_TOKENS,
                      top_p: float = GEN_TOP_P,
-                     stop: list[str] | None = None) -> str:
+                     stop: list[str] | None = None,
+                     repetition_penalty: float = GEN_REP_PEN) -> str:
     c = _client(base_url)
     r = c.chat.completions.create(
         model=model_name,
@@ -56,7 +61,10 @@ def chat_complete_on(base_url: str, model_name: str, prompt: str,
         max_tokens=max_tokens,
         top_p=top_p,
         stop=stop,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        extra_body={
+            "repetition_penalty": repetition_penalty,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
     )
     return _strip_thinking(r.choices[0].message.content)
 
