@@ -104,6 +104,7 @@ MODEL_MAX_CONTEXT = {
     "qwen2.5-14b": 30000,
     "qwen2.5-7b": 30000,
     "qwen3-14b": 16384,
+    "gemma-3-12b": 26000,
     "default": 8192,
 }
 # 리랭킹 설정

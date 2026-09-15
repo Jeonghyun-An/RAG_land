@@ -22,6 +22,7 @@ REGISTRY: Dict[str, ModelSpec] = {
     "qwen2.5-14b":   ModelSpec("vllm", "Qwen/Qwen2.5-14B-Instruct"),
     "qwen2.5-7b":   ModelSpec("vllm", "Qwen/Qwen2.5-7B-Instruct"),
     "qwen3-14b":   ModelSpec("vllm", "Qwen/Qwen3-14B-FP8", ctx_len=16384),
+    "gemma-3-12b":   ModelSpec("vllm", "google/gemma-3-12b-it", ctx_len=26000),
 
     # 실제 HF ID(그대로 받아도 로컬 로딩 가능)
     "meta-llama/Llama-3.2-1B-Instruct": ModelSpec("vllm", "meta-llama/Llama-3.2-1B-Instruct"),
@@ -31,6 +32,7 @@ REGISTRY: Dict[str, ModelSpec] = {
     "Qwen/Qwen2.5-14B-Instruct":        ModelSpec("vllm", "Qwen/Qwen2.5-14B-Instruct", ctx_len=32768),
     "Qwen/Qwen2.5-7B-Instruct":        ModelSpec("vllm", "Qwen/Qwen2.5-7B-Instruct", ctx_len=32768),
     "Qwen/Qwen3-14B-FP8":              ModelSpec("vllm", "Qwen/Qwen3-14B-FP8", ctx_len=16384),
+    "google/gemma-3-12b-it":           ModelSpec("vllm", "google/gemma-3-12b-it", ctx_len=26000),
 }
 
 # DEFAULT_MODEL_ALIAS 환경변수로 오버라이드 가능 (llama_model.py와 동일한 env var 공유)
