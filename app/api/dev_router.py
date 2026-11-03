@@ -23,6 +23,7 @@ import httpx
 from app.services.minio_store import MinIOStore
 from app.services.pdf_converter import convert_to_pdf, ConvertError
 from app.services import job_state
+from app.services.safe_io import UnsafePathError, ensure_under_roots, webhook_url_permitted
 
 router = APIRouter(prefix="/dev", tags=["development"])
 
@@ -84,6 +85,9 @@ def generate_hmac_signature(payload: str, secret: str) -> str:
 
 
 async def send_dev_webhook(url: str, payload: DevWebhookPayload, secret: str):
+    # 허용되지 않은 콜백 주소로는 전송하지 않음
+    if not webhook_url_permitted(url):
+        return
     try:
         payload_json = payload.model_dump_json()
         signature = generate_hmac_signature(payload_json, secret)
@@ -130,7 +134,8 @@ async def process_dev_convert_and_index(
         staging_dir = Path(LOCAL_STAGING_PATH)
         staging_dir.mkdir(parents=True, exist_ok=True)
         file_path = staging_dir / file_id
-        
+        ensure_under_roots(file_path, [LOCAL_STAGING_PATH])
+
         if not file_path.exists():
             raise FileNotFoundError(f"로컬 파일 없음: {file_path}")
         
@@ -335,7 +340,13 @@ async def dev_convert_and_index(
     
     staging_dir = Path(LOCAL_STAGING_PATH)
     file_path = staging_dir / request.file_id
-    
+
+    # 스테이징 디렉토리 밖을 가리키는 file_id(절대경로·'..')는 거부
+    try:
+        ensure_under_roots(file_path, [LOCAL_STAGING_PATH])
+    except UnsafePathError:
+        raise HTTPException(400, "Invalid file_id")
+
     if not file_path.exists():
         raise HTTPException(404, f"Local file not found: {file_path}")
     
