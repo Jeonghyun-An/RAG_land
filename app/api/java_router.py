@@ -23,6 +23,7 @@ from pydantic import BaseModel
 import httpx
 
 from app.services.db_connector import DBConnector
+from app.services.safe_io import UnsafePathError, resolve_source_path, webhook_url_permitted
 from app.services.iaea_smart_processor import process_if_needed
 from app.services.pdf_converter import convert_to_pdf, convert_bytes_to_pdf_bytes, ConvertError
 from app.services import job_state
@@ -131,6 +132,9 @@ def verify_internal_token(token: Optional[str]) -> bool:
 
 async def send_webhook(url: str, payload: WebhookPayload, secret: str):
     """AI → 자바 웹훅 전송"""
+    # 허용되지 않은 콜백 주소(내부 주소 외 / WEBHOOK_ALLOWED_HOSTS 미등록)로는 전송하지 않음
+    if not webhook_url_permitted(url):
+        return
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             headers = {}
@@ -448,6 +452,12 @@ async def convert_and_index(
     """자바 → AI 트리거 API (운영용) - convert-and-index"""
     if not verify_internal_token(x_internal_token):
         raise HTTPException(401, "Unauthorized - Invalid token")
+
+    # 공유 볼륨 밖을 가리키는 경로(절대경로·'..' 등)는 접수 단계에서 거부
+    try:
+        resolve_source_path(request.path, request.file_id, SERVER_BASE_PATH)
+    except UnsafePathError:
+        raise HTTPException(400, "Invalid path")
     
     db = DBConnector()
     existing = db.get_file_by_id(request.data_id)
@@ -725,11 +735,8 @@ async def process_convert_and_index_prod(
         # ========== Step 1: 파일 경로 확인 ==========
         job_state.update(job_id, status="initializing", step="Resolving file path")
         
-        raw_path = Path(path)
-        base = raw_path if raw_path.is_absolute() else Path(SERVER_BASE_PATH) / raw_path
-
-        # base가 폴더이거나 확장자가 없으면 file_id를 붙여 실제 파일 경로 구성
-        full_path = base if base.suffix else (base / file_id)
+        # 경로 조합 규칙은 기존과 동일, 결과가 공유 볼륨 하위가 아니면 UnsafePathError
+        full_path = resolve_source_path(path, file_id, SERVER_BASE_PATH)
 
         if not full_path.exists():
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {full_path}")
