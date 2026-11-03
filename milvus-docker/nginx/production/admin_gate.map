@@ -1,0 +1,7 @@
+# 관리자 경로 인증값 — FastAPI 스택 환경변수 ADMIN_GATE_SECRET 과 반드시 같은 값을 넣는다.
+#   값 생성:  openssl rand -hex 32
+#   권한:     chmod 600 admin_gate.map
+# 아래 한 줄의 주석(#)을 풀고 값을 바꾼다. 형식은 정확히 이 한 줄이다(1 = 관리자 IP).
+# 비어 있으면(주석뿐이면) 관리자 경로는 FastAPI 에서 거부된다.
+#
+# 1 "여기에_openssl_rand_-hex_32_로_만든_값";
