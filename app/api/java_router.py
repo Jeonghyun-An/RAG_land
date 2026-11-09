@@ -24,6 +24,7 @@ import httpx
 
 from app.services.db_connector import DBConnector
 from app.services.safe_io import UnsafePathError, resolve_source_path, webhook_url_permitted
+from app.services.internal_auth import verify_internal_token as _verify_internal_token
 from app.services.iaea_smart_processor import process_if_needed
 from app.services.pdf_converter import convert_to_pdf, convert_bytes_to_pdf_bytes, ConvertError
 from app.services import job_state
@@ -124,10 +125,8 @@ class UpdateMetadataResponse(BaseModel):
 
 # ==================== Helper Functions ====================
 def verify_internal_token(token: Optional[str]) -> bool:
-    """내부 토큰 검증"""
-    if not SHARED_SECRET:
-        return True
-    return token == SHARED_SECRET
+    """내부 토큰 검증 (토큰 필수화 스위치·상수 시간 비교는 internal_auth 참고)"""
+    return _verify_internal_token(token, SHARED_SECRET)
 
 
 async def send_webhook(url: str, payload: WebhookPayload, secret: str):

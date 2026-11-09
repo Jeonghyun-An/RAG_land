@@ -11,7 +11,7 @@ from typing import Dict, List, Optional,Literal,Any
 from starlette.responses import StreamingResponse
 from app.services.db_connector import DBConnector
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import asyncio, json
 import numpy as np
 import logging
@@ -39,7 +39,8 @@ from app.services.file_parser import (
     parse_any_bytes,              # (filename, bytes) -> {"kind":"pdf", "pages":[...], "blocks":[...]}
     parse_pdf_blocks_from_bytes,  # (bytes) -> [(page_no, [ {text,bbox}, ... ])]
 )
-from app.services import job_state, rag_params
+from app.services import job_state, rag_params, request_guard
+from app.services.model_registry import model_request_error
 from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
 from app.services.pdf_converter import convert_stream_to_pdf_bytes, convert_to_pdf,convert_bytes_to_pdf_bytes, ConvertError
@@ -66,10 +67,21 @@ class AskReq(BaseModel):
     history: Optional[List[dict]] = []
     doc_ids: Optional[List[str]] = None
     response_type: Literal["short", "long"] = "short"  # short(단문형) | long(장문형)
-    long_context: bool = Field( 
+    long_context: bool = Field(
         default=False,
         description="초장문 컨텍스트 모드: 임계치 넘는 모든 청크를 30K 토큰까지 포함"
     )
+
+    # 입력 길이·형식 제한(보안대책 M14): 질의문은 초과 시 거부, 대화 이력은 최근 건만 잘라서 사용
+    @field_validator("question", mode="before")
+    @classmethod
+    def _check_question(cls, v):
+        return request_guard.validate_question(v)
+
+    @field_validator("history", mode="before")
+    @classmethod
+    def _trim_history(cls, v):
+        return request_guard.trim_history(v)
 
 class UploadResp(BaseModel):
     filename: str
@@ -1280,7 +1292,7 @@ def _maybe_translate_query_for_search(question: str, lang: str) -> str:
     
     # 번역 결과 로깅 (디버깅용)
     if translated != q:
-        logger.debug(f"[translate] {q[:50]} → {translated[:50]}")
+        logger.debug("[translate] %s → %s", request_guard.describe_query(q), request_guard.describe_query(translated))
     
     return translated
 # 적응형 임계값 계산
@@ -1413,6 +1425,9 @@ def test():
 
 @router.post("/generate")
 def generate(body: GenerateReq):
+    err = model_request_error(body.model_name, admin=True)
+    if err:
+        raise HTTPException(400, err)
     try:
         result = generate_answer_unified(body.prompt, body.model_name)
         return {"response": result}
@@ -1550,12 +1565,30 @@ async def upload_document(
 
 @router.post("/ask", response_model=AskResp)
 def ask_question(req: AskReq):
+    # 일반 사용자 질의는 허용목록의 모델만 지정 가능(임의 모델 지정 불가, 보안대책 3.2)
+    err = model_request_error(req.model_name)
+    if err:
+        raise HTTPException(400, err)
     return _ask_impl(req)
 
 
 def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskResp:
     """질의 처리 본체. overrides 는 관리자 시험용(admin_router /admin/ask)에서만 넘기며 그 요청에만 적용된다."""
     P = _effective_rag_params(overrides)
+
+    # 입력 필터(보안대책 M13): 지시 무시·시스템 프롬프트 노출 요청·탈옥 패턴은 검색·생성 없이 거부하고 기록
+    injection = request_guard.detect_injection(req.question)
+    if injection:
+        logger.warning("[GUARD] input pattern=%s q=%s enforce=%s",
+                       injection, request_guard.describe_query(req.question),
+                       request_guard.input_filter_enforced())
+        if request_guard.input_filter_enforced():
+            return AskResp(
+                answer=request_guard.INJECTION_REFUSAL["ko" if _detect_lang(req.question) == "ko" else "en"],
+                used_chunks=0,
+                sources=[],
+            )
+
     try:
         # ========== 초장문 모드 분기 ==========
         if req.long_context and LONG_CONTEXT_ENABLED:
@@ -1588,8 +1621,9 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
 
         # 1) 검색용 질의 준비(한국어면 ko->en 변환)
         query_for_search = _maybe_translate_query_for_search(req.question, lang)
-        logger.info("[ask] lang=%s | q_before=%s", lang, req.question[:120])
-        logger.info("[ask] q_search=%s", query_for_search[:120])
+        # 질의 내용은 로그에 남기지 않음(보안대책 M09, LOG_QUERY_TEXT=1 이면 개발용으로 앞부분 기록)
+        logger.info("[ask] lang=%s | q_before=%s", lang, request_guard.describe_query(req.question))
+        logger.info("[ask] q_search=%s", request_guard.describe_query(query_for_search))
 
 # ========== 초기 검색 top_k 결정 (모드별 분기) ==========
         if use_token_packing:
@@ -1759,7 +1793,7 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
                 dbg = [(x.get("re_score"), x.get("score")) for x in topk[:3]]
                 logger.warning(
                     f"[ASK] ALL CHUNKS FILTERED | top3: {dbg} | "
-                    f"threshold={threshold:.3f} | q_search={query_for_search[:80]}"
+                    f"threshold={threshold:.3f} | q_search={request_guard.describe_query(query_for_search)}"
                 )
             except Exception as e:
                 logger.warning(f"[ASK] Debug log failed: {e}")
@@ -1862,6 +1896,23 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
             f"~{estimated_tokens} tokens, max={max_tokens}"
         )
 
+        # 출력 필터(보안대책 M13): 지시문 노출 차단 → 개인정보 마스킹(답변·근거 미리보기)
+        if request_guard.output_filter_enforced():
+            answer, leaked, block = request_guard.strip_instruction_leak(
+                answer, prompt, exclude=(context, req.question)
+            )
+            if leaked:
+                logger.warning("[GUARD] output instruction lines=%d blocked=%s", leaked, block)
+            if block:
+                answer = request_guard.LEAK_REPLACEMENT["ko" if lang == "ko" else "en"]
+            answer, masked = request_guard.mask_pii(answer)
+            for s in sources:
+                if isinstance(s.get("chunk"), str):
+                    s["chunk"], n = request_guard.mask_pii(s["chunk"])
+                    masked += n
+            if masked:
+                logger.info("[GUARD] output pii masked=%d", masked)
+
         return AskResp(
             answer=answer,
             used_chunks=len(filtered_topk),
@@ -1922,11 +1973,11 @@ def get_job(job_id: str):
     st = job_state.get(job_id)
     if not st:
         raise HTTPException(404, "해당 job_id를 찾을 수 없습니다.")
-    return st
+    return job_state.public_view(st)
 
 @router.get("/jobs")
 def list_jobs(status: Optional[str] = Query(None), limit: int = Query(50, ge=1, le=500)):
-    return {"jobs": job_state.list_jobs(status=status, limit=limit)}
+    return {"jobs": [job_state.public_view(j) for j in job_state.list_jobs(status=status, limit=limit)]}
 
 @router.get("/doc/{doc_id}")
 def doc_status(doc_id: str):
@@ -1980,7 +2031,7 @@ async def stream_job(job_id: str):
                 yield {"event": "error", "data": json.dumps({"error": "not found"}, ensure_ascii=False)}
                 break
 
-            data = json.dumps(st, ensure_ascii=False)
+            data = json.dumps(job_state.public_view(st), ensure_ascii=False)
             if data != last_serialized:
                 yield {"event": "update", "data": data}
                 last_serialized = data

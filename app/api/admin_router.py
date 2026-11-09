@@ -4,10 +4,11 @@ RAG 파라미터 런타임 수정 API (파일럿 전용)
 - 재시작 없이 파라미터 즉시 반영
 - 재시작 시 환경변수 기본값으로 복원됨
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import Any, Dict, Optional
 import app.api.llama_router as llama_module
+from app.services.model_registry import model_request_error
 
 router = APIRouter(prefix="/admin", tags=["⚙️ RAG 파라미터 설정"])
 
@@ -94,6 +95,10 @@ class AdminAskResp(llama_module.AskResp):
     summary="관리자 질의 시험 (이 요청에만 파라미터 적용, 서버 전체 설정은 변경하지 않음)",
 )
 def admin_ask(req: AdminAskReq):
+    # 관리자 시험도 등록된 모델만 지정 가능(임의 모델 로딩 방지)
+    err = model_request_error(req.model_name, admin=True)
+    if err:
+        raise HTTPException(400, err)
     overrides = req.overrides.model_dump(exclude_none=True) if req.overrides else {}
     resp = llama_module._ask_impl(req, overrides)
     return AdminAskResp(**resp.model_dump(), applied_overrides=overrides)

@@ -23,6 +23,7 @@ from app.api.stt_router import router as stt_router    # STT 라우터
 from app.api.finetune_router import router as finetune_router  # 파인튜닝 라우터
 from app.api.admin_router import router as admin_router  # RAG 파라미터 런타임 수정 라우터
 from app.services.admin_gate import AdminGateMiddleware  # 관리자 경로 보호
+from app.services.error_handlers import install_error_handlers  # 오류 응답 내부 정보 비노출
 
 # ========== 모델 미리 로드 (앱 시작 시) ==========
 from app.services.embedding_model import get_embedding_model
@@ -54,6 +55,9 @@ app.add_middleware(
 # 관리·개발·파인튜닝·디버그·API 문서 경로: Gateway 가 붙이는 X-Admin-Gate 값 확인
 # (마지막에 추가한 미들웨어가 가장 바깥에서 먼저 실행된다)
 app.add_middleware(AdminGateMiddleware)
+
+# 5xx 오류 응답에 내부 정보(예외 메시지 등)를 싣지 않고 오류 번호만 보냄 — 상세는 서버 로그
+install_error_handlers(app)
 
 # 라우터 등록
 app.include_router(llama_router, prefix=API_BASE)

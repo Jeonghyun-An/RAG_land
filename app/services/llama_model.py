@@ -11,7 +11,7 @@ from typing import Dict, Tuple, Optional, List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from app.services.llm_client import chat_complete, chat_complete_on, list_vllm_models
-from app.services.model_registry import resolve as resolve_spec
+from app.services.model_registry import resolve as resolve_spec, is_registered as is_registered_model
 from app.config import HUGGINGFACE_TOKEN
 
 OPENAI_ALIAS_URLS: Dict[str, str] = json.loads(os.getenv("OPENAI_ALIAS_URLS", "{}"))
@@ -193,6 +193,9 @@ def generate_answer_unified(
             pass
 
     # 2) Transformers 폴백
+    # 등록되지 않은 이름으로 임의 모델을 서버에서 내려받거나 띄우지 않는다(모델 허용목록, 보안대책 3.2)
+    if not is_registered_model(alias) and os.getenv("ALLOW_UNREGISTERED_MODELS", "0").strip() != "1":
+        raise ValueError("등록되지 않은 모델입니다.")
     model, tok = load_model(hf_id)
     return generate_answer(
         prompt, model, tok,

@@ -34,7 +34,8 @@ async def stt_health():
             return response.json()
     except Exception as e:
         logger.error(f"[STT] Health check failed: {e}")
-        return {"status": "error", "error": str(e)}
+        # 내부 주소·예외 문구는 응답에 싣지 않음(상세는 서버 로그)
+        return {"status": "error", "error": "STT service unavailable"}
 
 
 @router.post("/transcribe")
@@ -214,7 +215,7 @@ async def stt_stream(ws: WebSocket):
     except Exception as e:
         logger.error(f"[STT] WebSocket stream error: {e}", exc_info=True)
         try:
-            await ws.send_json({"type": "error", "message": str(e)})
+            await ws.send_json({"type": "error", "message": "음성 변환 중 오류가 발생했습니다."})
         except Exception:
             pass
         try:

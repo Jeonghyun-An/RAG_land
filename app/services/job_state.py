@@ -7,7 +7,11 @@ Job 상태 관리 모듈
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
+import hashlib
+import logging
 import os
+
+_logger = logging.getLogger(__name__)
 
 # In-memory 상태 (재시작 시 초기화)
 _JOBS: Dict[str, Dict[str, Any]] = {}
@@ -160,6 +164,23 @@ def fail(job_id: str, error: str) -> None:
     j["error"] = error
     j["parse_yn"] = "F"  # Failed (java_router용)
     _persist(j)
+    # 상세 원인은 서버 로그에 참조 번호와 함께 남긴다(공개 조회에는 참조 번호만 보임, public_view 참고)
+    _logger.warning("[JOB] %s failed ref=%s: %s", job_id, _error_ref(error), error)
+
+
+def _error_ref(error: Any) -> str:
+    return hashlib.sha256(str(error).encode("utf-8")).hexdigest()[:8]
+
+
+def public_view(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """화면·외부 조회용 사본. 실패 원인(서버 경로·예외 문구 등)은 참조 번호로 바꾼다(보안대책 M13 오류 비노출).
+    원문이 필요하면 서버 로그에서 같은 참조 번호를 찾는다. 홈페이지 연계(/llama/java)는 원본을 그대로 쓴다."""
+    if not job:
+        return job
+    out = dict(job)
+    if out.get("error"):
+        out["error"] = f"문서 처리 중 오류가 발생했습니다. (참조 {_error_ref(out['error'])})"
+    return out
 
 def get(identifier: str) -> Optional[Dict[str, Any]]:
     """
