@@ -904,10 +904,11 @@ def _build_prompt(
 
 사용자 요청은 "레터 이력(타임라인) 정리"입니다.
 아래 규칙을 반드시 지켜서 출력하세요. 4단 구성(개요/주요내용/배경/결론) 금지.
+이 지시문의 괄호, 설명, 규칙 문구는 답변에 절대 옮겨 적지 마세요. 섹션 제목은 아래 "제목:"에 적힌 문구만 그대로 출력합니다.
 
 [출력 형식]
-## 1) 요약(2~5문장): 해당 Facility code 관련 레터가 "몇 건" 확인되는지, 확인된 "기간"이 언제인지
-## 2) 타임라인 표(필수): 아래 컬럼명을 정확히 사용
+제목: "## 1) 요약" / 내용: 2~5문장. 해당 Facility code 관련 레터가 "몇 건" 확인되는지, 확인된 "기간"이 언제인지
+제목: "## 2) 타임라인 표" / 내용: 아래 컬럼명을 정확히 사용한 표 (필수)
 
 - Date: 문서에 적힌 날짜(예: 2006-10-06)
 - Reference: 문서의 레퍼런스(예: KOO4/2006/002, MA-ROK-33.1 등)
@@ -917,7 +918,7 @@ def _build_prompt(
 - Key Points: 해당 레터의 핵심 내용을 자세하게 설명
 - Source: (doc_id, page)
 
-## 3) 누락/추가 확인 필요(선택): "추가 레터가 더 있을 수 있음" 같은 점검 포인트를 1~3개(근거 기반)
+제목: "## 3) 누락/추가 확인 필요" / 내용(선택): "추가 레터가 더 있을 수 있음" 같은 점검 포인트를 근거 기반으로 1~3개
 
 [CONTEXT]
 {context}
@@ -935,9 +936,11 @@ No external knowledge, no speculation. If a letter is not in the context, write 
 
 The user asks for a "Letter history / timeline". Do NOT use the four-section essay format.
 
+Do NOT copy any instruction text (parentheses, descriptions, rules) into the answer. Print only the exact heading text given after "Heading:".
+
 [OUTPUT FORMAT]
-## 1) Summary (2-5 sentences): how many letters are found and the covered date range
-## 2) Timeline table (required) with EXACT columns:
+Heading: "## 1) Summary" / Content: 2-5 sentences on how many letters are found and the covered date range
+Heading: "## 2) Timeline table" / Content (required): a table with EXACT columns:
 - Date
 - Reference
 - Type
@@ -946,7 +949,7 @@ The user asks for a "Letter history / timeline". Do NOT use the four-section ess
 - Key Points (detailed explanation)
 - Source (doc_id, page)
 
-## 3) Missing / further check (optional): 1-3 checks based on evidence
+Heading: "## 3) Missing / further check" / Content (optional): 1-3 checks based on evidence
 
 [CONTEXT]
 {context}
@@ -1035,6 +1038,7 @@ Write strictly in the format above.
 - 일반 상식, 외부 문헌, 인터넷 정보, 모델 추론은 포함하지 않습니다.
 - 페이지 번호, 표 번호, 각주, URL, 인용 형식은 사용하지 않습니다.
 - 내부 판단 과정이나 규칙 설명은 출력하지 않습니다.
+- 섹션 제목은 "1) 개요"처럼 번호와 이름만 쓰고, 괄호 안 영문 병기나 이 지시문의 설명 문구는 출력하지 않습니다.
 
 # 컨텍스트
 {context}

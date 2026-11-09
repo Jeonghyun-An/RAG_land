@@ -7,6 +7,12 @@ if not hasattr(Image, "ANTIALIAS"):
         from PIL import Image as _I
         Image.ANTIALIAS = getattr(_I, "BICUBIC", None)
 
+import logging
+import os
+
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s:     %(name)s - %(message)s")
+logging.getLogger("app").setLevel(os.getenv("APP_LOG_LEVEL", "INFO").upper())
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.llama_router import router as llama_router
