@@ -16,6 +16,7 @@
   QUESTION_MAX_CHARS (2000)  HISTORY_MAX_ITEMS (10)  HISTORY_ITEM_MAX_CHARS (2000)
   INPUT_FILTER_ENFORCE (1)   "0" 이면 인젝션 패턴을 기록만 하고 통과
   OUTPUT_FILTER_ENFORCE (1)  "0" 이면 마스킹·지시문 제거를 하지 않음
+  PII_MASK (rrn)             마스킹할 종류: rrn, mobile, landline, email (쉼표 구분) / all / none
   LOG_QUERY_TEXT (0)
 """
 from __future__ import annotations
@@ -189,10 +190,27 @@ def _mask_digits_after(s: str, keep: int) -> str:
     return s[:keep] + re.sub(r"\d", "*", s[keep:])
 
 
+PII_TYPES = ("rrn", "mobile", "landline", "email")
+
+
+def pii_mask_types() -> set:
+    """마스킹할 종류. PII_MASK(쉼표 구분: rrn, mobile, landline, email / all / none), 기본은 rrn(주민등록번호)만.
+    업무 연락처(담당자 전화·메일) 조회를 쓰는 환경을 고려해 전화·메일은 기관 요청 시 켠다."""
+    raw = os.getenv("PII_MASK", "rrn").strip().lower()
+    if raw in ("all", "*"):
+        return set(PII_TYPES)
+    if raw in ("none", "off", "0", ""):
+        return set()
+    return {t.strip() for t in raw.split(",") if t.strip() in PII_TYPES}
+
+
 def mask_pii(text: Optional[str]) -> Tuple[str, int]:
-    """(마스킹한 문자열, 마스킹 건수)."""
+    """(마스킹한 문자열, 마스킹 건수). 마스킹할 종류는 PII_MASK 를 따른다."""
     if not text:
         return text or "", 0
+    types = pii_mask_types()
+    if not types:
+        return text, 0
     count = 0
 
     def _rrn(m):
@@ -226,10 +244,14 @@ def mask_pii(text: Optional[str]) -> Tuple[str, int]:
         count += 1
         return f"{m.group(1)[:1]}***@{m.group(2)}"
 
-    text = _RRN.sub(_rrn, text)
-    text = _MOBILE.sub(_mobile, text)
-    text = _LANDLINE.sub(_landline, text)
-    text = _EMAIL.sub(_email, text)
+    if "rrn" in types:
+        text = _RRN.sub(_rrn, text)
+    if "mobile" in types:
+        text = _MOBILE.sub(_mobile, text)
+    if "landline" in types:
+        text = _LANDLINE.sub(_landline, text)
+    if "email" in types:
+        text = _EMAIL.sub(_email, text)
     return text, count
 
 

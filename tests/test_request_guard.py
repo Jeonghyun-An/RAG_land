@@ -133,10 +133,28 @@ def test_detect_injection_negative(text):
     ("메일 hong.gildong@kinac.re.kr 로 회신", "메일 h***@kinac.re.kr 로 회신", 1),
     ("이메일hong@kinac.re.kr입니다", "이메일h***@kinac.re.kr입니다", 1),
 ])
-def test_mask_pii_positive(raw, expected, count):
+def test_mask_pii_positive(raw, expected, count, monkeypatch):
+    monkeypatch.setenv("PII_MASK", "all")
     masked, n = g.mask_pii(raw)
     assert masked == expected
     assert n == count
+
+
+def test_mask_pii_default_masks_only_rrn(monkeypatch):
+    # 기본값: 주민등록번호만 가리고 업무 연락처(전화·메일)는 그대로 둔다(담당자 연락처 조회 업무)
+    monkeypatch.delenv("PII_MASK", raising=False)
+    text = "주무관 연락처 042-860-1234, 휴대폰 010-1234-5678, 메일 hong@kinac.re.kr, 주민번호 900101-1234567"
+    masked, n = g.mask_pii(text)
+    assert n == 1
+    assert masked == "주무관 연락처 042-860-1234, 휴대폰 010-1234-5678, 메일 hong@kinac.re.kr, 주민번호 ******-*******"
+
+
+def test_mask_pii_selected_types(monkeypatch):
+    monkeypatch.setenv("PII_MASK", "rrn,mobile")
+    masked, n = g.mask_pii("사무실 042-860-1234, 휴대폰 010-1234-5678, 메일 hong@kinac.re.kr")
+    assert n == 1 and masked == "사무실 042-860-1234, 휴대폰 010-****-****, 메일 hong@kinac.re.kr"
+    monkeypatch.setenv("PII_MASK", "none")
+    assert g.mask_pii("주민번호 900101-1234567") == ("주민번호 900101-1234567", 0)
 
 
 @pytest.mark.parametrize("text", [
@@ -156,7 +174,8 @@ def test_mask_pii_positive(raw, expected, count):
     "서버 192.168.12.58:90 경유",
     "IAEA INFCIRC/153 제 12 조",
 ])
-def test_mask_pii_negative(text):
+def test_mask_pii_negative(text, monkeypatch):
+    monkeypatch.setenv("PII_MASK", "all")
     masked, n = g.mask_pii(text)
     assert masked == text
     assert n == 0

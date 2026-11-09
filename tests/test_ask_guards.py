@@ -76,7 +76,18 @@ def _ask(env, **body):
     return env["client"].post("/llama/ask", json=body)
 
 
-def test_normal_question_answers_and_masks_pii(env):
+def test_default_keeps_work_contacts_and_masks_rrn(env, monkeypatch):
+    # 기본값(PII_MASK=rrn): 담당자 연락처 조회가 되도록 전화·메일은 그대로, 주민등록번호만 가림
+    monkeypatch.delenv("PII_MASK", raising=False)
+    env["answer"] = "담당 주무관 연락처는 010-9876-5432입니다. 주민번호 900101-1234567"
+    data = _ask(env).json()
+    assert "010-9876-5432" in data["answer"]
+    assert "900101-1234567" not in data["answer"] and "******-*******" in data["answer"]
+    assert "inspector@kinac.re.kr" in data["sources"][0]["chunk"]
+
+
+def test_all_types_masked_when_enabled(env, monkeypatch):
+    monkeypatch.setenv("PII_MASK", "all")
     env["answer"] = "검증 결과 3개 카테고리가 식별되었습니다. 문의는 010-9876-5432 로 하세요."
     r = _ask(env)
     assert r.status_code == 200, r.text
