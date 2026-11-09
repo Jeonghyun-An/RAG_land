@@ -14,8 +14,8 @@ from datetime import datetime
 
 
 def _dsn() -> str:
-    host = os.getenv("CUBRID_HOST", "211.219.26.15")
-    port = os.getenv("CUBRID_PORT", "44000")
+    host = os.getenv("CUBRID_HOST", "192.168.12.58")
+    port = os.getenv("CUBRID_PORT", "33000")
     db   = os.getenv("CUBRID_DB", "nuclear")
     return f"CUBRID:{host}:{port}:{db}:::"
 
