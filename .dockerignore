@@ -1,0 +1,5 @@
+# 이미지에 비밀값 파일이 들어가지 않도록 한다.
+# milvus-docker/Dockerfile 이 finetune/ 폴더를 통째로 복사하는데, git 에서 무시되는 finetune/.env(토큰 포함)도 함께 들어가던 것.
+# 런타임 설정은 컨테이너 환경변수(스택)로 넘긴다.
+**/.env
+**/.env.*
