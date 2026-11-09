@@ -1,0 +1,7 @@
+# 이미지 빌드 시 컨텍스트에서 제외 (Dockerfile 은 milvus-docker/requirements.txt, app/, finetune/ 만 복사한다)
+.git
+.venv
+venv
+**/__pycache__
+**/*.pyc
+docs
