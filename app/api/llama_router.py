@@ -146,6 +146,8 @@ def _effective_rag_params(overrides: Optional[Dict[str, Any]] = None) -> Dict[st
     )
 
 
+# facility code(KOO4 등) 질문은 코드 hard-filter 전에 후보 풀을 이만큼 넓혀서 검색한다
+FACILITY_POOL_TOPK = int(os.getenv("RAG_FACILITY_POOL_TOPK", "200"))
 # --- 폴백 전용: pages 정규화 도우미 ---------------------------------
 def _normalize_pages_for_chunkers(pages):
     """
@@ -1596,7 +1598,10 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
         else:
             # 일반 모드: 기존 로직
             raw_topk = max(40, configured_top_k * 8)
-        
+            # 시설코드 질문은 코드가 들어간 청크가 의미 유사도 상위에 없을 수 있어 풀을 넓힌다
+            if extract_facility_codes(req.question) or extract_facility_codes(query_for_search):
+                raw_topk = max(raw_topk, FACILITY_POOL_TOPK)
+
         # 선택 문서가 있을 경우 doc 필터를 걸어서 검색하는 헬퍼
         def _search_with_optional_filter(q: str, topk: int):
             if not q:
@@ -1661,6 +1666,10 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
             query_for_search=query_for_search or "",
             logger=logger,
         )
+        _fac_codes = extract_facility_codes(req.question or "") or extract_facility_codes(query_for_search or "")
+        facility_filtered = bool(_fac_codes) and bool(cands) and all(
+            _candidate_has_any_facility_code(c, _fac_codes) for c in cands
+        )
         # 2) 키워드 부스트 (질문 원문 기준으로 키워드 추출)
         kws = extract_keywords(req.question)
         def _kw_boost_score(c: dict) -> int:
@@ -1709,7 +1718,11 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
             logger.info(f"[ASK] LONG MODE | Using threshold: {threshold}")
         else:
             # 일반 모드: 적응형 임계값
-            if USE_ADAPTIVE_THRESHOLD:
+            if facility_filtered:
+                # 시설코드 hard-filter로 이미 걸러진 후보라 적응형 임계값으로 더 깎지 않는다
+                threshold = P["base_score_threshold"]
+                logger.info(f"[ASK] Facility-filtered | Using base threshold: {threshold}")
+            elif USE_ADAPTIVE_THRESHOLD:
                 threshold = _calculate_adaptive_threshold(
                     topk, configured_top_k, P["base_score_threshold"]
                 )
