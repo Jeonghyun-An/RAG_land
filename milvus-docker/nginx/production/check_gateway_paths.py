@@ -64,6 +64,8 @@ def classify(method: str, raw_path: str, xff: str):
     norm = normalize(raw_path)
     if norm in ("/healthz", "/", "/rag", "/llama", "/llama/healthz"):
         return "allow", "고정 경로"
+    if norm == "/rag/admin" or norm.startswith("/rag/admin/"):
+        return "admin", "관리자 화면(IP 제한)"
 
     best = None
     for prefix, caret in PREFIXES:
