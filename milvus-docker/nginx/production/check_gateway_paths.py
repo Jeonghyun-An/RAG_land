@@ -31,7 +31,7 @@ REGEXES = [  # app.conf 의 정규식 location 순서와 동일
     ("admin", ADMIN, "admin"),
     ("ask", re.compile(r"^/rag/llama/ask(-stream)?(/|$)"), "allow"),
     ("job-stream", re.compile(r"^/rag/llama/job/[^/]+/stream$"), "allow"),
-    ("upload", re.compile(r"^/rag/llama/upload(/|$)"), "allow"),
+    ("upload", re.compile(r"^/rag/llama/upload(/|$)"), "admin"),
     ("stt", re.compile(r"^/rag/llama/stt(/|$)"), "allow"),
     ("service", re.compile(r"^/rag/llama/(jobs?|doc|files?|rag|status|view|download|healthz)(/|$)"), "allow"),
     ("java", re.compile(r"^/llama/java(/|$)"), "java"),

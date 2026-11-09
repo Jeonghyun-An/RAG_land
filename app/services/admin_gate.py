@@ -31,6 +31,7 @@ API_BASE = "/llama"
 GATED_NAMES = (
     "finetune", "admin", "dev", "debug", "milvus", "db",
     "docs", "openapi.json", "generate", "test", "files/purge",
+    "upload",   # 문서 업로드(화면 미사용, 문서 등록은 /llama/java 연계) — Gateway 를 거치지 않는 직접 업로드도 차단
 )
 GATED_PREFIXES = tuple(f"{API_BASE}/{n}" for n in GATED_NAMES)
 _HEADER = b"x-admin-gate"
