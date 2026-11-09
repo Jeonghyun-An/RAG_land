@@ -6,7 +6,7 @@ RAG 파라미터 런타임 수정 API (파일럿 전용)
 """
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Any, Dict, Optional
 import app.api.llama_router as llama_module
 
 router = APIRouter(prefix="/admin", tags=["⚙️ RAG 파라미터 설정"])
@@ -72,6 +72,31 @@ class RagConfigUpdate(BaseModel):
         None, ge=0.0, le=1.0,
         description="초장문 리랭킹 최소 스코어 - LONG_SCORE_THRESHOLD (현재: 0.25)"
     )
+
+
+class AdminAskReq(llama_module.AskReq):
+    """일반 질의(AskReq)와 같은 필드 + 이 요청에만 적용할 파라미터."""
+    overrides: Optional[RagConfigUpdate] = Field(
+        None,
+        description="이 질의에만 적용할 파라미터(지정한 항목만). 서버 전체 설정은 바뀌지 않는다. "
+                    "마음에 들면 POST /admin/rag-config 로 전체에 반영한다."
+    )
+
+
+class AdminAskResp(llama_module.AskResp):
+    scope: str = "request-only"
+    applied_overrides: Dict[str, Any] = {}
+
+
+@router.post(
+    "/ask",
+    response_model=AdminAskResp,
+    summary="관리자 질의 시험 (이 요청에만 파라미터 적용, 서버 전체 설정은 변경하지 않음)",
+)
+def admin_ask(req: AdminAskReq):
+    overrides = req.overrides.model_dump(exclude_none=True) if req.overrides else {}
+    resp = llama_module._ask_impl(req, overrides)
+    return AdminAskResp(**resp.model_dump(), applied_overrides=overrides)
 
 
 @router.get("/rag-config", summary="현재 RAG 파라미터 조회")

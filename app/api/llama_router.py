@@ -39,7 +39,7 @@ from app.services.file_parser import (
     parse_any_bytes,              # (filename, bytes) -> {"kind":"pdf", "pages":[...], "blocks":[...]}
     parse_pdf_blocks_from_bytes,  # (bytes) -> [(page_no, [ {text,bbox}, ... ])]
 )
-from app.services import job_state
+from app.services import job_state, rag_params
 from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
 from app.services.pdf_converter import convert_stream_to_pdf_bytes, convert_to_pdf,convert_bytes_to_pdf_bytes, ConvertError
@@ -127,6 +127,25 @@ LONG_SCORE_THRESHOLD = float(os.getenv("RAG_LONG_SCORE_THRESHOLD", "0.25"))
 LONG_MAX_TOKENS = int(os.getenv("RAG_LONG_MAX_TOKENS", "5000"))
 RERANKER_MAX_BATCH_SIZE = int(os.getenv("RERANKER_MAX_BATCH_SIZE", "100"))  # 리랭커 최대 배치 크기
 LONG_TEMPERATURE = float(os.getenv("RAG_LONG_TEMPERATURE", "0.1"))
+
+
+def _effective_rag_params(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """이 요청에 쓸 파라미터. 전역(런타임 설정) 값에 overrides 를 얹어 계산하고, 전역 값은 바꾸지 않는다."""
+    return rag_params.effective_params(
+        RESPONSE_MODE_CONFIG,
+        {
+            "short_context_budget": CONTEXT_BUDGET_TOKENS,
+            "long_context_budget": LONG_CONTEXT_BUDGET_TOKENS_NORMAL,
+            "ultra_top_k": LONG_CONTEXT_TOP_K,
+            "ultra_max_tokens": LONG_MAX_TOKENS,
+            "ultra_temperature": LONG_TEMPERATURE,
+            "base_score_threshold": BASE_SCORE_THRESHOLD,
+            "ultra_score_threshold": LONG_SCORE_THRESHOLD,
+        },
+        overrides,
+    )
+
+
 # --- 폴백 전용: pages 정규화 도우미 ---------------------------------
 def _normalize_pages_for_chunkers(pages):
     """
@@ -1525,13 +1544,19 @@ async def upload_document(
 
 @router.post("/ask", response_model=AskResp)
 def ask_question(req: AskReq):
+    return _ask_impl(req)
+
+
+def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskResp:
+    """질의 처리 본체. overrides 는 관리자 시험용(admin_router /admin/ask)에서만 넘기며 그 요청에만 적용된다."""
+    P = _effective_rag_params(overrides)
     try:
         # ========== 초장문 모드 분기 ==========
         if req.long_context and LONG_CONTEXT_ENABLED:
             # 초장문 모드 전용 설정
-            configured_top_k = LONG_CONTEXT_TOP_K  # 100
-            max_tokens = LONG_MAX_TOKENS  # 5000
-            temperature = LONG_TEMPERATURE
+            configured_top_k = P["ultra_top_k"]  # 100
+            max_tokens = P["ultra_max_tokens"]  # 5000
+            temperature = P["ultra_temperature"]
             top_p = 0.92
             use_token_packing = True  # 토큰 팩킹 활성화
             
@@ -1539,7 +1564,7 @@ def ask_question(req: AskReq):
         
         else:
             # response_type에 따른 파라미터 설정
-            mode_config = RESPONSE_MODE_CONFIG.get(req.response_type, RESPONSE_MODE_CONFIG["short"])
+            mode_config = P["modes"].get(req.response_type, P["modes"]["short"])
             configured_top_k = mode_config["top_k"] 
             max_tokens = mode_config["max_tokens"]
             temperature = mode_config["temperature"]
@@ -1563,7 +1588,7 @@ def ask_question(req: AskReq):
 # ========== 초기 검색 top_k 결정 (모드별 분기) ==========
         if use_token_packing:
             # 초장문 모드: 많이 검색
-            raw_topk = LONG_CONTEXT_TOP_K  # 100
+            raw_topk = P["ultra_top_k"]  # 100
         else:
             # 일반 모드: 기존 로직
             raw_topk = max(40, configured_top_k * 8)
@@ -1656,7 +1681,7 @@ def ask_question(req: AskReq):
         # ========== 리랭킹 풀 크기 결정 (모드별 분기) ==========
         if use_token_packing:
             # 초장문 모드: 전부 리랭킹
-            rerank_pool = cands[:LONG_CONTEXT_TOP_K]
+            rerank_pool = cands[:P["ultra_top_k"]]
         else:
             # 일반 모드: 기존 로직
             rerank_pool_size = max(RERANKER_BATCH_SIZE, configured_top_k * 8)
@@ -1676,16 +1701,16 @@ def ask_question(req: AskReq):
         # ========== 임계값 결정 (모드별 분기) ==========
         if use_token_packing:
             # 초장문 모드: 고정 임계치 사용
-            threshold = LONG_SCORE_THRESHOLD  # 0.25
+            threshold = P["ultra_score_threshold"]  # 0.25
             logger.info(f"[ASK] LONG MODE | Using threshold: {threshold}")
         else:
             # 일반 모드: 적응형 임계값
             if USE_ADAPTIVE_THRESHOLD:
                 threshold = _calculate_adaptive_threshold(
-                    topk, configured_top_k, BASE_SCORE_THRESHOLD
+                    topk, configured_top_k, P["base_score_threshold"]
                 )
             else:
-                threshold = BASE_SCORE_THRESHOLD
+                threshold = P["base_score_threshold"]
                 logger.info(f"[ASK] Using fixed threshold: {threshold}")
 
         # 4) 임계값 필터링
@@ -1737,7 +1762,7 @@ def ask_question(req: AskReq):
             # 초장문 모드: 토큰 예산으로 팩킹 일단 좀 하드코딩
             MODEL_MAX = 28000
             SYSTEM_RESERVE = 2000   # 시스템 프롬프트 + 오버헤드 (넉넉하게)
-            OUTPUT_RESERVE = LONG_MAX_TOKENS  # 5000
+            OUTPUT_RESERVE = P["ultra_max_tokens"]  # 5000
             SAFETY_MARGIN = 5000  # 예비 여유분
             
             chunk_budget = MODEL_MAX - SYSTEM_RESERVE - OUTPUT_RESERVE - SAFETY_MARGIN  # 18,000
@@ -1763,9 +1788,9 @@ def ask_question(req: AskReq):
         # 컨텍스트 구성 else 분기 수정
         else:
             if req.response_type == "long":
-                filtered_topk = _apply_context_budget(filtered_topk, LONG_CONTEXT_BUDGET_TOKENS_NORMAL)
+                filtered_topk = _apply_context_budget(filtered_topk, P["long_context_budget"])
             else:
-                filtered_topk = _apply_context_budget(filtered_topk, CONTEXT_BUDGET_TOKENS)
+                filtered_topk = _apply_context_budget(filtered_topk, P["short_context_budget"])
         # 5) 컨텍스트/출처 구성
         context_lines = []
         sources = []
