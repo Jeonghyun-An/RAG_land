@@ -1,0 +1,2 @@
+# 서버(Linux)에서 그대로 쓰는 Gateway 설정·스크립트는 Windows 에서 받아도 줄바꿈을 LF 로 유지한다
+milvus-docker/nginx/production/* text eol=lf
