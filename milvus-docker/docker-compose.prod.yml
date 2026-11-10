@@ -293,6 +293,8 @@ services:
     container_name: gateway
     ports:
       - "90:80" # 팀장님 지시: 호스트 포트를 90번으로 변경
+      # Apache(도메인)가 다른 서버(시범: 55번)에 있으면 위처럼 내부망에 게시한다.
+      # Apache 를 이 서버로 옮기면 "127.0.0.1:90:80" 으로 바꾼다 — nginx/production/app.conf 머리말 "Apache 위치별 설정"
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
     depends_on:

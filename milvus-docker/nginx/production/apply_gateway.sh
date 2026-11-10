@@ -6,7 +6,7 @@
 #            → nginx -t 검사 → reload → 동작 확인. 어느 단계든 실패하면 자동으로 원복한다.
 #   하지 않는 일: 컨테이너 재시작, 이미지·스택 변경 (Nginx 설정은 reload 만으로 적용된다)
 #
-# 사용법 (이 스크립트가 있는 폴더 = app.conf, admin_ips.inc, admin_gate.map 이 함께 있는 폴더)
+# 사용법 (이 스크립트가 있는 폴더 = app.conf, real_ip.inc, admin_ips.inc, admin_gate.map 이 함께 있는 폴더)
 #   sudo ./apply_gateway.sh -a 192.168.12.77            # 관리자 PC IP 를 넣고 적용
 #   sudo ./apply_gateway.sh -a 192.168.12.77 -a 10.1.2.0/24
 #   sudo ./apply_gateway.sh                             # IP 는 나중에 넣고 설정만 적용
@@ -16,12 +16,13 @@
 #   -a IP      관리자 IP 추가(여러 번 가능, IPv4 또는 192.168.12.0/24 형식, /16 보다 넓은 대역은 거부)
 #   -d DIR     서버의 conf.d 폴더            (기본 /data/nuclear-rag/nginx/conf.d)
 #   -c NAME    gateway 컨테이너 이름         (기본 gateway)
-#   -n NET     Docker 네트워크 이름          (기본 ragnet, 서브넷 점검용)
+#   -n NET     Docker 네트워크 이름          (기본 ragnet, real_ip.inc 점검용)
 #   -s SECRET  관리자 경로 인증값을 직접 지정(영문·숫자·._- 16자 이상). 생략하면 기존 값을 유지하고,
 #              기존 값이 없으면 새로 만든다.
 #   --denied   관리자 경로에서 403 을 받은 접속 IP 를 보여 주고 끝낸다(변경 없음)
 #
-# 다시 실행해도 안전하다: 이미 있는 관리자 IP·인증값은 그대로 두고 app.conf 만 다시 복사한다.
+# 다시 실행해도 안전하다: 서버에 이미 있는 real_ip.inc·관리자 IP·인증값은 그대로 두고 app.conf 만 다시 복사한다.
+# 적용 전에 real_ip.inc(X-Forwarded-For 를 믿는 출발지)를 점검해, 위조 위험이 있으면 아무것도 바꾸지 않고 멈춘다.
 # ============================================================================
 set -euo pipefail
 
@@ -32,7 +33,7 @@ NETWORK="ragnet"
 SECRET_ARG=""
 ONLY_DENIED=0
 ADMIN_IPS=()
-FILES=(app.conf admin_ips.inc admin_gate.map)
+FILES=(app.conf real_ip.inc admin_ips.inc admin_gate.map)
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf '[주의] %s\n' "$*" >&2; }
@@ -92,7 +93,8 @@ running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || tr
 [[ "$running" == "true" ]] || die "'$CONTAINER' 컨테이너가 실행 중이 아닙니다. (이름이 다르면 -c 로 지정)"
 
 show_denied() {
-    local re='"[A-Z]+ /(rag/)?llama/(finetune|admin|dev|debug|milvus|db|docs|openapi\.json|generate|test|files/purge)(/[^" ]*)?" 403'
+    # 관리자 화면 주소(/rag/admin…)와 관리자 API 경로(app.conf 의 관리자 전용 규칙·업로드)
+    local re='"[A-Z]+ /(rag/admin|(rag/)?llama/(finetune|admin|dev|debug|milvus|db|docs|openapi\.json|generate|test|files/purge|upload))(/[^" ]*)?" 403'
     local out
     out="$(docker logs --tail 5000 "$CONTAINER" 2>&1 | grep -E "$re" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 || true)"
     if [[ -z "$out" ]]; then
@@ -116,9 +118,49 @@ fi
 
 [[ -d "$CONF_DIR" ]] || die "conf.d 폴더가 없습니다: $CONF_DIR  (-d 로 지정)"
 for f in "${FILES[@]}"; do
-    [[ -f "$SRC_DIR/$f" ]] || die "$SRC_DIR/$f 가 없습니다. 네 파일(app.conf, admin_ips.inc, admin_gate.map, apply_gateway.sh)을 같은 폴더에 두세요."
+    [[ -f "$SRC_DIR/$f" ]] || die "$SRC_DIR/$f 가 없습니다. 다섯 파일(app.conf, real_ip.inc, admin_ips.inc, admin_gate.map, apply_gateway.sh)을 같은 폴더에 두세요."
 done
 [[ -w "$CONF_DIR" ]] || die "$CONF_DIR 에 쓸 수 없습니다. sudo 로 실행하세요."
+
+# ---- real_ip.inc 점검 (파일을 바꾸기 전에) ------------------------------------------------
+# X-Forwarded-For 를 믿는 출발지가 잘못되면 그 출발지에서 관리자 IP 를 위조할 수 있다(app.conf 머리말 "Apache 위치별 설정").
+# 서버에 real_ip.inc 가 있으면 그 파일(보존됨)을, 없으면 이번에 복사할 파일을 본다.
+realip_file="$CONF_DIR/real_ip.inc"
+[[ -e "$realip_file" ]] || realip_file="$SRC_DIR/real_ip.inc"
+other_confs=()
+for f in "$CONF_DIR"/*.conf; do
+    [[ -e "$f" && "$(basename "$f")" != "app.conf" ]] && other_confs+=("$f")
+done
+trusted="$(awk '$1=="set_real_ip_from" {v=$2; sub(/;.*/, "", v); print v}' \
+            "$SRC_DIR/app.conf" "$realip_file" ${other_confs[@]+"${other_confs[@]}"} | sort -u)"
+
+# 1) 대역 금지: IP 하나(/32, /128)만 허용
+wide="$(printf '%s\n' "$trusted" | grep '/' | grep -vE '/(32|128)$' || true)"
+[[ -z "$wide" ]] || die "set_real_ip_from 에 IP 대역이 있습니다: $(echo $wide)  ($realip_file 등)
+       이 대역의 컨테이너·PC 가 X-Forwarded-For 를 위조하면 관리자 IP 로 판정됩니다. Apache 가 접속하는 IP 하나씩 적으세요."
+
+# 2) ragnet 게이트웨이 IP 신뢰는 gateway 포트가 127.0.0.1 에만 열려 있을 때만
+gw_ip="$(docker network inspect "$NETWORK" --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null | awk '{print $1}' || true)"
+bindings="$(docker port "$CONTAINER" 80/tcp 2>/dev/null || true)"     # 예: 0.0.0.0:90 / [::]:90 / 127.0.0.1:90
+lan_bound="$(printf '%s\n' "$bindings" | grep -v '^$' | grep -v '^127\.0\.0\.1:' || true)"
+if [[ -z "$gw_ip" ]]; then
+    warn "'$NETWORK' 네트워크를 찾지 못해 real_ip.inc 점검 일부를 건너뜁니다. (네트워크 이름이 다르면 -n 으로 지정)"
+elif printf '%s\n' "$trusted" | grep -qxE "${gw_ip//./\.}(/32)?"; then
+    [[ -z "$lan_bound" ]] || die "real_ip.inc 가 $NETWORK 게이트웨이 IP($gw_ip)를 믿는데 gateway 포트가 내부망에도 열려 있습니다: $(echo $lan_bound)
+       이 상태에서는 다른 컨테이너 등이 이 IP 로 들어와 X-Forwarded-For 를 위조할 수 있습니다.
+       스택의 gateway 포트를 \"127.0.0.1:90:80\" 으로 바꿔 재배포한 뒤 다시 실행하세요."
+elif [[ -n "$bindings" && -z "$lan_bound" ]]; then
+    warn "gateway 포트가 127.0.0.1 에만 열려 있는데 real_ip.inc 에 $NETWORK 게이트웨이 IP($gw_ip)가 없습니다."
+    warn "같은 서버의 Apache 를 거친 요청이 모두 $gw_ip 하나로 보여 속도 제한을 함께 쓰고 관리자 판정이 되지 않습니다."
+fi
+
+# 3) 관리자 IP 로 등록하면 안 되는 주소
+for ip in ${NORM_IPS[@]+"${NORM_IPS[@]}"}; do
+    host="${ip%/*}"
+    if [[ "$host" =~ ^(127\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]] || printf '%s\n' "$trusted" | grep -qxF "$host"; then
+        die "관리자 IP 로 등록할 수 없는 주소입니다: $ip  (Docker 내부 주소이거나 real_ip.inc 의 프록시 주소)"
+    fi
+done
 
 # ---- 백업 ------------------------------------------------------------------------------
 BACKUP_DIR="${CONF_DIR}.bak.$(date +%Y%m%d-%H%M%S)"   # 마운트 폴더 밖(옆)에 둔다 — conf.d 안의 *.conf 는 모두 읽히기 때문
@@ -152,6 +194,7 @@ fail() { warn "$*"; rollback; exit 1; }
 install -m 644 "$SRC_DIR/app.conf" "$CONF_DIR/app.conf.new"
 mv -f "$CONF_DIR/app.conf.new" "$CONF_DIR/app.conf"
 
+[[ -e "$CONF_DIR/real_ip.inc" ]] || install -m 644 "$SRC_DIR/real_ip.inc" "$CONF_DIR/real_ip.inc"
 [[ -e "$CONF_DIR/admin_ips.inc" ]] || install -m 644 "$SRC_DIR/admin_ips.inc" "$CONF_DIR/admin_ips.inc"
 [[ -e "$CONF_DIR/admin_gate.map" ]] || install -m 600 "$SRC_DIR/admin_gate.map" "$CONF_DIR/admin_gate.map"
 
@@ -211,23 +254,10 @@ if docker logs --since 10s "$CONTAINER" 2>&1 | grep -Eq '\[(emerg|alert|crit)\]'
 fi
 say "reload 완료, /healthz 정상"
 
-# ---- 점검 안내 ---------------------------------------------------------------------------
-subnets="$(docker network inspect "$NETWORK" --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null || true)"
-if [[ -z "$subnets" ]]; then
-    warn "'$NETWORK' 네트워크를 찾지 못해 서브넷 점검을 건너뜁니다. app.conf 의 set_real_ip_from 이 이 네트워크 대역을 포함하는지 직접 확인하세요."
-else
-    for s in $subnets; do
-        [[ "$s" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ ]] || continue
-        if [[ ! "$s" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]]; then
-            warn "$NETWORK 서브넷($s)이 app.conf 의 set_real_ip_from 172.16.0.0/12 밖입니다. 이 줄을 $s 로 고치고 다시 실행하세요."
-            warn "그대로 두면 클라이언트 IP 를 알 수 없어 관리자 IP 판별이 안 되고 요청 속도 제한을 모두가 함께 쓰게 됩니다."
-        fi
-    done
-fi
-
 echo
 say "================ 적용 결과 ================"
 say "app.conf        : $CONF_DIR/app.conf"
+say "X-Forwarded-For 를 믿는 출발지(real_ip.inc 등): $(echo $trusted)"
 say "관리자 IP        :"
 active_ips="$(awk '$1 !~ /^#/ && $2=="1;" {print "  " $1}' "$ips_file")"
 if [[ -n "$active_ips" ]]; then
