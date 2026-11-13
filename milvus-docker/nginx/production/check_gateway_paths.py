@@ -28,6 +28,8 @@ LOG_NEW = re.compile(r'^(\S+) \[[^\]]+\] "(\S+) (\S+)" (\d{3})')
 ADMIN = re.compile(r"^/(rag/)?llama/(finetune|admin|dev|debug|milvus|db|docs|openapi\.json|generate|test|files/purge)(/|$)")
 REGEXES = [  # app.conf 의 정규식 location 순서와 동일
     ("hidden", re.compile(r"/\."), "block"),
+    # [임시 2026-11-13] 파라미터 조정·청크 보기는 모든 사용자에게 열림 (app.conf 의 [임시] location)
+    ("temp-open", re.compile(r"^/(rag/)?llama/(admin/rag-config(/reset)?|debug/milvus/by-doc)$"), "allow"),
     ("admin", ADMIN, "admin"),
     ("ask", re.compile(r"^/rag/llama/ask(-stream)?(/|$)"), "allow"),
     ("job-stream", re.compile(r"^/rag/llama/job/[^/]+/stream$"), "allow"),
