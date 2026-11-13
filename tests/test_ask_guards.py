@@ -253,3 +253,53 @@ def test_extract_facility_codes_folds_o_and_zero():
     assert lr.extract_facility_codes("K0F3 와 KOF3, k0m2") == ["KOF3", "KOM2"]
     assert lr._candidate_has_any_facility_code({"chunk": "seal at K004"}, ["KOO4"])
     assert not lr._candidate_has_any_facility_code({"chunk": "seal at KOF8"}, ["KOF3"])
+
+
+def test_facility_question_keeps_chunks_ocr_spelled_with_i_for_one(env, monkeypatch):
+    # 질문은 KOM1, 문서는 OCR 이 KOMI 로 읽음(1 → I). 문서의 KOL-(다른 시설)은 섞이지 않아야 한다
+    queries = _store_with(monkeypatch, [
+        {"doc_id": "677", "page": 1, "section": "ICR", "score": 0.6,
+         "chunk": "KOMI ICR 53-54 entries 146"},
+        {"doc_id": "722", "page": 1, "section": "PIEF", "score": 0.9,
+         "chunk": "Facility Code: KOL- inventory"},
+    ])
+    monkeypatch.setattr(lr, "_maybe_translate_query_for_search", lambda q, lang: "KOM1 ICR report")
+    env["answer"] = "KOM1 ICR 은 146 건입니다."
+    r = _ask(env, question="KOM1 ICR 보고 현황")
+    assert r.status_code == 200, r.text
+    srcs = r.json()["sources"]
+    assert [s["doc_id"] for s in srcs] == ["677"]
+    assert "KOM1 ICR" in srcs[0]["chunk"]                           # 근거에도 질문 표기
+    assert any("KOMI" in q for q in queries) and any("KOMl" in q for q in queries)
+
+
+def test_letter_i_code_does_not_pick_up_letter_l_code():
+    assert lr._candidate_has_any_facility_code({"chunk": "DUF4 plant Kol-"}, ["KOI"])
+    assert not lr._candidate_has_any_facility_code({"chunk": "PIEF KOL-"}, ["KOI"])
+    assert lr._candidate_has_any_facility_code({"chunk": "storage KOEl"}, ["KOE1"])
+
+
+def test_extract_facility_codes_with_korean_particles():
+    # 코드 뒤에 조사가 붙어도(KOF3의, kom2에서) 시설 코드로 인식
+    assert lr.extract_facility_codes("KOF3의 봉인, kom2에서 사찰, (KOC1)") == ["KOF3", "KOM2", "KOC1"]
+
+
+def test_lowercase_code_question_is_processed_like_uppercase(env, monkeypatch):
+    # 운영(2026-11-13): "KOF3 봉인 관련 내용" 은 찾고 "kof3 ..." 는 못 찾던 것 — 질문의 코드를 먼저 표준 표기로 맞춘다
+    seen = []
+
+    def fake_translate(q, lang):
+        seen.append(q)
+        return "KOF3 seal related content"
+
+    monkeypatch.setattr(lr, "_maybe_translate_query_for_search", fake_translate)
+    _store_with(monkeypatch, [
+        {"doc_id": "754", "page": 2, "section": "Seal", "score": 0.6, "chunk": "Total Agency Seals at KOF3: 40 Metal"},
+        {"doc_id": "900", "page": 1, "section": "Other", "score": 0.9, "chunk": "KOM2 inventory change report."},
+    ])
+    env["answer"] = "KOF3 의 봉인은 40개입니다."
+    r = _ask(env, question="kof3의 봉인 관련 내용")
+    assert r.status_code == 200, r.text
+    assert seen == ["KOF3의 봉인 관련 내용"]                           # 번역·검색에는 대문자 질문과 같은 문장이 들어감
+    assert [s["doc_id"] for s in r.json()["sources"]] == ["754"]
+    assert "kof3" not in env["prompts"][-1]

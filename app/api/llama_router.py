@@ -40,7 +40,9 @@ from app.services.file_parser import (
     parse_pdf_blocks_from_bytes,  # (bytes) -> [(page_no, [ {text,bbox}, ... ])]
 )
 from app.services import job_state, rag_params, request_guard
-from app.services.ocr_text_fix import align_codes, fix_ocr_confusions, fold_o0, zero_form
+from app.services.ocr_text_fix import (
+    align_codes, contains_code, fix_ocr_confusions, fold_o0, variant_queries,
+)
 from app.services.model_registry import model_request_error
 from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
@@ -756,8 +758,9 @@ def _calculate_safe_max_tokens(
     
     return safe_max_tokens
 
+# 앞뒤 경계는 영문·숫자만 본다(\b 는 한글도 글자로 봐서 "KOF3의"·"kom2에서" 처럼 조사가 붙으면 못 찾았다)
 FACILITY_RE = re.compile(
-    r"\bKO(?:-[A-Z]|[A-Z]{1,2}|\d[A-Z]|[A-Z]\d)\b",
+    r"(?<![A-Za-z0-9])KO(?:-[A-Z]|[A-Z]{1,2}|\d[A-Z]|[A-Z]\d)(?![A-Za-z0-9])",
     re.IGNORECASE
 )
 
@@ -778,9 +781,8 @@ def extract_facility_codes(text: str) -> List[str]:
 def _text_has_any_code(text: str, codes: List[str]) -> bool:
     if not text or not codes:
         return False
-    # O 와 0 을 같은 글자로 비교: 질문 KOF3 ↔ 단락 K0F3 (OCR 혼동)
-    up = fold_o0(text)
-    return any(fold_o0(code) in up for code in codes)
+    # OCR 이 섞어 읽는 글자를 같게 비교: 질문 KOF3 ↔ 단락 K0F3, 질문 KOM1 ↔ 단락 KOMI·KOMl (ocr_text_fix)
+    return any(contains_code(text, code) for code in codes)
 
 def _candidate_has_any_facility_code(cand: Dict[str, Any], codes: List[str]) -> bool:
     """청크/섹션/메타에 시설코드가 포함되는지 검사"""
@@ -1619,12 +1621,16 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
         model = get_embedding_model()
         store = MilvusStoreV2(dim=model.get_sentence_embedding_dimension())
 
+        # 질문에 쓴 시설 코드를 표준 표기로 맞춘다(kof3·K0F3·kof3의 → KOF3).
+        # 이후 번역·검색·재정렬·답변 모두 대문자로 물은 것과 똑같이 처리된다(소문자로 물으면 못 찾던 문제).
+        req.question = align_codes(req.question, extract_facility_codes(req.question or ""))
+
         # 언어 감지(ko/en)
         lang = _detect_lang(req.question)
 
         # 1) 검색용 질의 준비(한국어면 ko->en 변환)
         query_for_search = _maybe_translate_query_for_search(req.question, lang)
-        # OCR 의 O/0 혼동: 확실한 패턴 교정 + 시설 코드는 O 표기로 맞춤(K0F3→KOF3, K004→KOO4)
+        # OCR 의 O/0·1/l/I 혼동: 확실한 패턴 교정 + 시설 코드는 질문 표기로 맞춤(K0F3→KOF3, K004→KOO4)
         query_for_search = fix_ocr_confusions(query_for_search)
         _fac_q = extract_facility_codes(req.question or "") or extract_facility_codes(query_for_search or "")
         query_for_search = align_codes(query_for_search, _fac_q)
@@ -1691,16 +1697,12 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
         else:
             cands = _search_with_optional_filter(query_for_search, raw_topk)
 
-        # OCR 이 시설 코드를 0 으로 읽은 단락(K0F3·K004 등)도 후보에 넣는다 — 0 표기로 한 번 더 검색
+        # OCR 이 시설 코드를 다르게 읽은 단락(K0F3, KOMI·KOMl 등)도 후보에 넣는다 — 그 표기로 더 검색(최대 3회)
         if _fac_q and query_for_search:
-            alt_q = query_for_search
-            for code in _fac_q:
-                alt_q = re.sub(rf"(?<![A-Za-z0-9]){re.escape(code)}(?![A-Za-z0-9])",
-                               zero_form(code), alt_q, flags=re.IGNORECASE)
-            if alt_q != query_for_search:
+            for alt_q in variant_queries(query_for_search, _fac_q):
                 cands = _merge_dedup(cands, _search_with_optional_filter(alt_q, raw_topk))
 
-        # 후보 사본의 O/0 혼동 교정 + 질문의 시설 코드 표기로 맞춤 (색인 원문은 바꾸지 않음).
+        # 후보 사본의 OCR 혼동 교정 + 질문의 시설 코드 표기로 맞춤 (색인 원문은 바꾸지 않음).
         # 재정렬·답변 근거·화면에 같은 표기가 들어간다.
         for c in cands:
             for _k in ("chunk", "section"):
@@ -1729,9 +1731,13 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
         )
         # 2) 키워드 부스트 (질문 원문 기준으로 키워드 추출)
         kws = extract_keywords(req.question)
+        _code_keys = {fold_o0(c) for c in _fac_codes}
         def _kw_boost_score(c: dict) -> int:
-            txt = fold_o0(_strip_meta_line(c.get("chunk", "")))   # 대소문자·O/0 구분 없이 비교
-            return sum(1 for k in kws if fold_o0(k) in txt)
+            body = _strip_meta_line(c.get("chunk", ""))
+            txt = fold_o0(body)                    # 대소문자·O/0 구분 없이 비교
+            # 시설 코드 키워드만 OCR 표기(KOM1↔KOMI)까지 같게 본다 — 일반 단어·숫자(10, 11)는 예전 비교 그대로
+            return sum(1 for k in kws
+                       if fold_o0(k) in txt or (fold_o0(k) in _code_keys and contains_code(body, k)))
         for c in cands:
             c["kw_boost"] = _kw_boost_score(c)
 
