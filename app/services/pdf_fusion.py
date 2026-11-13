@@ -22,23 +22,10 @@ import os
 import re
 from io import BytesIO
 
-# [신규] EasyOCR Reader 싱글톤 캐싱
-_EASYOCR_READER_CACHE = {}
-
 def _get_easyocr_reader(langs: list[str], gpu: bool):
-    """
-    [성능 개선] EasyOCR Reader를 재사용
-    - 언어와 GPU 설정별로 캐싱
-    - 페이지마다 새로 생성하지 않음
-    """
-    cache_key = (tuple(sorted(langs)), gpu)
-    
-    if cache_key not in _EASYOCR_READER_CACHE:
-        import easyocr
-        print(f"[OCR] Creating EasyOCR Reader: langs={langs}, gpu={gpu}")
-        _EASYOCR_READER_CACHE[cache_key] = easyocr.Reader(langs, gpu=gpu)
-    
-    return _EASYOCR_READER_CACHE[cache_key]
+    """EasyOCR Reader 재사용 — Java 연계 경로(file_parser)와 같은 캐시를 쓴다(easyocr_runtime)."""
+    from app.services import easyocr_runtime
+    return easyocr_runtime.get_reader(langs, gpu)[0]
 
 # easyocr 언어코드 보정
 try:
@@ -281,12 +268,12 @@ def _ocr_page_with_easyocr(img_nd: "np.ndarray", lang: str, gpu: bool) -> Tuple[
     """
     import numpy as np
     
+    from app.services import easyocr_runtime
+
     langs = _norm_easyocr_langs(lang)
-    # [핵심 수정] Reader 재사용
-    reader = _get_easyocr_reader(langs, gpu)
-    
+    # Reader 재사용 + GPU 메모리가 모자라면 CPU 로 다시 읽기(easyocr_runtime)
     # detail=1로 bbox, text, confidence 받기
-    res = reader.readtext(img_nd, detail=1, paragraph=False)
+    res = easyocr_runtime.readtext(img_nd, langs, gpu, detail=1, paragraph=False)
     
     texts = []
     blocks: List[Dict] = []
@@ -409,7 +396,8 @@ def _ocr_page_image(fitz_page: "fitz.Page") -> Tuple[str, List[Dict]]:
 
     engine = os.getenv("OCR_ENGINE", "easyocr").strip().lower()
     if engine == "tesseract":
-        lang = os.getenv("OCR_LANG", "kor+eng")
+        # Tesseract 는 OCR_LANGS(kor+eng). OCR_LANG 은 EasyOCR 형식(ko,en)이라 쓰면 언어 파일을 못 찾는다
+        lang = os.getenv("OCR_LANGS") or "kor+eng"
         return _ocr_page_with_tesseract(img, lang)
     else:
         lang = os.getenv("OCR_LANG", "ko,en")

@@ -305,17 +305,17 @@ def _ocr_with_tesseract(images_iter, by_page: bool, lang: str) -> Union[str, Lis
     return "\n\n".join([t for _, t in pages]).strip()
 
 def _ocr_with_easyocr(images_iter, by_page: bool, lang: str) -> Union[str, List[Tuple[int, str]]]:
-    import easyocr
     import numpy as np
     from PIL import Image
-    
+    from app.services import easyocr_runtime
+
     langs = _norm_easyocr_langs(lang)
     gpu = os.getenv("OCR_EASYOCR_GPU", "1").strip() == "1"
-    
+
     width_ths = float(os.getenv("OCR_WIDTH_THS", "0.5"))
     height_ths = float(os.getenv("OCR_HEIGHT_THS", "0.5"))
-    
-    reader = easyocr.Reader(langs, gpu=gpu)
+
+    # Reader 는 재사용하고, GPU 메모리가 모자라면 CPU 로 다시 읽는다(easyocr_runtime)
     pages: List[Tuple[int, str]] = []
     
     for pno, img in images_iter:
@@ -332,8 +332,8 @@ def _ocr_with_easyocr(images_iter, by_page: bool, lang: str) -> Union[str, List[
             else:
                 rotated_img = img
             
-            res = reader.readtext(
-                rotated_img,
+            res = easyocr_runtime.readtext(
+                rotated_img, langs, gpu,
                 detail=1,
                 paragraph=False,
                 width_ths=width_ths,
@@ -505,11 +505,25 @@ def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, st
         if text_result and not _should_ocr(text_result):
             return text_result
 
+    def _empty(x):
+        return x is None or (isinstance(x, str) and not x.strip()) or (isinstance(x, list) and len(x) == 0)
+
+    def _placeholders(reason: str):
+        # 글자를 하나도 못 얻은 경우 — 운영 로그에서 보이도록 남긴다(예전에는 아무 기록 없이 자리표시만 저장)
+        print(f"[OCR] parse_pdf: 텍스트 없음 → placeholder 저장 ({os.path.basename(path)}, {page_count}쪽): {reason}")
+        if by_page:
+            return [(p, _make_image_placeholder_chunk(p)[0]) for p in range(1, page_count + 1)]
+        return "\n".join(_make_image_placeholder_chunk(p)[0] for p in range(1, page_count + 1))
+
+    def _has_text_layer():
+        if isinstance(text_result, str):
+            return bool(text_result.strip())
+        return any((t or "").strip() for _, t in (text_result or []))
+
+    stage = ocr_engine          # 로그에 실제로 실패한 엔진을 남기기 위함
+    tesseract_tried = False
     try:
         images_iter = _render_pdf_pages_fitz(path, ocr_dpi)
-
-        def _empty(x):
-            return (isinstance(x, str) and not x.strip()) or (isinstance(x, list) and len(x) == 0)
 
         if ocr_engine == "tesseract":
             ocr_out = _ocr_with_tesseract(images_iter, by_page, ocr_langs)
@@ -521,27 +535,35 @@ def parse_pdf(path: str, by_page: bool = False) -> Union[str, List[Tuple[int, st
         if _empty(ocr_out):
             images_iter = _render_pdf_pages_fitz(path, ocr_dpi)
             if ocr_engine == "easyocr":
+                stage, tesseract_tried = "tesseract(대체)", True
                 ocr_out = _ocr_with_tesseract(images_iter, by_page, os.getenv("OCR_LANGS", "kor+eng"))
             else:
+                stage = "easyocr(대체)"
                 ocr_out = _ocr_with_easyocr(images_iter, by_page, os.getenv("OCR_LANG", "ko,en"))
 
         if _empty(ocr_out):
-            if text_result and ((isinstance(text_result, str) and text_result.strip()) or (isinstance(text_result, list) and len(text_result) > 0)):
+            if _has_text_layer():
                 return text_result
-            if by_page:
-                return [(p, _make_image_placeholder_chunk(p)[0]) for p in range(1, page_count + 1)]
-            else:
-                return "\n".join(_make_image_placeholder_chunk(p)[0] for p in range(1, page_count + 1))
+            return _placeholders("OCR 결과가 비어 있음")
 
         return ocr_out
 
     except Exception as e:
-        if text_result and ((isinstance(text_result, str) and text_result.strip()) or (isinstance(text_result, list) and len(text_result) > 0)):
+        print(f"[OCR] parse_pdf: {stage} OCR 실패 ({os.path.basename(path)}): {type(e).__name__}: {e}")
+        # 글자층이 있으면 예전처럼 그것을 쓴다
+        if _has_text_layer():
             return text_result
-        if by_page:
-            return [(p, _make_image_placeholder_chunk(p)[0]) for p in range(1, page_count + 1)]
-        else:
-            return "\n".join(_make_image_placeholder_chunk(p)[0] for p in range(1, page_count + 1))
+        # 글자층도 없으면 Tesseract 로 한 번 더 읽는다(EasyOCR 가 비었을 때만 하던 대체를 오류일 때도, 단 한 번만)
+        if ocr_engine == "easyocr" and not tesseract_tried:
+            try:
+                ocr_out = _ocr_with_tesseract(_render_pdf_pages_fitz(path, ocr_dpi), by_page,
+                                              os.getenv("OCR_LANGS", "kor+eng"))
+                if not _empty(ocr_out):
+                    print(f"[OCR] parse_pdf: Tesseract 로 대체 성공 ({os.path.basename(path)})")
+                    return ocr_out
+            except Exception as e2:
+                print(f"[OCR] parse_pdf: Tesseract 대체도 실패: {type(e2).__name__}: {e2}")
+        return _placeholders(f"{type(e).__name__}: {e}")
 
 def parse_pdf_blocks(path: str) -> list[tuple[int, list[dict]]]:
     import fitz

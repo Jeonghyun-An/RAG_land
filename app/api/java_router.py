@@ -9,11 +9,14 @@ Java 시스템 연동 라우터 (운영용)
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 import os
 import re
 import hashlib
 import hmac
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
@@ -440,6 +443,27 @@ def _clean_html_and_split_paragraphs(html_text: str) -> List[str]:
     
     return cleaned_paragraphs
 
+# ==================== 문서 처리 전용 스레드 ====================
+# convert-and-index 작업(OCR·청킹·임베딩·Milvus 저장)은 오래 걸리는 동기 작업이다. async 작업 안에서 그대로 돌면
+# 그동안 이벤트 루프가 멈춰 채팅·상태 조회 등 API 전체가 응답하지 않는다(GPU 가 모자라 OCR 이 CPU 로 넘어가면 쪽당 수 분).
+# 그래서 전용 스레드에서 차례로 처리한다(기본 한 번에 1건 — 예전처럼 순서대로, GPU 를 여러 작업이 동시에 쓰지 않게).
+# FastAPI 공용 스레드 풀은 쓰지 않는다: 대기 중인 작업이 일반 요청 처리 자리를 차지하지 않게.
+def _ingest_workers() -> int:
+    try:
+        return max(1, int(os.getenv("JAVA_INGEST_WORKERS") or 1))
+    except ValueError:
+        return 1
+
+
+_INGEST_POOL = ThreadPoolExecutor(max_workers=_ingest_workers(), thread_name_prefix="java-ingest")
+
+
+async def _run_in_ingest_thread(job, **kwargs):
+    """async 작업 job(**kwargs)을 전용 스레드의 별도 이벤트 루프에서 실행하고 끝날 때까지 (루프를 막지 않고) 기다린다."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_INGEST_POOL, functools.partial(asyncio.run, job(**kwargs)))
+
+
 # ==================== Endpoints ====================
 
 @router.post("/convert-and-index", response_model=ConvertAndIndexResponse)
@@ -466,8 +490,10 @@ async def convert_and_index(
     #     return ConvertAndIndexResponse(...)
     
     job_id = str(uuid.uuid4())[:8]
-    
+
+    # OCR·임베딩이 이벤트 루프를 막지 않도록 전용 스레드에서 처리
     background_tasks.add_task(
+        _run_in_ingest_thread,
         process_convert_and_index_prod,
         job_id=job_id,
         data_id=request.data_id,
@@ -475,7 +501,7 @@ async def convert_and_index(
         file_id=request.file_id,
         callback_url=request.callback_url
     )
-    
+
     return ConvertAndIndexResponse(
         status="accepted",
         job_id=job_id,
