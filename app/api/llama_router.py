@@ -40,6 +40,7 @@ from app.services.file_parser import (
     parse_pdf_blocks_from_bytes,  # (bytes) -> [(page_no, [ {text,bbox}, ... ])]
 )
 from app.services import job_state, rag_params, request_guard
+from app.services.ocr_text_fix import align_codes, fix_ocr_confusions, fold_o0, zero_form
 from app.services.model_registry import model_request_error
 from app.services.llama_model import generate_answer_unified
 from app.services.minio_store import MinIOStore
@@ -761,10 +762,11 @@ FACILITY_RE = re.compile(
 )
 
 def extract_facility_codes(text: str) -> List[str]:
-    """질문에서 facility code(KOO/KOI/KOEI...) 추출"""
+    """질문에서 facility code(KOO/KOI/KOEI...) 추출.
+    OCR·입력에서 O 와 0 이 섞여도(K0F3, K004) 같은 코드로 보도록 O 표기로 맞춰 찾는다(ocr_text_fix)."""
     if not text:
         return []
-    codes = FACILITY_RE.findall(text.upper())
+    codes = FACILITY_RE.findall(fold_o0(text))
     seen, out = set(), []
     for c in codes:
         c = c.upper()
@@ -776,8 +778,9 @@ def extract_facility_codes(text: str) -> List[str]:
 def _text_has_any_code(text: str, codes: List[str]) -> bool:
     if not text or not codes:
         return False
-    up = text.upper()
-    return any(code in up for code in codes)
+    # O 와 0 을 같은 글자로 비교: 질문 KOF3 ↔ 단락 K0F3 (OCR 혼동)
+    up = fold_o0(text)
+    return any(fold_o0(code) in up for code in codes)
 
 def _candidate_has_any_facility_code(cand: Dict[str, Any], codes: List[str]) -> bool:
     """청크/섹션/메타에 시설코드가 포함되는지 검사"""
@@ -1621,6 +1624,10 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
 
         # 1) 검색용 질의 준비(한국어면 ko->en 변환)
         query_for_search = _maybe_translate_query_for_search(req.question, lang)
+        # OCR 의 O/0 혼동: 확실한 패턴 교정 + 시설 코드는 O 표기로 맞춤(K0F3→KOF3, K004→KOO4)
+        query_for_search = fix_ocr_confusions(query_for_search)
+        _fac_q = extract_facility_codes(req.question or "") or extract_facility_codes(query_for_search or "")
+        query_for_search = align_codes(query_for_search, _fac_q)
         # 질의 내용은 로그에 남기지 않음(보안대책 M09, LOG_QUERY_TEXT=1 이면 개발용으로 앞부분 기록)
         logger.info("[ask] lang=%s | q_before=%s", lang, request_guard.describe_query(req.question))
         logger.info("[ask] q_search=%s", request_guard.describe_query(query_for_search))
@@ -1684,6 +1691,22 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
         else:
             cands = _search_with_optional_filter(query_for_search, raw_topk)
 
+        # OCR 이 시설 코드를 0 으로 읽은 단락(K0F3·K004 등)도 후보에 넣는다 — 0 표기로 한 번 더 검색
+        if _fac_q and query_for_search:
+            alt_q = query_for_search
+            for code in _fac_q:
+                alt_q = re.sub(rf"(?<![A-Za-z0-9]){re.escape(code)}(?![A-Za-z0-9])",
+                               zero_form(code), alt_q, flags=re.IGNORECASE)
+            if alt_q != query_for_search:
+                cands = _merge_dedup(cands, _search_with_optional_filter(alt_q, raw_topk))
+
+        # 후보 사본의 O/0 혼동 교정 + 질문의 시설 코드 표기로 맞춤 (색인 원문은 바꾸지 않음).
+        # 재정렬·답변 근거·화면에 같은 표기가 들어간다.
+        for c in cands:
+            for _k in ("chunk", "section"):
+                if isinstance(c.get(_k), str) and c[_k]:
+                    c[_k] = align_codes(fix_ocr_confusions(c[_k]), _fac_q)
+
         logger.info("[ask] cands=%d (raw_topk=%d)", len(cands), raw_topk)
 
         if not cands:
@@ -1707,8 +1730,8 @@ def _ask_impl(req: AskReq, overrides: Optional[Dict[str, Any]] = None) -> AskRes
         # 2) 키워드 부스트 (질문 원문 기준으로 키워드 추출)
         kws = extract_keywords(req.question)
         def _kw_boost_score(c: dict) -> int:
-            txt = _strip_meta_line(c.get("chunk", "")).lower()
-            return sum(1 for k in kws if k.lower() in txt)
+            txt = fold_o0(_strip_meta_line(c.get("chunk", "")))   # 대소문자·O/0 구분 없이 비교
+            return sum(1 for k in kws if fold_o0(k) in txt)
         for c in cands:
             c["kw_boost"] = _kw_boost_score(c)
 

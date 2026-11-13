@@ -205,3 +205,51 @@ def test_pipeline_error_hides_detail(env, monkeypatch):
     r = _ask(env)
     assert r.status_code in (500, 503)
     assert "milvus" not in r.text.lower() and "error_id" in r.json()
+
+
+# ---- OCR O/0 혼동 (ocr_text_fix) -------------------------------------------------------
+def _store_with(monkeypatch, chunks):
+    queries = []
+
+    def search(self, query, embed_fn, topk):
+        queries.append(query)
+        return [dict(c) for c in chunks]          # 실제 Milvus 처럼 매번 새 dict
+
+    monkeypatch.setattr(_FakeStore, "search", search)
+    return queries
+
+
+def test_facility_question_keeps_chunks_ocr_spelled_with_zero(env, monkeypatch):
+    # 질문은 KOF3, 문서는 OCR 이 K0F3 로 읽음 → 예전에는 시설 코드 필터가 이 단락을 버렸다
+    queries = _store_with(monkeypatch, [
+        {"doc_id": "872", "page": 1, "section": "Seal", "score": 0.6,
+         "chunk": "Seal activity at K0F3 was verified in 2OO6."},
+        {"doc_id": "900", "page": 1, "section": "Other", "score": 0.9,
+         "chunk": "KOM2 inventory change report."},
+    ])
+    monkeypatch.setattr(lr, "_maybe_translate_query_for_search", lambda q, lang: "KOF3 seal activity")
+    env["answer"] = "KOF3 봉인 활동이 확인되었습니다."
+    r = _ask(env, question="KOF3 봉인 활동 결과 알려줘")
+    assert r.status_code == 200, r.text
+    srcs = r.json()["sources"]
+    assert [s["doc_id"] for s in srcs] == ["872"]                    # 코드가 다른 KOM2 단락은 걸러짐
+    assert "KOF3" in srcs[0]["chunk"] and "2006" in srcs[0]["chunk"]  # 근거에도 교정된 표기
+    assert "Seal activity at KOF3" in env["prompts"][-1]
+    assert any("K0F3" in q for q in queries)                         # 0 표기로 보조 검색
+
+
+def test_question_typed_with_zero_finds_o_spelled_chunks(env, monkeypatch):
+    _store_with(monkeypatch, [
+        {"doc_id": "873", "page": 1, "section": "", "score": 0.7, "chunk": "Inspection schedule for KOO4."},
+        {"doc_id": "901", "page": 1, "section": "", "score": 0.9, "chunk": "Unrelated KOC1 text."},
+    ])
+    monkeypatch.setattr(lr, "_maybe_translate_query_for_search", lambda q, lang: "K004 inspection schedule")
+    r = _ask(env, question="K004 사찰 일정")
+    assert r.status_code == 200, r.text
+    assert [s["doc_id"] for s in r.json()["sources"]] == ["873"]
+
+
+def test_extract_facility_codes_folds_o_and_zero():
+    assert lr.extract_facility_codes("K0F3 와 KOF3, k0m2") == ["KOF3", "KOM2"]
+    assert lr._candidate_has_any_facility_code({"chunk": "seal at K004"}, ["KOO4"])
+    assert not lr._candidate_has_any_facility_code({"chunk": "seal at KOF8"}, ["KOF3"])
